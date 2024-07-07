@@ -1,9 +1,12 @@
-ollama
 neo4j
+neo4j-async
+ollama
 Pillow
-torch
 torchvision
 transformers
-libclang
-astor
+clang
 syn
+PyPDF2
+python-magic
+asyncio
+esprima
