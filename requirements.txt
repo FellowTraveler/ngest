@@ -1,5 +1,6 @@
 aiofiles
 aiohttp
+aiolimiter
 aiorate
 async-generator
 clang
@@ -16,3 +17,4 @@ torch
 tqdm
 torchvision
 transformers
+

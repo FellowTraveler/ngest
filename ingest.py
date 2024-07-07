@@ -2,15 +2,19 @@
 # MIT License
 
 import os
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 import uuid
 import logging
 from abc import ABC, abstractmethod
 import asyncio
 from neo4j import AsyncGraphDatabase
+from neo4j.exceptions import ServiceUnavailable
 import PIL.Image
 import torchvision.transforms as transforms
 import torchvision.models as models
-from transformers import pipeline, AutoTokenizer, AutoModel
+from transformers import pipeline, AutoTokenizer, AutoModel, BertModel, BertTokenizer
+from clang.cindex import Config
+Config.set_library_path("/opt/homebrew/opt/llvm/lib")
 import clang.cindex
 import ast
 import syn
@@ -24,7 +28,7 @@ from contextlib import asynccontextmanager
 import torch
 from tqdm import tqdm
 import aiohttp
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import dotenv
 import tempfile
 import unittest
@@ -35,6 +39,11 @@ from pathlib import Path
 import fnmatch
 import aiorate
 import ollama
+from aiolimiter import AsyncLimiter
+from typing import AsyncGenerator
+from typing import Optional, List, Dict, Any, Union
+import magic
+
 
 # Load environment variables
 dotenv.load_dotenv()
@@ -50,9 +59,10 @@ DEFAULT_MEDIUM_CHUNK_SIZE = 10000
 DEFAULT_SMALL_CHUNK_SIZE = 1000
 DEFAULT_NEO4J_URL = "bolt://localhost:7687"
 DEFAULT_NEO4J_USER = "neo4j"
-DEFAULT_NEO4J_PASSWORD = "password"
+DEFAULT_NEO4J_PASSWORD = "mynewpassword"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
+
 
 if not os.path.exists(config_dir):
     os.makedirs(config_dir)
@@ -80,6 +90,17 @@ EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', config.get('Models', 'EMBEDDING_M
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def ollama_generate_embedding_sync(prompt: str) -> List[float]:
+    response = ollama.embeddings(model=EMBEDDING_MODEL, prompt=prompt)
+    if 'embedding' in response:
+        return response['embedding']
+    else:
+        logger.error(f"Error generating embedding: {response}")
+        return []
+
+async def ollama_generate_embedding(prompt: str) -> List[float]:
+    return await asyncio.to_thread(ollama_generate_embedding_sync, prompt)
+
 class CustomError(Exception):
     """Base class for custom exceptions"""
     pass
@@ -106,7 +127,6 @@ class NBaseImporter(ABC):
         pass
 
     def ascertain_file_type(self, filename: str) -> str:
-        import magic
         try:
             mime = magic.Magic(mime=True)
             file_type = mime.from_file(filename)
@@ -181,25 +201,25 @@ class NBaseImporter(ABC):
         Returns:
             Optional[str]: The chunk ID, or None if creation failed.
         """
-        embedding = self.model.embed_text(chunk)
-        chunk_id = f"{inputPath}_chunk_{index}"
         try:
-            result = await session.run(
-                "CREATE (n:Chunk {id: $id, content: $content, embedding: $embedding, projectID: $projectID}) RETURN id(n)",
-                id=chunk_id, content=chunk, embedding=embedding, projectID=projectID
-            )
-            node = result.single()
-            if node:
-                node_id = node['id']
-                logger.info(f"Created chunk node {chunk_id} with embedding")
-                return chunk_id
-            else:
-                logger.error(f"No result returned for chunk node {chunk_id}")
-                return None
+            async with self.rate_limiter:
+                embedding = await self.generate_embedding(chunk)
+                chunk_id = f"{inputPath}_chunk_{index}"
+                
+                node_id = await self.run_query_and_get_element_id(session,
+                    "CREATE (n:Chunk {elementId: $id, content: $content, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
+                    id=chunk_id, content=chunk, embedding=embedding, projectID=projectID
+                )
+                if node_id:
+                    logger.info(f"Created chunk node {chunk_id} with embedding")
+                    return chunk_id
+                else:
+                    logger.error(f"No result returned for chunk node {chunk_id}")
+                    return None
         except Exception as e:
             logger.error(f"Error creating chunk node: {e}")
             raise DatabaseError(f"Error creating chunk node: {e}")
-
+                   
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     async def create_chunk_relationship(self, session, chunk_id1: str, chunk_id2: str, projectID: str) -> None:
         """
@@ -213,8 +233,7 @@ class NBaseImporter(ABC):
         """
         try:
             result = await session.run(
-                "MATCH (c1:Chunk {id: $id1, projectID: $projectID}), (c2:Chunk {id: $id2, projectID: $projectID}) "
-                "CREATE (c1)-[:NEXT]->(c2)",
+                "MATCH (c1:Chunk {elementId: $id1, projectID: $projectID}), (c2:Chunk {elementId: $id2, projectID: $projectID}) CREATE (c1)-[:NEXT]->(c2)",
                 id1=chunk_id1, id2=chunk_id2, projectID=projectID
             )
             if result:
@@ -294,14 +313,17 @@ class NNeo4JImporter(NBaseImporter):
         self.tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
         self.code_model = AutoModel.from_pretrained("microsoft/codebert-base").to(self.device)
         self.code_model.eval()
+
+        self.rate_limiter = AsyncLimiter(1, 10)  # 1 operations per 10 seconds
         
-        self.model = ollama.Model(EMBEDDING_MODEL)  # Reuse the model instance
-        
-        self.rate_limiter = aiorate.Limiter(10, 1)  # 10 operations per second
-        
+        self.bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.bert_model = BertModel.from_pretrained('bert-base-uncased').to(self.device)
+        self.bert_model.eval()
+
         logger.info(f"Neo4J importer initialized with URL {neo4j_url}")
         
     @asynccontextmanager
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=10), retry=retry_if_exception_type(ServiceUnavailable))
     async def get_session(self):
         """
         Get a session for Neo4j database operations.
@@ -314,6 +336,30 @@ class NNeo4JImporter(NBaseImporter):
                 yield session
             finally:
                 await session.close()
+
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    async def generate_embedding(self, text: str) -> List[float]:
+        try:
+            inputs = self.bert_tokenizer(text, return_tensors="pt", truncation=True, padding=True).to(self.device)
+            with torch.no_grad():
+                outputs = self.bert_model(**inputs)
+            return outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy().tolist()
+        except Exception as e:
+            logger.error(f"Error generating embedding: {e}")
+            raise
+
+    # Function to use Ollama for generating embeddings
+#    async def generate_embedding(self, text: str) -> List[float]:
+#        try:
+#            response = await ollama_generate_embedding(prompt=text)
+#            if response and 'embedding' in response:
+#                return response['embedding']
+#            else:
+#                raise ValueError("Failed to generate embedding")
+#        except Exception as e:
+#            logger.error(f"Error generating embedding: {e}")
+#            raise
 
     async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         """
@@ -328,9 +374,14 @@ class NNeo4JImporter(NBaseImporter):
         """
         try:
             file_type = self.ascertain_file_type(inputPath)
+            if file_type == 'text':
+                async with aiofiles.open(inputPath, 'r') as file:
+                    content = await file.read()
+                embedding = await self.generate_embedding(content)
+                print(f"Generated embedding for {inputName}: {embedding}")
         except Exception as e:
-            logger.error(f"Error ascertaining file type for {inputPath}: {e}")
-            raise FileProcessingError(f"Error ascertaining file type for {inputPath}: {e}")
+            logger.error(f"Error processing file {inputPath}: {e}")
+            raise FileProcessingError(f"Error processing file {inputPath}: {e}")
 
         ingest_method = getattr(self, f"Ingest{file_type.capitalize()}", None)
         if ingest_method:
@@ -353,7 +404,7 @@ class NNeo4JImporter(NBaseImporter):
             str: The summary of the text.
         """
         try:
-            return (await asyncio.to_thread(self.summarizer, text, max_length=50, min_length=25, do_sample=False))[0]['summary_text']
+            return (await asyncio.to_thread(self.summarizer, text, max_length=50, min_length=10, do_sample=False))[0]['summary_text']
         except Exception as e:
             logger.error(f"Error summarizing text: {e}")
             return ""
@@ -389,24 +440,21 @@ class NNeo4JImporter(NBaseImporter):
             projectID: The project ID.
         """
         try:
-            chunk_node = await session.run(
-                f"CREATE (n:{chunk_type} {{content: $content, type: $chunk_type, projectID: $projectID}}) RETURN id(n)",
+            chunk_id = await self.run_query_and_get_element_id(session,
+                f"CREATE (n:{chunk_type} {{content: $content, type: $chunk_type, projectID: $projectID}}) RETURN elementId(n)",
                 content=chunk, chunk_type=chunk_type, projectID=projectID
             )
-            chunk_id = chunk_node.single()['id']
             await session.run(
-                f"MATCH (p:{parent_node_type}), (c:{chunk_type}) WHERE id(p) = $parent_node_id AND id(c) = $chunk_id AND p.projectID = $projectID AND c.projectID = $projectID "
-                f"CREATE (p)-[:HAS_CHUNK]->(c), (c)-[:PART_OF]->(p)",
+                f"MATCH (p:{parent_node_type} {{elementId: $parent_node_id, projectID: $projectID}}), (c:{chunk_type} {{elementId: $chunk_id, projectID: $projectID}}) CREATE (p)-[:HAS_CHUNK]->(c), (c)-[:PART_OF]->(p)",
                 parent_node_id=parent_node_id, chunk_id=chunk_id, projectID=projectID
             )
-            embedding = self.model.embed_text(chunk)
-            embedding_node = await session.run(
-                "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', projectID: $projectID}) RETURN id(n)",
+            embedding = await self.generate_embedding(chunk)
+            embedding_id = await self.run_query_and_get_element_id(session,
+                "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', projectID: $projectID}) RETURN elementId(n)",
                 embedding=embedding, projectID=projectID
             )
-            embedding_id = embedding_node.single()['id']
             await session.run(
-                f"MATCH (c:{chunk_type}), (e:Embedding) WHERE id(c) = $chunk_id AND id(e) = $embedding_id AND c.projectID = $projectID AND e.projectID = $projectID "
+                f"MATCH (c:{chunk_type}), (e:Embedding) WHERE elementId(c) = $chunk_id AND elementId(e) = $embedding_id AND c.projectID = $projectID AND e.projectID = $projectID "
                 f"CREATE (c)-[:HAS_EMBEDDING]->(e)",
                 chunk_id=chunk_id, embedding_id=embedding_id, projectID=projectID
             )
@@ -414,7 +462,7 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Error creating chunk with embedding: {e}")
             raise DatabaseError(f"Error creating chunk with embedding: {e}")
 
-    async def IngestTxt(self, input_path: str, input_location: str, input_name: str, current_output_path: str, project_id: str) -> None:
+    async def IngestText(self, input_path: str, input_location: str, input_name: str, current_output_path: str, project_id: str) -> None:
         """
         Ingest a text file by reading its content and creating document and chunk nodes in the database.
 
@@ -434,11 +482,10 @@ class NNeo4JImporter(NBaseImporter):
                 raise FileProcessingError(f"Error reading file {input_path}: {e}")
 
             try:
-                parent_doc_node = await session.run(
-                    "CREATE (n:Document {name: $name, type: 'text', projectID: $projectID}) RETURN id(n)",
+                parent_doc_id = await self.run_query_and_get_element_id(session,
+                    "CREATE (n:Document {name: $name, type: 'text', projectID: $projectID}) RETURN elementId(n)",
                     name=input_name, projectID=project_id
                 )
-                parent_doc_id = parent_doc_node.single()['id']
 
                 await self.process_chunks(session, file_content, parent_doc_id, "Document", MEDIUM_CHUNK_SIZE, "MediumChunk", project_id)
 
@@ -515,18 +562,16 @@ class NNeo4JImporter(NBaseImporter):
         """
         try:
             async with self.rate_limiter:
-                image_node = await session.run(
-                    "CREATE (n:Image {name: $name, type: 'image', projectID: $projectID}) RETURN id(n)",
+                image_id = await self.run_query_and_get_element_id(session,
+                    "CREATE (n:Image {name: $name, type: 'image', projectID: $projectID}) RETURN elementId(n)",
                     name=input_name, projectID=project_id
                 )
-                image_id = image_node.single()['id']
-                features_node = await session.run(
-                    "CREATE (n:ImageFeatures {features: $features, type: 'image_features', projectID: $projectID}) RETURN id(n)",
+                features_id = await self.run_query_and_get_element_id(session,
+                    "CREATE (n:ImageFeatures {features: $features, type: 'image_features', projectID: $projectID}) RETURN elementId(n)",
                     features=features, projectID=project_id
                 )
-                features_id = features_node.single()['id']
                 await session.run(
-                    "MATCH (i:Image), (f:ImageFeatures) WHERE id(i) = $image_id AND id(f) = $features_id AND i.projectID = $projectID AND f.projectID = $projectID "
+                    "MATCH (i:Image), (f:ImageFeatures) WHERE elementId(i) = $image_id AND elementId(f) = $features_id AND i.projectID = $projectID AND f.projectID = $projectID "
                     "CREATE (i)-[:HAS_FEATURES]->(f)",
                     image_id=image_id, features_id=features_id, projectID=project_id
                 )
@@ -594,46 +639,51 @@ class NNeo4JImporter(NBaseImporter):
             classes = []
 
             for node in tu.cursor.get_children():
-                if node.kind == clang.cindex.CursorKind.FUNCTION_DECL:
-                    functions.append(node)
-                elif node.kind in [clang.cindex.CursorKind.CLASS_DECL, clang.cindex.CursorKind.STRUCT_DECL]:
-                    classes.append(node)
+                # Check if the node belongs to a file within the project directory
+                if os.path.commonpath([node.location.file.name, currentOutputPath]).startswith(currentOutputPath):
+                    if node.kind == clang.cindex.CursorKind.FUNCTION_DECL:
+                        functions.append(node)
+                    elif node.kind in [clang.cindex.CursorKind.CLASS_DECL, clang.cindex.CursorKind.STRUCT_DECL]:
+                        classes.append(node)
 
             async with self.get_session() as session:
                 for cls in classes:
                     class_summary = await self.summarize_cpp_class(cls)
-                    embedding = self.model.embed_text(class_summary)
+                    embedding = await self.generate_embedding(class_summary)
                     async with self.rate_limiter:
-                        class_node = await session.run(
-                            "CREATE (n:Class {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN id(n)",
+                        class_id = await self.run_query_and_get_element_id(session,
+                            "CREATE (n:Class {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
                             name=cls.spelling, summary=class_summary, embedding=embedding, projectID=projectID
                         )
-                        class_id = class_node.single()['id']
                     
                     for func in cls.get_children():
-                        if func.kind == clang.cindex.CursorKind.CXX_METHOD:
+                        # Check if the method belongs to a file within the project directory
+                        if func.kind == clang.cindex.CursorKind.CXX_METHOD and os.path.commonpath([func.location.file.name, currentOutputPath]).startswith(currentOutputPath):
                             function_summary = await self.summarize_cpp_function(func)
-                            embedding = self.model.embed_text(function_summary)
+                            embedding = await self.generate_embedding(function_summary)
                             async with self.rate_limiter:
-                                function_node = await session.run(
-                                    "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN id(n)",
+                                function_id = await self.run_query_and_get_element_id(session,
+                                    "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
                                     name=func.spelling, summary=function_summary, embedding=embedding, projectID=projectID
                                 )
-                                function_id = function_node.single()['id']
+                                
                                 await session.run(
-                                    "MATCH (c:Class), (f:Function) WHERE id(c) = $class_id AND id(f) = $function_id AND c.projectID = $projectID AND f.projectID = $projectID "
+                                    "MATCH (c:Class), (f:Function) "
+                                    "WHERE elementId(c) = $class_id AND elementId(f) = $function_id AND c.projectID = $projectID AND f.projectID = $projectID "
                                     "CREATE (c)-[:HAS_METHOD]->(f)",
-                                    class_id=class_id, function_id=function_id, projectID=projectID
+                                    {"class_id": class_id, "function_id": function_id, "projectID": projectID}
                                 )
 
                 for func in functions:
-                    function_summary = await self.summarize_cpp_function(func)
-                    embedding = self.model.embed_text(function_summary)
-                    async with self.rate_limiter:
-                        await session.run(
-                            "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID})",
-                            name=func.spelling, summary=function_summary, embedding=embedding, projectID=projectID
-                        )
+                    # Check if the function belongs to a file within the project directory
+                    if os.path.commonpath([func.location.file.name, currentOutputPath]).startswith(currentOutputPath):
+                        function_summary = await self.summarize_cpp_function(func)
+                        embedding = await self.generate_embedding(function_summary)
+                        async with self.rate_limiter:
+                            await session.run(
+                                "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID})",
+                                {"name": func.spelling, "summary": function_summary, "embedding": embedding, "projectID": projectID}
+                            )
         except Exception as e:
             logger.error(f"Error ingesting C++ file {inputPath}: {e}")
             raise FileProcessingError(f"Error ingesting C++ file {inputPath}: {e}")
@@ -660,33 +710,31 @@ class NNeo4JImporter(NBaseImporter):
             async with self.get_session() as session:
                 for cls in classes:
                     class_summary = await self.summarize_python_class(cls)
-                    embedding = self.model.embed_text(class_summary)
+                    embedding = await self.generate_embedding(class_summary)
                     async with self.rate_limiter:
-                        class_node = await session.run(
-                            "CREATE (n:Class {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN id(n)",
+                        class_id = await self.run_query_and_get_element_id(session,
+                            "CREATE (n:Class {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
                             name=cls.name, summary=class_summary, embedding=embedding, projectID=projectID
                         )
-                        class_id = class_node.single()['id']
                     
                     for func in cls.body:
                         if isinstance(func, ast.FunctionDef):
                             function_summary = await self.summarize_python_function(func)
-                            embedding = self.model.embed_text(function_summary)
+                            embedding = await self.generate_embedding(function_summary)
                             async with self.rate_limiter:
-                                function_node = await session.run(
-                                    "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN id(n)",
+                                function_id = await self.run_query_and_get_element_id(session,
+                                    "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
                                     name=func.name, summary=function_summary, embedding=embedding, projectID=projectID
                                 )
-                                function_id = function_node.single()['id']
                                 await session.run(
-                                    "MATCH (c:Class), (f:Function) WHERE id(c) = $class_id AND id(f) = $function_id AND c.projectID = $projectID AND f.projectID = $projectID "
+                                    "MATCH (c:Class), (f:Function) WHERE elementId(c) = $class_id AND elementId(f) = $function_id AND c.projectID = $projectID AND f.projectID = $projectID "
                                     "CREATE (c)-[:HAS_METHOD]->(f)",
                                     class_id=class_id, function_id=function_id, projectID=projectID
                                 )
 
                 for func in functions:
                     function_summary = await self.summarize_python_function(func)
-                    embedding = self.model.embed_text(function_summary)
+                    embedding = await self.generate_embedding(function_summary)
                     async with self.rate_limiter:
                         await session.run(
                             "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID})",
@@ -745,33 +793,31 @@ class NNeo4JImporter(NBaseImporter):
             async with self.get_session() as session:
                 for impl in impls:
                     impl_summary = await self.summarize_rust_impl(impl)
-                    embedding = self.model.embed_text(impl_summary)
+                    embedding = await self.generate_embedding(impl_summary)
                     async with self.rate_limiter:
-                        impl_node = await session.run(
-                            "CREATE (n:Impl {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN id(n)",
+                        impl_id = await self.run_query_and_get_element_id(session,
+                            "CREATE (n:Impl {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
                             name=impl.trait_.path.segments[0].ident, summary=impl_summary, embedding=embedding, projectID=projectID
                         )
-                        impl_id = impl_node.single()['id']
                     
                     for item in impl.items:
                         if isinstance(item, syn.ImplItemMethod):
                             function_summary = await self.summarize_rust_function(item)
-                            embedding = self.model.embed_text(function_summary)
+                            embedding = await self.generate_embedding(function_summary)
                             async with self.rate_limiter:
-                                function_node = await session.run(
-                                    "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN id(n)",
+                                function_id = await self.run_query_and_get_element_id(session,
+                                    "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
                                     name=item.sig.ident, summary=function_summary, embedding=embedding, projectID=projectID
                                 )
-                                function_id = function_node.single()['id']
                                 await session.run(
-                                    "MATCH (i:Impl), (f:Function) WHERE id(i) = $impl_id AND id(f) = $function_id AND i.projectID = $projectID AND f.projectID = $projectID "
+                                    "MATCH (i:Impl), (f:Function) WHERE elementId(i) = $impl_id AND elementId(f) = $function_id AND i.projectID = $projectID AND f.projectID = $projectID "
                                     "CREATE (i)-[:HAS_METHOD]->(f)",
                                     impl_id=impl_id, function_id=function_id, projectID=projectID
                                 )
 
                 for func in functions:
                     function_summary = await self.summarize_rust_function(func)
-                    embedding = self.model.embed_text(function_summary)
+                    embedding = await self.generate_embedding(function_summary)
                     async with self.rate_limiter:
                         await session.run(
                             "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID})",
@@ -832,11 +878,10 @@ class NNeo4JImporter(NBaseImporter):
         async with self.get_session() as session:
             try:
                 async with self.rate_limiter:
-                    file_node = await session.run(
-                        "CREATE (n:JavaScriptFile {name: $name, path: $path, projectID: $projectID}) RETURN id(n)",
+                    file_id = await self.run_query_and_get_element_id(session,
+                        "CREATE (n:JavaScriptFile {name: $name, path: $path, projectID: $projectID}) RETURN elementId(n)",
                         name=inputName, path=inputPath, projectID=projectID
                     )
-                    file_id = file_node.single()['id']
 
                 for node in ast.body:
                     if isinstance(node, nodes.FunctionDeclaration):
@@ -900,18 +945,17 @@ class NNeo4JImporter(NBaseImporter):
     async def process_js_function(self, session, func_node, file_id: int, projectID: str) -> None:
         func_name = func_node.id.name if func_node.id else 'anonymous'
         func_summary = await self.summarize_js_function(func_node)
-        embedding = self.model.embed_text(func_summary)
+        embedding = await self.generate_embedding(func_summary)
 
         try:
             async with self.rate_limiter:
-                func_db_node = await session.run(
-                    "CREATE (n:JavaScriptFunction {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN id(n)",
+                func_db_id = await self.run_query_and_get_element_id(session,
+                    "CREATE (n:JavaScriptFunction {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
                     name=func_name, summary=func_summary, embedding=embedding, projectID=projectID
                 )
-                func_db_id = func_db_node.single()['id']
 
                 await session.run(
-                    "MATCH (f:JavaScriptFile), (func:JavaScriptFunction) WHERE id(f) = $file_id AND id(func) = $func_id AND f.projectID = $projectID AND func.projectID = $projectID "
+                    "MATCH (f:JavaScriptFile), (func:JavaScriptFunction) WHERE elementId(f) = $file_id AND elementId(func) = $func_id AND f.projectID = $projectID AND func.projectID = $projectID "
                     "CREATE (f)-[:CONTAINS]->(func)",
                     file_id=file_id, func_id=func_db_id, projectID=projectID
                 )
@@ -922,18 +966,17 @@ class NNeo4JImporter(NBaseImporter):
     async def process_js_class(self, session, class_node, file_id: int, projectID: str) -> None:
         class_name = class_node.id.name
         class_summary = await self.summarize_js_class(class_node)
-        embedding = self.model.embed_text(class_summary)
+        embedding = await self.generate_embedding(class_summary)
 
         try:
             async with self.rate_limiter:
-                class_db_node = await session.run(
-                    "CREATE (n:JavaScriptClass {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN id(n)",
+                class_db_id = await self.run_query_and_get_element_id(session,
+                    "CREATE (n:JavaScriptClass {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
                     name=class_name, summary=class_summary, embedding=embedding, projectID=projectID
                 )
-                class_db_id = class_db_node.single()['id']
 
                 await session.run(
-                    "MATCH (f:JavaScriptFile), (c:JavaScriptClass) WHERE id(f) = $file_id AND id(c) = $class_id AND f.projectID = $projectID AND c.projectID = $projectID "
+                    "MATCH (f:JavaScriptFile), (c:JavaScriptClass) WHERE elementId(f) = $file_id AND elementId(c) = $class_id AND f.projectID = $projectID AND c.projectID = $projectID "
                     "CREATE (f)-[:CONTAINS]->(c)",
                     file_id=file_id, class_id=class_db_id, projectID=projectID
                 )
@@ -950,18 +993,17 @@ class NNeo4JImporter(NBaseImporter):
             var_name = declaration.id.name
             var_type = var_node.kind  # 'var', 'let', or 'const'
             var_summary = await self.summarize_js_variable(var_node)
-            embedding = self.model.embed_text(var_summary)
+            embedding = await self.generate_embedding(var_summary)
 
             try:
                 async with self.rate_limiter:
-                    var_db_node = await session.run(
-                        "CREATE (n:JavaScriptVariable {name: $name, type: $type, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN id(n)",
+                    var_db_id = await self.run_query_and_get_element_id(session,
+                        "CREATE (n:JavaScriptVariable {name: $name, type: $type, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
                         name=var_name, type=var_type, summary=var_summary, embedding=embedding, projectID=projectID
                     )
-                    var_db_id = var_db_node.single()['id']
 
                     await session.run(
-                        "MATCH (f:JavaScriptFile), (v:JavaScriptVariable) WHERE id(f) = $file_id AND id(v) = $var_id AND f.projectID = $projectID AND v.projectID = $projectID "
+                        "MATCH (f:JavaScriptFile), (v:JavaScriptVariable) WHERE elementId(f) = $file_id AND elementId(v) = $var_id AND f.projectID = $projectID AND v.projectID = $projectID "
                         "CREATE (f)-[:CONTAINS]->(v)",
                         file_id=file_id, var_id=var_db_id, projectID=projectID
                     )
@@ -981,18 +1023,17 @@ class NNeo4JImporter(NBaseImporter):
         """
         method_name = method_node.key.name
         method_summary = await self.summarize_js_function(method_node.value)
-        embedding = self.model.embed_text(method_summary)
+        embedding = await self.generate_embedding(method_summary)
 
         try:
             async with self.rate_limiter:
-                method_db_node = await session.run(
-                    "CREATE (n:JavaScriptMethod {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN id(n)",
+                method_db_id = await self.run_query_and_get_element_id(session,
+                    "CREATE (n:JavaScriptMethod {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
                     name=method_name, summary=method_summary, embedding=embedding, projectID=projectID
                 )
-                method_db_id = method_db_node.single()['id']
 
                 await session.run(
-                    "MATCH (c:JavaScriptClass), (m:JavaScriptMethod) WHERE id(c) = $class_id AND id(m) = $method_id AND c.projectID = $projectID AND m.projectID = $projectID "
+                    "MATCH (c:JavaScriptClass), (m:JavaScriptMethod) WHERE elementId(c) = $class_id AND elementId(m) = $method_id AND c.projectID = $projectID AND m.projectID = $projectID "
                     "CREATE (c)-[:HAS_METHOD]->(m)",
                     class_id=class_id, method_id=method_db_id, projectID=projectID
                 )
@@ -1000,28 +1041,36 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Error processing JavaScript method {method_name}: {e}")
             raise DatabaseError(f"Error processing JavaScript method {method_name}: {e}")
 
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=10), retry=retry_if_exception_type(ServiceUnavailable))
+    async def run_query_and_get_element_id(self, session, query: str, **parameters) -> str:
+        result = await session.run(query, parameters)
+        record = await result.single()
+        if record:
+            return record['elementId(n)']
+        else:
+            raise FileProcessingError("No elementId returned from query")
+
+#    async def run_query_and_get_element_id(self, session, query: str, parameters: dict) -> str:
+#        result = await session.run(query, parameters)
+#        record = await result.single()
+#        if record:
+#            return record['elementId(n)']
+#        else:
+#            raise FileProcessingError("No elementId returned from query")
+
     async def IngestPdf(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         """
         Ingest a PDF file by reading its content, chunking it, and storing the chunks and their embeddings in the database.
-
-        Args:
-            inputPath (str): The path to the input file.
-            inputLocation (str): The location of the input file.
-            inputName (str): The name of the input file.
-            currentOutputPath (str): The current output path.
-            projectID (str): The project ID.
         """
         try:
             reader = PdfReader(inputPath)
             num_pages = len(reader.pages)
 
             async with self.get_session() as session:
-                async with self.rate_limiter:
-                    pdf_node = await session.run(
-                        "CREATE (n:PDF {name: $name, pages: $pages, projectID: $projectID}) RETURN id(n)",
-                        name=inputName, pages=num_pages, projectID=projectID
-                    )
-                    pdf_id = pdf_node.single()['id']
+                pdf_id = await self.run_query_and_get_element_id(session,
+                    "CREATE (n:PDF {name: $name, pages: $pages, projectID: $projectID}) RETURN elementId(n)",
+                    name=inputName, pages=num_pages, projectID=projectID
+                )
 
                 for i in range(num_pages):
                     page = reader.pages[i]
@@ -1029,46 +1078,41 @@ class NNeo4JImporter(NBaseImporter):
 
                     medium_chunks = self.chunk_text(text, MEDIUM_CHUNK_SIZE)
                     for j, medium_chunk in enumerate(medium_chunks):
-                        async with self.rate_limiter:
-                            medium_chunk_node = await session.run(
-                                "CREATE (n:MediumChunk {content: $content, type: 'medium_chunk', page: $page, projectID: $projectID}) RETURN id(n)",
-                                content=medium_chunk, page=i+1, projectID=projectID
-                            )
-                            medium_chunk_id = medium_chunk_node.single()['id']
+                        medium_chunk_id = await self.run_query_and_get_element_id(session,
+                            "CREATE (n:MediumChunk {content: $content, type: 'medium_chunk', page: $page, projectID: $projectID}) RETURN elementId(n)",
+                            content=medium_chunk, page=i + 1, projectID=projectID
+                        )
 
-                            await session.run(
-                                "MATCH (p:PDF), (c:MediumChunk) WHERE id(p) = $pdf_id AND id(c) = $chunk_id AND p.projectID = $projectID AND c.projectID = $projectID "
-                                "CREATE (p)-[:HAS_CHUNK]->(c), (c)-[:PART_OF]->(p)",
-                                pdf_id=pdf_id, chunk_id=medium_chunk_id, projectID=projectID
-                            )
+                        await session.run(
+                            "MATCH (p:PDF {elementId: $pdf_id, projectID: $projectID}), (c:MediumChunk {elementId: $chunk_id, projectID: $projectID}) CREATE (p)-[:HAS_CHUNK]->(c), (c)-[:PART_OF]->(p)",
+                            {"pdf_id": pdf_id, "chunk_id": medium_chunk_id, "projectID": projectID}
+                        )
 
                         small_chunks = self.chunk_text(medium_chunk, SMALL_CHUNK_SIZE)
                         for k, small_chunk in enumerate(small_chunks):
-                            async with self.rate_limiter:
-                                small_chunk_node = await session.run(
-                                    "CREATE (n:SmallChunk {content: $content, type: 'small_chunk', page: $page, projectID: $projectID}) RETURN id(n)",
-                                    content=small_chunk, page=i+1, projectID=projectID
-                                )
-                                small_chunk_id = small_chunk_node.single()['id']
+                            small_chunk_id = await self.run_query_and_get_element_id(session,
+                                "CREATE (n:SmallChunk {content: $content, type: 'small_chunk', page: $page, projectID: $projectID}) RETURN elementId(n)",
+                                content=small_chunk, page=i + 1, projectID=projectID
+                            )
 
-                                await session.run(
-                                    "MATCH (mc:MediumChunk), (sc:SmallChunk) WHERE id(mc) = $medium_chunk_id AND id(sc) = $small_chunk_id AND mc.projectID = $projectID AND sc.projectID = $projectID "
-                                    "CREATE (mc)-[:HAS_CHUNK]->(sc), (sc)-[:PART_OF]->(mc)",
-                                    medium_chunk_id=medium_chunk_id, small_chunk_id=small_chunk_id, projectID=projectID
-                                )
+                            await session.run(
+                                "MATCH (mc:MediumChunk {elementId: $medium_chunk_id, projectID: $projectID}) "
+                                "WITH mc "
+                                "MATCH (sc:SmallChunk {elementId: $small_chunk_id, projectID: $projectID}) "
+                                "CREATE (mc)-[:HAS_CHUNK]->(sc), (sc)-[:PART_OF]->(mc)",
+                                {"medium_chunk_id": medium_chunk_id, "small_chunk_id": small_chunk_id, "projectID": projectID}
+                            )
 
-                                embedding = self.model.embed_text(small_chunk)
-                                embedding_node = await session.run(
-                                    "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', projectID: $projectID}) RETURN id(n)",
-                                    embedding=embedding, projectID=projectID
-                                )
-                                embedding_id = embedding_node.single()['id']
+                            embedding = await self.generate_embedding(small_chunk)
+                            embedding_id = await self.run_query_and_get_element_id(session,
+                                "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', projectID: $projectID}) RETURN elementId(n)",
+                                embedding=embedding, projectID=projectID
+                            )
 
-                                await session.run(
-                                    "MATCH (sc:SmallChunk), (e:Embedding) WHERE id(sc) = $small_chunk_id AND id(e) = $embedding_id AND sc.projectID = $projectID AND e.projectID = $projectID "
-                                    "CREATE (sc)-[:HAS_EMBEDDING]->(e)",
-                                    small_chunk_id=small_chunk_id, embedding_id=embedding_id, projectID=projectID
-                                )
+                            await session.run(
+                                "MATCH (sc:SmallChunk {elementId: $small_chunk_id, projectID: $projectID}), (e:Embedding {elementId: $embedding_id, projectID: $projectID}) CREATE (sc)-[:HAS_EMBEDDING]->(e)",
+                                {"small_chunk_id": small_chunk_id, "embedding_id": embedding_id, "projectID": projectID}
+                            )
         except Exception as e:
             logger.error(f"Error ingesting PDF file {inputPath}: {e}")
             raise FileProcessingError(f"Error ingesting PDF file {inputPath}: {e}")
@@ -1077,31 +1121,38 @@ class NIngest:
     """
     Manages the ingestion process, counting files, handling directories, and updating or deleting projects.
     """
-    def __init__(self, projectID: str = None, importer: NBaseImporter = NNeo4JImporter()):
+    def __init__(self, projectID: str, importer: NBaseImporter = NNeo4JImporter()):
         self.total_files = 0
         self.progress_bar = None
 
-        self.projectID = projectID or str(uuid.uuid4())
+        self.projectID = projectID
         self.currentOutputPath = os.path.expanduser(f"~/.ngest/projects/{self.projectID}")
         self.importer_ = importer
 
-        if not projectID:
+        if not os.path.exists(self.currentOutputPath):
             os.makedirs(self.currentOutputPath, exist_ok=True)
             open(os.path.join(self.currentOutputPath, '.ngest_index'), 'a').close()
             logger.info(f"Created new project directory at {self.currentOutputPath}")
-            
+
+    def validate_input_path(self, input_path: str) -> bool:
+        if not os.path.exists(input_path):
+            logger.error(f"Input path does not exist: {input_path}")
+            return False
+        if os.path.isfile(input_path) and os.path.getsize(input_path) > MAX_FILE_SIZE:
+            logger.error(f"File {input_path} exceeds the maximum allowed size of {MAX_FILE_SIZE} bytes.")
+            return False
+        return True
+    
     async def start_ingestion(self, inputPath: str) -> int:
-        """
-        Start the ingestion process.
-
-        Args:
-            inputPath (str): The path to the input file or directory.
-
-        Returns:
-            int: The result of the ingestion process.
-        """
-        if not validate_input_path(inputPath):
+        if not self.validate_input_path(inputPath):
             return -1
+
+        self.gitignore_patterns = self.load_gitignore_patterns(inputPath)
+
+        if not os.path.exists(self.currentOutputPath):
+            os.makedirs(self.currentOutputPath, exist_ok=True)
+            open(os.path.join(self.currentOutputPath, '.ngest_index'), 'a').close()
+            logger.info(f"Created new project directory at {self.currentOutputPath}")
 
         self.total_files = await self.count_files(inputPath)
         self.progress_bar = tqdm(total=self.total_files, desc="Ingesting files", unit="file")
@@ -1110,10 +1161,11 @@ class NIngest:
             self.progress_bar.close()
             return result
         except Exception as e:
-            logger.error(f"Error during ingestion: {e}")
+            logger.error(f"Error during ingestion in start_ingestion: {e}")
             if self.progress_bar:
                 self.progress_bar.close()
             return -1
+
 
     async def count_files(self, path: str) -> int:
         """
@@ -1142,16 +1194,15 @@ class NIngest:
         """
         async with self.importer_.get_session() as session:
             try:
-                # Remove all nodes and relationships related to this project
                 await session.run(
                     "MATCH (n) WHERE n.projectID = $projectID "
                     "DETACH DELETE n",
-                    projectID=projectID
+                    projectID=self.projectID
                 )
-                logger.info(f"Cleaned up partial ingestion for project {projectID}")
+                logger.info(f"Cleaned up partial ingestion for project {self.projectID}")
             except Exception as e:
-                logger.error(f"Error during cleanup for project {projectID}: {e}")
-                
+                logger.error(f"Error during cleanup for project {self.projectID}: {e}")
+
     async def Ingest(self, inputPath: str, currentOutputPath: str) -> int:
         """
         Ingest files from the input path into the output path.
@@ -1169,25 +1220,27 @@ class NIngest:
                 return -1
 
             inputType = 'd' if os.path.isdir(inputPath) else 'f'
-            with open(os.path.join(currentOutputPath, '.ngest_index'), 'a') as index_file:
+            index_file_path = os.path.join(currentOutputPath, '.ngest_index')
+
+            with open(index_file_path, 'a') as index_file:
                 index_file.write(f"{inputType},{inputPath}\n")
             logger.info(f"INGESTING: {inputPath}")
 
             inputLocation, inputName = os.path.split(inputPath)
             if inputType == 'd':
-                await self.IngestDirectory(inputPath, inputLocation, inputName, currentOutputPath, self.projectID)
+                await self.IngestDirectory(inputPath=inputPath, inputLocation=inputLocation, inputName=inputName, currentOutputPath=currentOutputPath, projectID=self.projectID)
             else:
                 if not self.should_ignore_file(inputPath):
-                    await self.IngestFile(inputPath, inputLocation, inputName, currentOutputPath, self.projectID)
+                    await self.IngestFile(inputPath=inputPath, inputLocation=inputLocation, inputName=inputName, currentOutputPath=currentOutputPath, projectID=self.projectID)
                     if self.progress_bar:
                         self.progress_bar.update(1)
             return 0
         
         except Exception as e:
-            logger.error(f"Error during ingestion: {e}")
+            logger.error(f"Error during ingestion in Ingest: {e}")
             await self.cleanup_partial_ingestion(self.projectID)
             return -1
-            
+
     async def IngestDirectory(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         """
         Ingest a directory by recursively processing its contents.
@@ -1232,8 +1285,13 @@ class NIngest:
         Returns:
             bool: True if the file should be ignored, False otherwise.
         """
-        gitignore_patterns = self.load_gitignore_patterns(os.path.dirname(file_path))
-        return any(fnmatch.fnmatch(os.path.basename(file_path), pattern) for pattern in gitignore_patterns)
+        for pattern in self.gitignore_patterns:
+            if fnmatch.fnmatch(file_path, pattern) or fnmatch.fnmatch(os.path.basename(file_path), pattern):
+                return True
+        # Explicitly ignore .git directory
+        if '.git/' in file_path or file_path.endswith('.git'):
+            return True
+        return False
 
     def load_gitignore_patterns(self, directory: str) -> List[str]:
         """
@@ -1321,24 +1379,6 @@ class NIngest:
             logger.error(f"Error exporting project {projectID}: {e}")
             return -1
 
-def validate_input_path(input_path: str) -> bool:
-    """
-    Validate the input path.
-
-    Args:
-        input_path (str): The path to validate.
-
-    Returns:
-        bool: True if the path is valid, False otherwise.
-    """
-    if not os.path.exists(input_path):
-        logger.error(f"Input path does not exist: {input_path}")
-        return False
-    if os.path.isfile(input_path) and os.path.getsize(input_path) > MAX_FILE_SIZE:
-        logger.error(f"File {input_path} exceeds the maximum allowed size of {MAX_FILE_SIZE} bytes.")
-        return False
-    return True
-
 def preprocess_text(text: str) -> str:
     """
     Preprocess the text by stripping leading and trailing whitespace.
@@ -1377,9 +1417,6 @@ class ProjectManager:
     """
     Provides a high-level interface for managing projects, including creating, updating, deleting, and exporting projects.
     """
-    def __init__(self):
-        self.ingest = NIngest()
-
     async def create_project(self, input_path: str) -> str:
         """
         Create a new project.
@@ -1425,19 +1462,19 @@ class ProjectManager:
         ingest_instance = NIngest(projectID=project_id)
         return await ingest_instance.delete_project(project_id)
 
-    async def export_project(self, project_id: str, output_path: str) -> int:
+    async def export_project(self, project_id: str, export_path: str) -> int:
         """
         Export a project to a JSON file.
 
         Args:
             project_id (str): The project ID.
-            output_path (str): The path to the output file.
+            export_path (str): The path to the output file.
 
         Returns:
             int: The result of the export process.
         """
         ingest_instance = NIngest(projectID=project_id)
-        return await ingest_instance.export_project(project_id, output_path)
+        return await ingest_instance.export_project(project_id, export_path)
 
 async def main():
     """
@@ -1447,7 +1484,7 @@ async def main():
     parser.add_argument('action', choices=['create', 'update', 'delete', 'export'], help='Action to perform')
     parser.add_argument('--input_path', type=str, help='Path to file or directory to ingest')
     parser.add_argument('--project_id', type=str, help='Project ID for update, delete, or export actions')
-    parser.add_argument('--output_path', type=str, help='Output path for export action')
+    parser.add_argument('--export_path', type=str, help='Output path for export action')
     args = parser.parse_args()
 
     project_manager = ProjectManager()
@@ -1469,9 +1506,9 @@ async def main():
             result = await project_manager.delete_project(args.project_id)
             print(f"Project deletion {'succeeded' if result == 0 else 'failed'}")
         elif args.action == 'export':
-            if not args.project_id or not args.output_path:
-                raise ValueError("Both project_id and output_path are required for export action")
-            result = await project_manager.export_project(args.project_id, args.output_path)
+            if not args.project_id or not args.export_path:
+                raise ValueError("Both project_id and export_path are required for export action")
+            result = await project_manager.export_project(args.project_id, args.export_path)
             print(f"Project export {'succeeded' if result == 0 else 'failed'}")
     except Exception as e:
         print(f"An error occurred: {e}")
