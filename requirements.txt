@@ -9,3 +9,6 @@ syn
 PyPDF2
 esprima
 tqdm
+aiohttp
+tenacity
+python-dotenv

@@ -16,7 +16,7 @@ import clang.cindex
 import ast
 import syn
 from PyPDF2 import PdfReader
-from typing import List, Dict, Any, Union
+from typing import List, Dict, Any, Union, Optional
 import esprima
 from esprima import nodes
 import argparse
@@ -24,28 +24,19 @@ import configparser
 from contextlib import asynccontextmanager
 import torch
 from tqdm import tqdm
+import aiohttp
+from tenacity import retry, stop_after_attempt, wait_exponential
+import dotenv
+import tempfile
 
-# Commented out unused imports
-# import magic
-# import shutil
+# Load environment variables
+dotenv.load_dotenv()
 
-# Constants (hardcoded for now)
-MAX_FILE_SIZE = 30 * 1024 * 1024
-MEDIUM_CHUNK_SIZE = 10000
-SMALL_CHUNK_SIZE = 1000
-NEO4J_URL = "bolt://localhost:7687"
-OLLAMA_URL = "http://localhost:11434"
-EMBEDDING_MODEL = "nomic-embed-text"
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Path to the configuration file
+# Constants (now loaded from environment variables with fallbacks to config file)
+config = configparser.ConfigParser()
 config_dir = os.path.expanduser("~/.ngest")
 config_file = os.path.join(config_dir, 'config.ini')
 
-# Create the configuration directory and file if they don't exist
 if not os.path.exists(config_dir):
     os.makedirs(config_dir)
 
@@ -53,18 +44,24 @@ if not os.path.isfile(config_file):
     with open(config_file, 'w') as f:
         f.write("[Limits]\nMAX_FILE_SIZE = 31457280\n\n"
                 "[Chunks]\nMEDIUM_CHUNK_SIZE = 10000\nSMALL_CHUNK_SIZE = 1000\n\n"
-                "[Database]\nNEO4J_URL = bolt://localhost:7687\n\n"
+                "[Database]\nNEO4J_URL = bolt://localhost:7687\nNEO4J_USER = neo4j\nNEO4J_PASSWORD = password\n\n"
                 "[Ollama]\nOLLAMA_URL = http://localhost:11434\n\n"
                 "[Models]\nEMBEDDING_MODEL = nomic-embed-text")
 
-# Load configuration
-config = configparser.ConfigParser()
-
-if not os.path.isfile(config_file):
-    raise FileNotFoundError(f"Configuration file '{config_file}' not found.")
-
 config.read(config_file)
 
+MAX_FILE_SIZE = int(os.getenv('MAX_FILE_SIZE', config.get('Limits', 'MAX_FILE_SIZE')))
+MEDIUM_CHUNK_SIZE = int(os.getenv('MEDIUM_CHUNK_SIZE', config.get('Chunks', 'MEDIUM_CHUNK_SIZE')))
+SMALL_CHUNK_SIZE = int(os.getenv('SMALL_CHUNK_SIZE', config.get('Chunks', 'SMALL_CHUNK_SIZE')))
+NEO4J_URL = os.getenv('NEO4J_URL', config.get('Database', 'NEO4J_URL'))
+NEO4J_USER = os.getenv('NEO4J_USER', config.get('Database', 'NEO4J_USER'))
+NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD', config.get('Database', 'NEO4J_PASSWORD'))
+OLLAMA_URL = os.getenv('OLLAMA_URL', config.get('Ollama', 'OLLAMA_URL'))
+EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', config.get('Models', 'EMBEDDING_MODEL'))
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 class NBaseImporter(ABC):
     @abstractmethod
@@ -99,6 +96,7 @@ class NBaseImporter(ABC):
         else:
             return 'unknown'
 
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     async def create_graph_nodes(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         logger.info(f"Creating graph nodes for {inputPath}")
         # Implement the actual graph node creation logic here
@@ -124,7 +122,8 @@ class NBaseImporter(ABC):
     def chunk_text(self, text: str, chunk_size: int) -> List[str]:
         return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
-    async def create_chunk_node(self, session, chunk: str, inputPath: str, index: int, projectID: str) -> str:
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    async def create_chunk_node(self, session, chunk: str, inputPath: str, index: int, projectID: str) -> Optional[str]:
         embedding = self.model.embed_text(chunk)
         chunk_id = f"{inputPath}_chunk_{index}"
         try:
@@ -139,6 +138,7 @@ class NBaseImporter(ABC):
             logger.error(f"Error creating chunk node: {e}")
             return None
 
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     async def create_chunk_relationship(self, session, chunk_id1: str, chunk_id2: str, projectID: str) -> None:
         try:
             await session.run(
@@ -148,7 +148,6 @@ class NBaseImporter(ABC):
             logger.info(f"Created relationship between {chunk_id1} and {chunk_id2}")
         except Exception as e:
             logger.error(f"Error creating chunk relationship: {e}")
-
 
 class NFilesystemImporter(NBaseImporter):
     async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
@@ -164,11 +163,12 @@ class NFilesystemImporter(NBaseImporter):
         except Exception as e:
             logger.error(f"Error ingesting file {inputPath}: {e}")
 
-
 class NNeo4JImporter(NBaseImporter):
-    def __init__(self, neo4j_url: str = NEO4J_URL):
+    def __init__(self, neo4j_url: str = NEO4J_URL, neo4j_user: str = NEO4J_USER, neo4j_password: str = NEO4J_PASSWORD):
         self.neo4j_url = neo4j_url
-        self.driver = AsyncGraphDatabase.driver(self.neo4j_url)
+        self.neo4j_user = neo4j_user
+        self.neo4j_password = neo4j_password
+        self.driver = AsyncGraphDatabase.driver(self.neo4j_url, auth=(self.neo4j_user, self.neo4j_password))
         self.index = clang.cindex.Index.create()
         
         self.device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -205,6 +205,7 @@ class NNeo4JImporter(NBaseImporter):
     async def summarize_text(self, text: str) -> str:
         return self.summarizer(text, max_length=50, min_length=25, do_sample=False)[0]['summary_text']
 
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     async def process_chunks(self, session, text, parent_node_id, parent_node_type, chunk_size, chunk_type, projectID):
         chunks = self.chunk_text(text, chunk_size)
         for i, chunk in enumerate(chunks):
@@ -720,7 +721,6 @@ class NIngest:
     async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         await self.importer_.IngestFile(inputPath, inputLocation, inputName, currentOutputPath, projectID)
 
-
 async def main():
     parser = argparse.ArgumentParser(description='Ingest files into Neo4j database')
     parser.add_argument('input_path', type=str, help='Path to file or directory to ingest')
@@ -731,7 +731,5 @@ async def main():
     result = await ingest_instance.start_ingestion(args.input_path)
     print(f"Ingestion {'succeeded' if result == 0 else 'failed'}")
 
-
 if __name__ == "__main__":
     asyncio.run(main())
-
