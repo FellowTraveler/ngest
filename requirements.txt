@@ -1,0 +1,9 @@
+ollama
+neo4j
+Pillow
+torch
+torchvision
+transformers
+libclang
+astor
+syn
