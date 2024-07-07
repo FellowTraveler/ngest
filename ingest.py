@@ -25,26 +25,46 @@ from contextlib import asynccontextmanager
 import torch
 from tqdm import tqdm
 
+# Commented out unused imports
+# import magic
+# import shutil
+
+# Constants (hardcoded for now)
+MAX_FILE_SIZE = 30 * 1024 * 1024
+MEDIUM_CHUNK_SIZE = 10000
+SMALL_CHUNK_SIZE = 1000
+NEO4J_URL = "bolt://localhost:7687"
+OLLAMA_URL = "http://localhost:11434"
+EMBEDDING_MODEL = "nomic-embed-text"
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Path to the configuration file
+config_dir = os.path.expanduser("~/.ngest")
+config_file = os.path.join(config_dir, 'config.ini')
+
+# Create the configuration directory and file if they don't exist
+if not os.path.exists(config_dir):
+    os.makedirs(config_dir)
+
+if not os.path.isfile(config_file):
+    with open(config_file, 'w') as f:
+        f.write("[Limits]\nMAX_FILE_SIZE = 31457280\n\n"
+                "[Chunks]\nMEDIUM_CHUNK_SIZE = 10000\nSMALL_CHUNK_SIZE = 1000\n\n"
+                "[Database]\nNEO4J_URL = bolt://localhost:7687\n\n"
+                "[Ollama]\nOLLAMA_URL = http://localhost:11434\n\n"
+                "[Models]\nEMBEDDING_MODEL = nomic-embed-text")
+
 # Load configuration
 config = configparser.ConfigParser()
-config_file = 'config.ini'
 
 if not os.path.isfile(config_file):
     raise FileNotFoundError(f"Configuration file '{config_file}' not found.")
 
 config.read(config_file)
 
-# Constants from config
-MAX_FILE_SIZE = config.getint('Limits', 'MAX_FILE_SIZE', fallback=30 * 1024 * 1024)
-MEDIUM_CHUNK_SIZE = config.getint('Chunks', 'MEDIUM_CHUNK_SIZE', fallback=10000)
-SMALL_CHUNK_SIZE = config.getint('Chunks', 'SMALL_CHUNK_SIZE', fallback=1000)
-NEO4J_URL = config.get('Database', 'NEO4J_URL', fallback="bolt://localhost:7687")
-OLLAMA_URL = config.get('Ollama', 'OLLAMA_URL', fallback="http://localhost:11434")
-EMBEDDING_MODEL = config.get('Models', 'EMBEDDING_MODEL', fallback="nomic-embed-text")
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 class NBaseImporter(ABC):
     @abstractmethod
@@ -129,6 +149,7 @@ class NBaseImporter(ABC):
         except Exception as e:
             logger.error(f"Error creating chunk relationship: {e}")
 
+
 class NFilesystemImporter(NBaseImporter):
     async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         if os.path.getsize(inputPath) > MAX_FILE_SIZE:
@@ -142,6 +163,7 @@ class NFilesystemImporter(NBaseImporter):
             logger.info(f"File {inputPath} ingested successfully.")
         except Exception as e:
             logger.error(f"Error ingesting file {inputPath}: {e}")
+
 
 class NNeo4JImporter(NBaseImporter):
     def __init__(self, neo4j_url: str = NEO4J_URL):
@@ -182,7 +204,32 @@ class NNeo4JImporter(NBaseImporter):
 
     async def summarize_text(self, text: str) -> str:
         return self.summarizer(text, max_length=50, min_length=25, do_sample=False)[0]['summary_text']
-    
+
+    async def process_chunks(self, session, text, parent_node_id, parent_node_type, chunk_size, chunk_type, projectID):
+        chunks = self.chunk_text(text, chunk_size)
+        for i, chunk in enumerate(chunks):
+            chunk_node = await session.run(
+                f"CREATE (n:{chunk_type} {{content: $content, type: $chunk_type, projectID: $projectID}}) RETURN id(n)",
+                content=chunk, chunk_type=chunk_type, projectID=projectID
+            )
+            chunk_id = chunk_node.single()['id']
+            await session.run(
+                f"MATCH (p:{parent_node_type}), (c:{chunk_type}) WHERE id(p) = $parent_node_id AND id(c) = $chunk_id AND p.projectID = $projectID AND c.projectID = $projectID "
+                f"CREATE (p)-[:HAS_CHUNK]->(c), (c)-[:PART_OF]->(p)",
+                parent_node_id=parent_node_id, chunk_id=chunk_id, projectID=projectID
+            )
+            embedding = self.model.embed_text(chunk)
+            embedding_node = await session.run(
+                "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', projectID: $projectID}) RETURN id(n)",
+                embedding=embedding, projectID=projectID
+            )
+            embedding_id = embedding_node.single()['id']
+            await session.run(
+                f"MATCH (c:{chunk_type}), (e:Embedding) WHERE id(c) = $chunk_id AND id(e) = $embedding_id AND c.projectID = $projectID AND e.projectID = $projectID "
+                f"CREATE (c)-[:HAS_EMBEDDING]->(e)",
+                chunk_id=chunk_id, embedding_id=embedding_id, projectID=projectID
+            )
+
     async def IngestTxt(self, input_path: str, input_location: str, input_name: str, current_output_path: str, project_id: str) -> None:
         async with self.get_session() as session:
             try:
@@ -199,46 +246,8 @@ class NNeo4JImporter(NBaseImporter):
                 )
                 parent_doc_id = parent_doc_node.single()['id']
 
-                medium_chunks = self.chunk_text(file_content, MEDIUM_CHUNK_SIZE)
-                for i, medium_chunk in enumerate(medium_chunks):
-                    medium_chunk_node = await session.run(
-                        "CREATE (n:MediumChunk {content: $content, type: 'medium_chunk', projectID: $projectID}) RETURN id(n)",
-                        content=medium_chunk, projectID=project_id
-                    )
-                    medium_chunk_id = medium_chunk_node.single()['id']
+                await self.process_chunks(session, file_content, parent_doc_id, "Document", MEDIUM_CHUNK_SIZE, "MediumChunk", project_id)
 
-                    await session.run(
-                        "MATCH (d:Document), (c:MediumChunk) WHERE id(d) = $doc_id AND id(c) = $chunk_id AND d.projectID = $projectID AND c.projectID = $projectID "
-                        "CREATE (d)-[:HAS_CHUNK]->(c), (c)-[:PART_OF]->(d)",
-                        doc_id=parent_doc_id, chunk_id=medium_chunk_id, projectID=project_id
-                    )
-
-                    small_chunks = self.chunk_text(medium_chunk, SMALL_CHUNK_SIZE)
-                    for j, small_chunk in enumerate(small_chunks):
-                        small_chunk_node = await session.run(
-                            "CREATE (n:SmallChunk {content: $content, type: 'small_chunk', projectID: $projectID}) RETURN id(n)",
-                            content=small_chunk, projectID=project_id
-                        )
-                        small_chunk_id = small_chunk_node.single()['id']
-
-                        await session.run(
-                            "MATCH (mc:MediumChunk), (sc:SmallChunk) WHERE id(mc) = $medium_chunk_id AND id(sc) = $small_chunk_id AND mc.projectID = $projectID AND sc.projectID = $projectID "
-                            "CREATE (mc)-[:HAS_CHUNK]->(sc), (sc)-[:PART_OF]->(mc)",
-                            medium_chunk_id=medium_chunk_id, small_chunk_id=small_chunk_id, projectID=project_id
-                        )
-
-                        embedding = self.model.embed_text(small_chunk)
-                        embedding_node = await session.run(
-                            "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', projectID: $projectID}) RETURN id(n)",
-                            embedding=embedding, projectID=project_id
-                        )
-                        embedding_id = embedding_node.single()['id']
-
-                        await session.run(
-                            "MATCH (sc:SmallChunk), (e:Embedding) WHERE id(sc) = $small_chunk_id AND id(e) = $embedding_id AND sc.projectID = $projectID AND e.projectID = $projectID "
-                            "CREATE (sc)-[:HAS_EMBEDDING]->(e)",
-                            small_chunk_id=small_chunk_id, embedding_id=embedding_id, projectID=project_id
-                        )
             except Exception as e:
                 logger.error(f"Error ingesting text file {input_path}: {e}")
 
@@ -544,7 +553,27 @@ class NNeo4JImporter(NBaseImporter):
                 )
             except Exception as e:
                 logger.error(f"Error processing JavaScript variable {var_name}: {e}")
-                
+
+    async def process_js_method(self, session, method_node, class_id: int, projectID: str) -> None:
+        method_name = method_node.key.name
+        method_summary = await self.summarize_js_function(method_node.value)
+        embedding = self.model.embed_text(method_summary)
+
+        try:
+            method_db_node = await session.run(
+                "CREATE (n:JavaScriptMethod {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN id(n)",
+                name=method_name, summary=method_summary, embedding=embedding, projectID=projectID
+            )
+            method_db_id = method_db_node.single()['id']
+
+            await session.run(
+                "MATCH (c:JavaScriptClass), (m:JavaScriptMethod) WHERE id(c) = $class_id AND id(m) = $method_id AND c.projectID = $projectID AND m.projectID = $projectID "
+                "CREATE (c)-[:HAS_METHOD]->(m)",
+                class_id=class_id, method_id=method_db_id, projectID=projectID
+            )
+        except Exception as e:
+            logger.error(f"Error processing JavaScript method {method_name}: {e}")
+
     async def IngestPdf(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         try:
             reader = PdfReader(inputPath)
@@ -603,26 +632,6 @@ class NNeo4JImporter(NBaseImporter):
                             )
         except Exception as e:
             logger.error(f"Error ingesting PDF file {inputPath}: {e}")
-
-    async def process_js_method(self, session, method_node, class_id: int, projectID: str) -> None:
-        method_name = method_node.key.name
-        method_summary = await self.summarize_js_function(method_node.value)
-        embedding = self.model.embed_text(method_summary)
-
-        try:
-            method_db_node = await session.run(
-                "CREATE (n:JavaScriptMethod {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN id(n)",
-                name=method_name, summary=method_summary, embedding=embedding, projectID=projectID
-            )
-            method_db_id = method_db_node.single()['id']
-
-            await session.run(
-                "MATCH (c:JavaScriptClass), (m:JavaScriptMethod) WHERE id(c) = $class_id AND id(m) = $method_id AND c.projectID = $projectID AND m.projectID = $projectID "
-                "CREATE (c)-[:HAS_METHOD]->(m)",
-                class_id=class_id, method_id=method_db_id, projectID=projectID
-            )
-        except Exception as e:
-            logger.error(f"Error processing JavaScript method {method_name}: {e}")
 
 class NIngest:
     def __init__(self, projectID: str = None, importer: NBaseImporter = NNeo4JImporter()):
@@ -711,6 +720,7 @@ class NIngest:
     async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         await self.importer_.IngestFile(inputPath, inputLocation, inputName, currentOutputPath, projectID)
 
+
 async def main():
     parser = argparse.ArgumentParser(description='Ingest files into Neo4j database')
     parser.add_argument('input_path', type=str, help='Path to file or directory to ingest')
@@ -721,5 +731,7 @@ async def main():
     result = await ingest_instance.start_ingestion(args.input_path)
     print(f"Ingestion {'succeeded' if result == 0 else 'failed'}")
 
+
 if __name__ == "__main__":
     asyncio.run(main())
+
