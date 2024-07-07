@@ -164,16 +164,6 @@ class NBaseImporter(ABC):
                 raise FileProcessingError(f"Error processing file {inputPath}: {e}")
 
     def chunk_text(self, text: str, chunk_size: int) -> List[str]:
-        """
-        Chunk the given text into smaller pieces.
-
-        Args:
-            text (str): The text to be chunked.
-            chunk_size (int): The size of each chunk.
-
-        Returns:
-            List[str]: A list of text chunks.
-        """
         return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
@@ -370,15 +360,15 @@ class NNeo4JImporter(NBaseImporter):
 
     async def process_chunks(self, session, text, parent_node_id, parent_node_type, chunk_size, chunk_type, projectID):
         """
-        Process text chunks and create nodes in the database.
+        Process text chunks and create corresponding nodes in the Neo4j database.
 
         Args:
             session: The Neo4j session.
-            text: The text to be chunked and processed.
-            parent_node_id: The parent node ID.
-            parent_node_type: The parent node type.
+            text: The text to be chunked.
+            parent_node_id: The ID of the parent node.
+            parent_node_type: The type of the parent node.
             chunk_size: The size of each chunk.
-            chunk_type: The type of chunk.
+            chunk_type: The type of the chunk.
             projectID: The project ID.
         """
         chunks = self.chunk_text(text, chunk_size)
@@ -388,14 +378,14 @@ class NNeo4JImporter(NBaseImporter):
 
     async def create_chunk_with_embedding(self, session, chunk, parent_node_id, parent_node_type, chunk_type, projectID):
         """
-        Create a chunk node with an embedding in the database.
+        Create a chunk node with embedding in the Neo4j database.
 
         Args:
             session: The Neo4j session.
             chunk: The text chunk.
-            parent_node_id: The parent node ID.
-            parent_node_type: The parent node type.
-            chunk_type: The type of chunk.
+            parent_node_id: The ID of the parent node.
+            parent_node_type: The type of the parent node.
+            chunk_type: The type of the chunk.
             projectID: The project ID.
         """
         try:
@@ -793,7 +783,7 @@ class NNeo4JImporter(NBaseImporter):
 
     async def summarize_rust_impl(self, impl) -> str:
         """
-        Summarize a Rust implementation.
+        Summarize a Rust implementation block.
 
         Args:
             impl: The implementation node.
@@ -859,16 +849,55 @@ class NNeo4JImporter(NBaseImporter):
                 logger.error(f"Error ingesting JavaScript file {inputPath}: {e}")
                 raise DatabaseError(f"Error ingesting JavaScript file {inputPath}: {e}")
 
-    async def process_js_function(self, session, func_node, file_id: int, projectID: str) -> None:
+    async def summarize_js_function(self, func_node) -> str:
         """
-        Process a JavaScript function node and create nodes in the database.
+        Summarize a JavaScript function.
 
         Args:
-            session: The Neo4j session.
             func_node: The function node.
-            file_id: The file ID.
-            projectID: The project ID.
+
+        Returns:
+            str: The summary of the function.
         """
+        func_name = func_node.id.name if func_node.id else 'anonymous'
+        description = f"Function {func_name} with arguments: {', '.join(param.name for param in func_node.params)}."
+        return await self.summarize_text(description)
+
+    async def summarize_js_variable(self, var_node) -> str:
+        """
+        Summarize a JavaScript variable.
+
+        Args:
+            var_node: The variable node.
+
+        Returns:
+            str: The summary of the variable.
+        """
+        descriptions = []
+        for declaration in var_node.declarations:
+            var_name = declaration.id.name
+            var_type = var_node.kind
+            description = f"Variable {var_name} of type {var_type}."
+            descriptions.append(description)
+        return await self.summarize_text(" ".join(descriptions))
+
+
+    async def summarize_js_class(self, class_node) -> str:
+        """
+        Summarize a JavaScript class.
+
+        Args:
+            class_node: The class node.
+
+        Returns:
+            str: The summary of the class.
+        """
+        description = f"Class {class_node.id.name} with methods: "
+        methods = [method.key.name for method in class_node.body.body if isinstance(method, nodes.MethodDefinition)]
+        description += ", ".join(methods)
+        return await self.summarize_text(description)
+
+    async def process_js_function(self, session, func_node, file_id: int, projectID: str) -> None:
         func_name = func_node.id.name if func_node.id else 'anonymous'
         func_summary = await self.summarize_js_function(func_node)
         embedding = self.model.embed_text(func_summary)
@@ -891,15 +920,6 @@ class NNeo4JImporter(NBaseImporter):
             raise DatabaseError(f"Error processing JavaScript function {func_name}: {e}")
 
     async def process_js_class(self, session, class_node, file_id: int, projectID: str) -> None:
-        """
-        Process a JavaScript class node and create nodes in the database.
-
-        Args:
-            session: The Neo4j session.
-            class_node: The class node.
-            file_id: The file ID.
-            projectID: The project ID.
-        """
         class_name = class_node.id.name
         class_summary = await self.summarize_js_class(class_node)
         embedding = self.model.embed_text(class_summary)
@@ -926,15 +946,6 @@ class NNeo4JImporter(NBaseImporter):
             raise DatabaseError(f"Error processing JavaScript class {class_name}: {e}")
 
     async def process_js_variable(self, session, var_node, file_id: int, projectID: str) -> None:
-        """
-        Process a JavaScript variable node and create nodes in the database.
-
-        Args:
-            session: The Neo4j session.
-            var_node: The variable node.
-            file_id: The file ID.
-            projectID: The project ID.
-        """
         for declaration in var_node.declarations:
             var_name = declaration.id.name
             var_type = var_node.kind  # 'var', 'let', or 'const'
@@ -988,47 +999,6 @@ class NNeo4JImporter(NBaseImporter):
         except Exception as e:
             logger.error(f"Error processing JavaScript method {method_name}: {e}")
             raise DatabaseError(f"Error processing JavaScript method {method_name}: {e}")
-
-    async def summarize_js_function(self, func) -> str:
-        """
-        Summarize a JavaScript function.
-
-        Args:
-            func: The function node.
-
-        Returns:
-            str: The summary of the function.
-        """
-        description = f"Function {func.id.name if func.id else 'anonymous'} with arguments: {', '.join(param.name for param in func.params)}. It performs the following tasks: "
-        return await self.summarize_text(description)
-
-    async def summarize_js_class(self, cls) -> str:
-        """
-        Summarize a JavaScript class.
-
-        Args:
-            cls: The class node.
-
-        Returns:
-            str: The summary of the class.
-        """
-        description = f"Class {cls.id.name} with methods: "
-        methods = [method.key.name for method in cls.body.body if isinstance(method, nodes.MethodDefinition)]
-        description += ", ".join(methods)
-        return await self.summarize_text(description)
-
-    async def summarize_js_variable(self, var) -> str:
-        """
-        Summarize a JavaScript variable.
-
-        Args:
-            var: The variable node.
-
-        Returns:
-            str: The summary of the variable.
-        """
-        description = f"Variable {var.declarations[0].id.name} of type {var.kind}. It is initialized as: "
-        return await self.summarize_text(description)
 
     async def IngestPdf(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         """
@@ -1220,7 +1190,7 @@ class NIngest:
             
     async def IngestDirectory(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         """
-        Ingest all files in a directory.
+        Ingest a directory by recursively processing its contents.
 
         Args:
             inputPath (str): The path to the input directory.
