@@ -1,14 +1,11 @@
-neo4j
-neo4j-async
 ollama
+neo4j
 Pillow
+torch
 torchvision
 transformers
-clang
+libclang
 syn
 PyPDF2
-python-magic
 esprima
-configparser
-torch
 tqdm
