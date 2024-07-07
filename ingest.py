@@ -28,6 +28,7 @@ import aiohttp
 from tenacity import retry, stop_after_attempt, wait_exponential
 import dotenv
 import tempfile
+import unittest
 
 # Load environment variables
 dotenv.load_dotenv()
@@ -59,9 +60,10 @@ NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD', config.get('Database', 'NEO4J_PASSW
 OLLAMA_URL = os.getenv('OLLAMA_URL', config.get('Ollama', 'OLLAMA_URL'))
 EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', config.get('Models', 'EMBEDDING_MODEL'))
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure logging with different levels
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
 
 class NBaseImporter(ABC):
     @abstractmethod
@@ -104,13 +106,11 @@ class NBaseImporter(ABC):
     async def chunk_and_create_nodes(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         async with self.driver.session() as session:
             try:
-                chunks = []
-                for chunk in read_file_in_chunks(inputPath, MEDIUM_CHUNK_SIZE):
-                    chunks.append(chunk)
+                chunks = [chunk for chunk in read_file_in_chunks(inputPath, MEDIUM_CHUNK_SIZE)]
                 previous_chunk_id = None
 
                 for i, chunk in enumerate(chunks):
-                    chunk_id = await self.create_chunk_node(session, chunk, inputPath, i, projectID)
+                    chunk_id = await self.handle_chunk_creation(session, chunk, inputPath, i, projectID)
                     if previous_chunk_id:
                         await self.create_chunk_relationship(session, previous_chunk_id, chunk_id, projectID)
                     previous_chunk_id = chunk_id
@@ -155,6 +155,14 @@ class NBaseImporter(ABC):
                 logger.error(f"No result returned for creating relationship between {chunk_id1} and {chunk_id2}")
         except Exception as e:
             logger.error(f"Error creating chunk relationship: {e}")
+
+    async def handle_chunk_creation(self, session, chunk, inputPath, index, projectID):
+        try:
+            chunk_id = await self.create_chunk_node(session, chunk, inputPath, index, projectID)
+            return chunk_id
+        except Exception as e:
+            logger.error(f"Error creating chunk node for chunk {index} in file {inputPath}: {e}")
+            return None
 
 class NFilesystemImporter(NBaseImporter):
     async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
@@ -227,30 +235,33 @@ class NNeo4JImporter(NBaseImporter):
     async def process_chunks(self, session, text, parent_node_id, parent_node_type, chunk_size, chunk_type, projectID):
         chunks = self.chunk_text(text, chunk_size)
         for i, chunk in enumerate(chunks):
-            try:
-                chunk_node = await session.run(
-                    f"CREATE (n:{chunk_type} {{content: $content, type: $chunk_type, projectID: $projectID}}) RETURN id(n)",
-                    content=chunk, chunk_type=chunk_type, projectID=projectID
-                )
-                chunk_id = chunk_node.single()['id']
-                await session.run(
-                    f"MATCH (p:{parent_node_type}), (c:{chunk_type}) WHERE id(p) = $parent_node_id AND id(c) = $chunk_id AND p.projectID = $projectID AND c.projectID = $projectID "
-                    f"CREATE (p)-[:HAS_CHUNK]->(c), (c)-[:PART_OF]->(p)",
-                    parent_node_id=parent_node_id, chunk_id=chunk_id, projectID=projectID
-                )
-                embedding = self.model.embed_text(chunk)
-                embedding_node = await session.run(
-                    "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', projectID: $projectID}) RETURN id(n)",
-                    embedding=embedding, projectID=projectID
-                )
-                embedding_id = embedding_node.single()['id']
-                await session.run(
-                    f"MATCH (c:{chunk_type}), (e:Embedding) WHERE id(c) = $chunk_id AND id(e) = $embedding_id AND c.projectID = $projectID AND e.projectID = $projectID "
-                    f"CREATE (c)-[:HAS_EMBEDDING]->(e)",
-                    chunk_id=chunk_id, embedding_id=embedding_id, projectID=projectID
-                )
-            except Exception as e:
-                logger.error(f"Error processing chunk: {e}")
+            await self.create_chunk_with_embedding(session, chunk, parent_node_id, parent_node_type, chunk_type, projectID)
+
+    async def create_chunk_with_embedding(self, session, chunk, parent_node_id, parent_node_type, chunk_type, projectID):
+        try:
+            chunk_node = await session.run(
+                f"CREATE (n:{chunk_type} {{content: $content, type: $chunk_type, projectID: $projectID}}) RETURN id(n)",
+                content=chunk, chunk_type=chunk_type, projectID=projectID
+            )
+            chunk_id = chunk_node.single()['id']
+            await session.run(
+                f"MATCH (p:{parent_node_type}), (c:{chunk_type}) WHERE id(p) = $parent_node_id AND id(c) = $chunk_id AND p.projectID = $projectID AND c.projectID = $projectID "
+                f"CREATE (p)-[:HAS_CHUNK]->(c), (c)-[:PART_OF]->(p)",
+                parent_node_id=parent_node_id, chunk_id=chunk_id, projectID=projectID
+            )
+            embedding = self.model.embed_text(chunk)
+            embedding_node = await session.run(
+                "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', projectID: $projectID}) RETURN id(n)",
+                embedding=embedding, projectID=projectID
+            )
+            embedding_id = embedding_node.single()['id']
+            await session.run(
+                f"MATCH (c:{chunk_type}), (e:Embedding) WHERE id(c) = $chunk_id AND id(e) = $embedding_id AND c.projectID = $projectID AND e.projectID = $projectID "
+                f"CREATE (c)-[:HAS_EMBEDDING]->(e)",
+                chunk_id=chunk_id, embedding_id=embedding_id, projectID=projectID
+            )
+        except Exception as e:
+            logger.error(f"Error creating chunk with embedding: {e}")
 
     async def IngestTxt(self, input_path: str, input_location: str, input_name: str, current_output_path: str, project_id: str) -> None:
         async with self.get_session() as session:
@@ -292,28 +303,35 @@ class NNeo4JImporter(NBaseImporter):
     async def IngestImg(self, input_path: str, input_location: str, input_name: str, current_output_path: str, project_id: str) -> None:
         try:
             image = PIL.Image.open(input_path)
-            features = await self.extract_image_features(image)
-
-            async with self.get_session() as session:
-                image_node = await session.run(
-                    "CREATE (n:Image {name: $name, type: 'image', projectID: $projectID}) RETURN id(n)",
-                    name=input_name, projectID=project_id
-                )
-                image_id = image_node.single()['id']
-
-                features_node = await session.run(
-                    "CREATE (n:ImageFeatures {features: $features, type: 'image_features', projectID: $projectID}) RETURN id(n)",
-                    features=features, projectID=project_id
-                )
-                features_id = features_node.single()['id']
-
-                await session.run(
-                    "MATCH (i:Image), (f:ImageFeatures) WHERE id(i) = $image_id AND id(f) = $features_id AND i.projectID = $projectID AND f.projectID = $projectID "
-                    "CREATE (i)-[:HAS_FEATURES]->(f)",
-                    image_id=image_id, features_id=features_id, projectID=project_id
-                )
+            await self.process_image_file(image, input_name, project_id)
         except Exception as e:
             logger.error(f"Error ingesting image: {e}")
+
+    async def process_image_file(self, image: PIL.Image.Image, input_name: str, project_id: str):
+        features = await self.extract_image_features(image)
+
+        async with self.get_session() as session:
+            await self.store_image_features(session, features, input_name, project_id)
+
+    async def store_image_features(self, session, features: List[float], input_name: str, project_id: str):
+        try:
+            image_node = await session.run(
+                "CREATE (n:Image {name: $name, type: 'image', projectID: $projectID}) RETURN id(n)",
+                name=input_name, projectID=project_id
+            )
+            image_id = image_node.single()['id']
+            features_node = await session.run(
+                "CREATE (n:ImageFeatures {features: $features, type: 'image_features', projectID: $projectID}) RETURN id(n)",
+                features=features, projectID=project_id
+            )
+            features_id = features_node.single()['id']
+            await session.run(
+                "MATCH (i:Image), (f:ImageFeatures) WHERE id(i) = $image_id AND id(f) = $features_id AND i.projectID = $projectID AND f.projectID = $projectID "
+                "CREATE (i)-[:HAS_FEATURES]->(f)",
+                image_id=image_id, features_id=features_id, projectID=project_id
+            )
+        except Exception as e:
+            logger.error(f"Error storing image features: {e}")
 
     async def summarize_cpp_class(self, cls) -> str:
         description = f"Class {cls.spelling} with public methods: "
@@ -670,6 +688,9 @@ class NIngest:
             logger.info(f"Created new project directory at {self.currentOutputPath}")
             
     async def start_ingestion(self, inputPath: str) -> int:
+        if not validate_input_path(inputPath):
+            return -1
+
         self.total_files = await self.count_files(inputPath)
         self.progress_bar = tqdm(total=self.total_files, desc="Ingesting files")
         try:
@@ -741,6 +762,18 @@ class NIngest:
 
     async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         await self.importer_.IngestFile(inputPath, inputLocation, inputName, currentOutputPath, projectID)
+
+def validate_input_path(input_path: str) -> bool:
+    if not os.path.exists(input_path):
+        logger.error(f"Input path does not exist: {input_path}")
+        return False
+    if os.path.isfile(input_path) and os.path.getsize(input_path) > MAX_FILE_SIZE:
+        logger.error(f"File {input_path} exceeds the maximum allowed size of {MAX_FILE_SIZE} bytes.")
+        return False
+    return True
+
+def preprocess_text(text: str) -> str:
+    return text.strip()
 
 def read_file_in_chunks(file_path: str, chunk_size: int = 1024) -> Generator[str, None, None]:
     try:
