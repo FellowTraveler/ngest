@@ -8,5 +8,7 @@ clang
 syn
 PyPDF2
 python-magic
-asyncio
 esprima
+configparser
+torch
+tqdm
