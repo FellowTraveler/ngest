@@ -6,7 +6,6 @@ import uuid
 import logging
 from abc import ABC, abstractmethod
 import asyncio
-import ollama
 from neo4j import AsyncGraphDatabase
 import PIL.Image
 import torchvision.transforms as transforms
@@ -35,6 +34,7 @@ import shutil
 from pathlib import Path
 import fnmatch
 import aiorate
+import ollama
 
 # Load environment variables
 dotenv.load_dotenv()
@@ -97,6 +97,10 @@ class ConfigurationError(CustomError):
     pass
 
 class NBaseImporter(ABC):
+    """
+    Abstract base class for file importers. Provides methods to determine file types
+    and handle file chunking and graph node creation.
+    """
     @abstractmethod
     async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         pass
@@ -131,6 +135,16 @@ class NBaseImporter(ABC):
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     async def create_graph_nodes(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
+        """
+        Create graph nodes in the Neo4j database for a given file.
+
+        Args:
+            inputPath (str): The path to the input file.
+            inputLocation (str): The location of the input file.
+            inputName (str): The name of the input file.
+            currentOutputPath (str): The current output path.
+            projectID (str): The project ID.
+        """
         logger.info(f"Creating graph nodes for {inputPath}")
         # Implement the actual graph node creation logic here
 
@@ -150,10 +164,33 @@ class NBaseImporter(ABC):
                 raise FileProcessingError(f"Error processing file {inputPath}: {e}")
 
     def chunk_text(self, text: str, chunk_size: int) -> List[str]:
+        """
+        Chunk the given text into smaller pieces.
+
+        Args:
+            text (str): The text to be chunked.
+            chunk_size (int): The size of each chunk.
+
+        Returns:
+            List[str]: A list of text chunks.
+        """
         return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     async def create_chunk_node(self, session, chunk: str, inputPath: str, index: int, projectID: str) -> Optional[str]:
+        """
+        Create a chunk node in the Neo4j database.
+
+        Args:
+            session: The Neo4j session.
+            chunk (str): The text chunk.
+            inputPath (str): The path to the input file.
+            index (int): The index of the chunk.
+            projectID (str): The project ID.
+
+        Returns:
+            Optional[str]: The chunk ID, or None if creation failed.
+        """
         embedding = self.model.embed_text(chunk)
         chunk_id = f"{inputPath}_chunk_{index}"
         try:
@@ -175,6 +212,15 @@ class NBaseImporter(ABC):
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     async def create_chunk_relationship(self, session, chunk_id1: str, chunk_id2: str, projectID: str) -> None:
+        """
+        Create a relationship between two chunks in the Neo4j database.
+
+        Args:
+            session: The Neo4j session.
+            chunk_id1 (str): The ID of the first chunk.
+            chunk_id2 (str): The ID of the second chunk.
+            projectID (str): The project ID.
+        """
         try:
             result = await session.run(
                 "MATCH (c1:Chunk {id: $id1, projectID: $projectID}), (c2:Chunk {id: $id2, projectID: $projectID}) "
@@ -190,6 +236,19 @@ class NBaseImporter(ABC):
             raise DatabaseError(f"Error creating chunk relationship: {e}")
 
     async def handle_chunk_creation(self, session, chunk, inputPath, index, projectID):
+        """
+        Handle the creation of a chunk node.
+
+        Args:
+            session: The Neo4j session.
+            chunk: The text chunk.
+            inputPath: The path to the input file.
+            index: The index of the chunk.
+            projectID: The project ID.
+
+        Returns:
+            The chunk ID.
+        """
         try:
             chunk_id = await self.create_chunk_node(session, chunk, inputPath, index, projectID)
             return chunk_id
@@ -198,7 +257,20 @@ class NBaseImporter(ABC):
             raise DatabaseError(f"Error creating chunk node for chunk {index} in file {inputPath}: {e}")
 
 class NFilesystemImporter(NBaseImporter):
+    """
+    A file importer that simply copies files to the output directory.
+    """
     async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
+        """
+        Ingest a file by copying it to the output directory.
+
+        Args:
+            inputPath (str): The path to the input file.
+            inputLocation (str): The location of the input file.
+            inputName (str): The name of the input file.
+            currentOutputPath (str): The current output path.
+            projectID (str): The project ID.
+        """
         if os.path.getsize(inputPath) > MAX_FILE_SIZE:
             logger.info(f"File {inputPath} skipped due to size.")
             open(os.path.join(currentOutputPath, f"{inputName}.skipped"), 'a').close()
@@ -212,6 +284,9 @@ class NFilesystemImporter(NBaseImporter):
             raise FileProcessingError(f"Error ingesting file {inputPath}: {e}")
 
 class NNeo4JImporter(NBaseImporter):
+    """
+    A file importer that ingests various file types into a Neo4j database.
+    """
     def __init__(self, neo4j_url: str = NEO4J_URL, neo4j_user: str = NEO4J_USER, neo4j_password: str = NEO4J_PASSWORD):
         self.neo4j_url = neo4j_url
         self.neo4j_user = neo4j_user
@@ -238,6 +313,12 @@ class NNeo4JImporter(NBaseImporter):
         
     @asynccontextmanager
     async def get_session(self):
+        """
+        Get a session for Neo4j database operations.
+
+        Yields:
+            The Neo4j session.
+        """
         async with self.driver.session() as session:
             try:
                 yield session
@@ -245,6 +326,16 @@ class NNeo4JImporter(NBaseImporter):
                 await session.close()
 
     async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
+        """
+        Ingest a file by determining its type and using the appropriate ingestion method.
+
+        Args:
+            inputPath (str): The path to the input file.
+            inputLocation (str): The location of the input file.
+            inputName (str): The name of the input file.
+            currentOutputPath (str): The current output path.
+            projectID (str): The project ID.
+        """
         try:
             file_type = self.ascertain_file_type(inputPath)
         except Exception as e:
@@ -262,6 +353,15 @@ class NNeo4JImporter(NBaseImporter):
             logger.warning(f"No ingest method for file type: {file_type}")
 
     async def summarize_text(self, text: str) -> str:
+        """
+        Summarize the given text using a pre-trained model.
+
+        Args:
+            text (str): The text to be summarized.
+
+        Returns:
+            str: The summary of the text.
+        """
         try:
             return (await asyncio.to_thread(self.summarizer, text, max_length=50, min_length=25, do_sample=False))[0]['summary_text']
         except Exception as e:
@@ -269,12 +369,35 @@ class NNeo4JImporter(NBaseImporter):
             return ""
 
     async def process_chunks(self, session, text, parent_node_id, parent_node_type, chunk_size, chunk_type, projectID):
+        """
+        Process text chunks and create nodes in the database.
+
+        Args:
+            session: The Neo4j session.
+            text: The text to be chunked and processed.
+            parent_node_id: The parent node ID.
+            parent_node_type: The parent node type.
+            chunk_size: The size of each chunk.
+            chunk_type: The type of chunk.
+            projectID: The project ID.
+        """
         chunks = self.chunk_text(text, chunk_size)
         for i, chunk in enumerate(chunks):
             async with self.rate_limiter:
                 await self.create_chunk_with_embedding(session, chunk, parent_node_id, parent_node_type, chunk_type, projectID)
 
     async def create_chunk_with_embedding(self, session, chunk, parent_node_id, parent_node_type, chunk_type, projectID):
+        """
+        Create a chunk node with an embedding in the database.
+
+        Args:
+            session: The Neo4j session.
+            chunk: The text chunk.
+            parent_node_id: The parent node ID.
+            parent_node_type: The parent node type.
+            chunk_type: The type of chunk.
+            projectID: The project ID.
+        """
         try:
             chunk_node = await session.run(
                 f"CREATE (n:{chunk_type} {{content: $content, type: $chunk_type, projectID: $projectID}}) RETURN id(n)",
@@ -302,6 +425,16 @@ class NNeo4JImporter(NBaseImporter):
             raise DatabaseError(f"Error creating chunk with embedding: {e}")
 
     async def IngestTxt(self, input_path: str, input_location: str, input_name: str, current_output_path: str, project_id: str) -> None:
+        """
+        Ingest a text file by reading its content and creating document and chunk nodes in the database.
+
+        Args:
+            input_path (str): The path to the input file.
+            input_location (str): The location of the input file.
+            input_name (str): The name of the input file.
+            current_output_path (str): The current output path.
+            project_id (str): The project ID.
+        """
         async with self.get_session() as session:
             try:
                 async with aiofiles.open(input_path, 'r') as file:
@@ -324,6 +457,15 @@ class NNeo4JImporter(NBaseImporter):
                 raise DatabaseError(f"Error ingesting text file {input_path}: {e}")
 
     async def extract_image_features(self, image: PIL.Image.Image) -> List[float]:
+        """
+        Extract features from an image using a pre-trained model.
+
+        Args:
+            image (PIL.Image.Image): The image to be processed.
+
+        Returns:
+            List[float]: The extracted features.
+        """
         try:
             preprocess = transforms.Compose([
                 transforms.Resize(256),
@@ -340,6 +482,16 @@ class NNeo4JImporter(NBaseImporter):
             raise FileProcessingError(f"Error extracting image features: {e}")
 
     async def IngestImg(self, input_path: str, input_location: str, input_name: str, current_output_path: str, project_id: str) -> None:
+        """
+        Ingest an image file by extracting features and creating nodes in the database.
+
+        Args:
+            input_path (str): The path to the input file.
+            input_location (str): The location of the input file.
+            input_name (str): The name of the input file.
+            current_output_path (str): The current output path.
+            project_id (str): The project ID.
+        """
         try:
             image = PIL.Image.open(input_path)
             await self.process_image_file(image, input_name, project_id)
@@ -348,12 +500,29 @@ class NNeo4JImporter(NBaseImporter):
             raise FileProcessingError(f"Error ingesting image: {e}")
 
     async def process_image_file(self, image: PIL.Image.Image, input_name: str, project_id: str):
+        """
+        Process an image file by extracting features and storing them in the database.
+
+        Args:
+            image (PIL.Image.Image): The image to be processed.
+            input_name (str): The name of the input file.
+            project_id (str): The project ID.
+        """
         features = await self.extract_image_features(image)
 
         async with self.get_session() as session:
             await self.store_image_features(session, features, input_name, project_id)
 
     async def store_image_features(self, session, features: List[float], input_name: str, project_id: str):
+        """
+        Store the extracted image features in the database.
+
+        Args:
+            session: The Neo4j session.
+            features (List[float]): The extracted features.
+            input_name (str): The name of the input file.
+            project_id (str): The project ID.
+        """
         try:
             async with self.rate_limiter:
                 image_node = await session.run(
@@ -376,22 +545,59 @@ class NNeo4JImporter(NBaseImporter):
             raise DatabaseError(f"Error storing image features: {e}")
 
     async def summarize_cpp_class(self, cls) -> str:
+        """
+        Summarize a C++ class.
+
+        Args:
+            cls: The class node.
+
+        Returns:
+            str: The summary of the class.
+        """
         description = f"Class {cls.spelling} with public methods: "
         public_methods = [c.spelling for c in cls.get_children() if c.access_specifier == clang.cindex.AccessSpecifier.PUBLIC]
         description += ", ".join(public_methods)
         return await self.summarize_text(description)
 
     async def summarize_cpp_function(self, func) -> str:
+        """
+        Summarize a C++ function.
+
+        Args:
+            func: The function node.
+
+        Returns:
+            str: The summary of the function.
+        """
         description = f"Function {func.spelling} in namespace {func.semantic_parent.spelling}. It performs the following tasks: "
         return await self.summarize_text(description)
 
     def get_code_features(self, code: str) -> List[float]:
+        """
+        Extract features from code using a pre-trained model.
+
+        Args:
+            code (str): The code to be processed.
+
+        Returns:
+            List[float]: The extracted features.
+        """
         inputs = self.tokenizer(code, return_tensors="pt", truncation=True, max_length=512).to(self.device)
         with torch.no_grad():
             outputs = self.code_model(**inputs)
         return outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy().tolist()
 
     async def IngestCpp(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
+        """
+        Ingest a C++ file by parsing it, summarizing classes and functions, and storing them in the database.
+
+        Args:
+            inputPath (str): The path to the input file.
+            inputLocation (str): The location of the input file.
+            inputName (str): The name of the input file.
+            currentOutputPath (str): The current output path.
+            projectID (str): The project ID.
+        """
         try:
             tu = self.index.parse(inputPath)
             functions = []
@@ -443,6 +649,16 @@ class NNeo4JImporter(NBaseImporter):
             raise FileProcessingError(f"Error ingesting C++ file {inputPath}: {e}")
 
     async def IngestPython(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
+        """
+        Ingest a Python file by parsing it, summarizing classes and functions, and storing them in the database.
+
+        Args:
+            inputPath (str): The path to the input file.
+            inputLocation (str): The location of the input file.
+            inputName (str): The name of the input file.
+            currentOutputPath (str): The current output path.
+            projectID (str): The project ID.
+        """
         try:
             async with aiofiles.open(inputPath, 'r') as file:
                 content = await file.read()
@@ -491,16 +707,44 @@ class NNeo4JImporter(NBaseImporter):
             raise FileProcessingError(f"Error ingesting Python file {inputPath}: {e}")
 
     async def summarize_python_class(self, cls) -> str:
+        """
+        Summarize a Python class.
+
+        Args:
+            cls: The class node.
+
+        Returns:
+            str: The summary of the class.
+        """
         description = f"Class {cls.name} with methods: "
         methods = [func.name for func in cls.body if isinstance(func, ast.FunctionDef)]
         description += ", ".join(methods)
         return await self.summarize_text(description)
 
     async def summarize_python_function(self, func) -> str:
+        """
+        Summarize a Python function.
+
+        Args:
+            func: The function node.
+
+        Returns:
+            str: The summary of the function.
+        """
         description = f"Function {func.name} with arguments: {', '.join(arg.arg for arg in func.args.args)}. It performs the following tasks: "
         return await self.summarize_text(description)
 
     async def IngestRust(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
+        """
+        Ingest a Rust file by parsing it, summarizing implementations and functions, and storing them in the database.
+
+        Args:
+            inputPath (str): The path to the input file.
+            inputLocation (str): The location of the input file.
+            inputName (str): The name of the input file.
+            currentOutputPath (str): The current output path.
+            projectID (str): The project ID.
+        """
         try:
             async with aiofiles.open(inputPath, 'r') as file:
                 content = await file.read()
@@ -548,16 +792,44 @@ class NNeo4JImporter(NBaseImporter):
             raise FileProcessingError(f"Error ingesting Rust file {inputPath}: {e}")
 
     async def summarize_rust_impl(self, impl) -> str:
+        """
+        Summarize a Rust implementation.
+
+        Args:
+            impl: The implementation node.
+
+        Returns:
+            str: The summary of the implementation.
+        """
         description = f"Implementation of trait {impl.trait_.path.segments[0].ident} with methods: "
         methods = [item.sig.ident for item in impl.items if isinstance(item, syn.ImplItemMethod)]
         description += ", ".join([str(m) for m in methods])
         return await self.summarize_text(description)
 
     async def summarize_rust_function(self, func) -> str:
+        """
+        Summarize a Rust function.
+
+        Args:
+            func: The function node.
+
+        Returns:
+            str: The summary of the function.
+        """
         description = f"Function {func.sig.ident} with arguments: {', '.join(arg.pat.ident for arg in func.sig.inputs)}. It performs the following tasks: "
         return await self.summarize_text(description)
 
     async def IngestJavascript(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
+        """
+        Ingest a JavaScript file by parsing it, summarizing classes, functions, and variables, and storing them in the database.
+
+        Args:
+            inputPath (str): The path to the input file.
+            inputLocation (str): The location of the input file.
+            inputName (str): The name of the input file.
+            currentOutputPath (str): The current output path.
+            projectID (str): The project ID.
+        """
         try:
             async with aiofiles.open(inputPath, 'r') as file:
                 content = await file.read()
@@ -588,6 +860,15 @@ class NNeo4JImporter(NBaseImporter):
                 raise DatabaseError(f"Error ingesting JavaScript file {inputPath}: {e}")
 
     async def process_js_function(self, session, func_node, file_id: int, projectID: str) -> None:
+        """
+        Process a JavaScript function node and create nodes in the database.
+
+        Args:
+            session: The Neo4j session.
+            func_node: The function node.
+            file_id: The file ID.
+            projectID: The project ID.
+        """
         func_name = func_node.id.name if func_node.id else 'anonymous'
         func_summary = await self.summarize_js_function(func_node)
         embedding = self.model.embed_text(func_summary)
@@ -610,6 +891,15 @@ class NNeo4JImporter(NBaseImporter):
             raise DatabaseError(f"Error processing JavaScript function {func_name}: {e}")
 
     async def process_js_class(self, session, class_node, file_id: int, projectID: str) -> None:
+        """
+        Process a JavaScript class node and create nodes in the database.
+
+        Args:
+            session: The Neo4j session.
+            class_node: The class node.
+            file_id: The file ID.
+            projectID: The project ID.
+        """
         class_name = class_node.id.name
         class_summary = await self.summarize_js_class(class_node)
         embedding = self.model.embed_text(class_summary)
@@ -636,6 +926,15 @@ class NNeo4JImporter(NBaseImporter):
             raise DatabaseError(f"Error processing JavaScript class {class_name}: {e}")
 
     async def process_js_variable(self, session, var_node, file_id: int, projectID: str) -> None:
+        """
+        Process a JavaScript variable node and create nodes in the database.
+
+        Args:
+            session: The Neo4j session.
+            var_node: The variable node.
+            file_id: The file ID.
+            projectID: The project ID.
+        """
         for declaration in var_node.declarations:
             var_name = declaration.id.name
             var_type = var_node.kind  # 'var', 'let', or 'const'
@@ -660,6 +959,15 @@ class NNeo4JImporter(NBaseImporter):
                 raise DatabaseError(f"Error processing JavaScript variable {var_name}: {e}")
 
     async def process_js_method(self, session, method_node, class_id: int, projectID: str) -> None:
+        """
+        Process a JavaScript method node and create nodes in the database.
+
+        Args:
+            session: The Neo4j session.
+            method_node: The method node.
+            class_id: The class ID.
+            projectID: The project ID.
+        """
         method_name = method_node.key.name
         method_summary = await self.summarize_js_function(method_node.value)
         embedding = self.model.embed_text(method_summary)
@@ -681,7 +989,58 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Error processing JavaScript method {method_name}: {e}")
             raise DatabaseError(f"Error processing JavaScript method {method_name}: {e}")
 
+    async def summarize_js_function(self, func) -> str:
+        """
+        Summarize a JavaScript function.
+
+        Args:
+            func: The function node.
+
+        Returns:
+            str: The summary of the function.
+        """
+        description = f"Function {func.id.name if func.id else 'anonymous'} with arguments: {', '.join(param.name for param in func.params)}. It performs the following tasks: "
+        return await self.summarize_text(description)
+
+    async def summarize_js_class(self, cls) -> str:
+        """
+        Summarize a JavaScript class.
+
+        Args:
+            cls: The class node.
+
+        Returns:
+            str: The summary of the class.
+        """
+        description = f"Class {cls.id.name} with methods: "
+        methods = [method.key.name for method in cls.body.body if isinstance(method, nodes.MethodDefinition)]
+        description += ", ".join(methods)
+        return await self.summarize_text(description)
+
+    async def summarize_js_variable(self, var) -> str:
+        """
+        Summarize a JavaScript variable.
+
+        Args:
+            var: The variable node.
+
+        Returns:
+            str: The summary of the variable.
+        """
+        description = f"Variable {var.declarations[0].id.name} of type {var.kind}. It is initialized as: "
+        return await self.summarize_text(description)
+
     async def IngestPdf(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
+        """
+        Ingest a PDF file by reading its content, chunking it, and storing the chunks and their embeddings in the database.
+
+        Args:
+            inputPath (str): The path to the input file.
+            inputLocation (str): The location of the input file.
+            inputName (str): The name of the input file.
+            currentOutputPath (str): The current output path.
+            projectID (str): The project ID.
+        """
         try:
             reader = PdfReader(inputPath)
             num_pages = len(reader.pages)
@@ -745,6 +1104,9 @@ class NNeo4JImporter(NBaseImporter):
             raise FileProcessingError(f"Error ingesting PDF file {inputPath}: {e}")
 
 class NIngest:
+    """
+    Manages the ingestion process, counting files, handling directories, and updating or deleting projects.
+    """
     def __init__(self, projectID: str = None, importer: NBaseImporter = NNeo4JImporter()):
         self.total_files = 0
         self.progress_bar = None
@@ -759,6 +1121,15 @@ class NIngest:
             logger.info(f"Created new project directory at {self.currentOutputPath}")
             
     async def start_ingestion(self, inputPath: str) -> int:
+        """
+        Start the ingestion process.
+
+        Args:
+            inputPath (str): The path to the input file or directory.
+
+        Returns:
+            int: The result of the ingestion process.
+        """
         if not validate_input_path(inputPath):
             return -1
 
@@ -775,6 +1146,15 @@ class NIngest:
             return -1
 
     async def count_files(self, path: str) -> int:
+        """
+        Count the total number of files in a directory.
+
+        Args:
+            path (str): The path to the directory.
+
+        Returns:
+            int: The total number of files.
+        """
         total = 0
         for entry in os.scandir(path):
             if entry.is_file():
@@ -784,6 +1164,12 @@ class NIngest:
         return total
     
     async def cleanup_partial_ingestion(self, projectID: str):
+        """
+        Clean up partial ingestion by removing all nodes and relationships related to the project.
+
+        Args:
+            projectID (str): The project ID.
+        """
         async with self.importer_.get_session() as session:
             try:
                 # Remove all nodes and relationships related to this project
@@ -797,6 +1183,16 @@ class NIngest:
                 logger.error(f"Error during cleanup for project {projectID}: {e}")
                 
     async def Ingest(self, inputPath: str, currentOutputPath: str) -> int:
+        """
+        Ingest files from the input path into the output path.
+
+        Args:
+            inputPath (str): The path to the input file or directory.
+            currentOutputPath (str): The current output path.
+
+        Returns:
+            int: The result of the ingestion process.
+        """
         try:
             if not os.path.exists(inputPath):
                 logger.error(f"Invalid path: {inputPath}")
@@ -823,6 +1219,16 @@ class NIngest:
             return -1
             
     async def IngestDirectory(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
+        """
+        Ingest all files in a directory.
+
+        Args:
+            inputPath (str): The path to the input directory.
+            inputLocation (str): The location of the input directory.
+            inputName (str): The name of the input directory.
+            currentOutputPath (str): The current output path.
+            projectID (str): The project ID.
+        """
         newOutputPath = os.path.join(currentOutputPath, inputName)
         os.makedirs(newOutputPath, exist_ok=True)
 
@@ -834,13 +1240,41 @@ class NIngest:
         await asyncio.gather(*tasks)
 
     async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
+        """
+        Ingest a single file.
+
+        Args:
+            inputPath (str): The path to the input file.
+            inputLocation (str): The location of the input file.
+            inputName (str): The name of the input file.
+            currentOutputPath (str): The current output path.
+            projectID (str): The project ID.
+        """
         await self.importer_.IngestFile(inputPath, inputLocation, inputName, currentOutputPath, projectID)
 
     def should_ignore_file(self, file_path: str) -> bool:
+        """
+        Determine if a file should be ignored based on .gitignore patterns.
+
+        Args:
+            file_path (str): The path to the file.
+
+        Returns:
+            bool: True if the file should be ignored, False otherwise.
+        """
         gitignore_patterns = self.load_gitignore_patterns(os.path.dirname(file_path))
         return any(fnmatch.fnmatch(os.path.basename(file_path), pattern) for pattern in gitignore_patterns)
 
     def load_gitignore_patterns(self, directory: str) -> List[str]:
+        """
+        Load .gitignore patterns from a directory.
+
+        Args:
+            directory (str): The directory to load patterns from.
+
+        Returns:
+            List[str]: A list of .gitignore patterns.
+        """
         patterns = []
         gitignore_path = os.path.join(directory, '.gitignore')
         if os.path.exists(gitignore_path):
@@ -849,10 +1283,29 @@ class NIngest:
         return patterns
 
     async def update_project(self, projectID: str, inputPath: str) -> int:
+        """
+        Update a project with new files.
+
+        Args:
+            projectID (str): The project ID.
+            inputPath (str): The path to the new files.
+
+        Returns:
+            int: The result of the update process.
+        """
         # Implement project update logic here
         pass
 
     async def delete_project(self, projectID: str) -> int:
+        """
+        Delete a project by removing all related data and files.
+
+        Args:
+            projectID (str): The project ID.
+
+        Returns:
+            int: The result of the deletion process.
+        """
         try:
             # Delete from database
             await self.cleanup_partial_ingestion(projectID)
@@ -869,6 +1322,16 @@ class NIngest:
             return -1
 
     async def export_project(self, projectID: str, outputPath: str) -> int:
+        """
+        Export a project to a JSON file.
+
+        Args:
+            projectID (str): The project ID.
+            outputPath (str): The path to the output file.
+
+        Returns:
+            int: The result of the export process.
+        """
         try:
             async with self.importer_.get_session() as session:
                 result = await session.run(
@@ -889,6 +1352,15 @@ class NIngest:
             return -1
 
 def validate_input_path(input_path: str) -> bool:
+    """
+    Validate the input path.
+
+    Args:
+        input_path (str): The path to validate.
+
+    Returns:
+        bool: True if the path is valid, False otherwise.
+    """
     if not os.path.exists(input_path):
         logger.error(f"Input path does not exist: {input_path}")
         return False
@@ -898,9 +1370,28 @@ def validate_input_path(input_path: str) -> bool:
     return True
 
 def preprocess_text(text: str) -> str:
+    """
+    Preprocess the text by stripping leading and trailing whitespace.
+
+    Args:
+        text (str): The text to preprocess.
+
+    Returns:
+        str: The preprocessed text.
+    """
     return text.strip()
 
 async def read_file_in_chunks(file_path: str, chunk_size: int = 1024) -> AsyncGenerator[str, None]:
+    """
+    Read a file in chunks.
+
+    Args:
+        file_path (str): The path to the file.
+        chunk_size (int): The size of each chunk.
+
+    Yields:
+        str: A chunk of the file.
+    """
     try:
         async with aiofiles.open(file_path, 'r') as file:
             while True:
@@ -913,10 +1404,22 @@ async def read_file_in_chunks(file_path: str, chunk_size: int = 1024) -> AsyncGe
         return
 
 class ProjectManager:
+    """
+    Provides a high-level interface for managing projects, including creating, updating, deleting, and exporting projects.
+    """
     def __init__(self):
         self.ingest = NIngest()
 
     async def create_project(self, input_path: str) -> str:
+        """
+        Create a new project.
+
+        Args:
+            input_path (str): The path to the input files.
+
+        Returns:
+            str: The project ID.
+        """
         project_id = str(uuid.uuid4())
         ingest_instance = NIngest(projectID=project_id)
         result = await ingest_instance.start_ingestion(input_path)
@@ -926,18 +1429,50 @@ class ProjectManager:
             raise Exception("Failed to create project")
 
     async def update_project(self, project_id: str, input_path: str) -> int:
+        """
+        Update an existing project with new files.
+
+        Args:
+            project_id (str): The project ID.
+            input_path (str): The path to the new files.
+
+        Returns:
+            int: The result of the update process.
+        """
         ingest_instance = NIngest(projectID=project_id)
         return await ingest_instance.update_project(project_id, input_path)
 
     async def delete_project(self, project_id: str) -> int:
+        """
+        Delete a project.
+
+        Args:
+            project_id (str): The project ID.
+
+        Returns:
+            int: The result of the deletion process.
+        """
         ingest_instance = NIngest(projectID=project_id)
         return await ingest_instance.delete_project(project_id)
 
     async def export_project(self, project_id: str, output_path: str) -> int:
+        """
+        Export a project to a JSON file.
+
+        Args:
+            project_id (str): The project ID.
+            output_path (str): The path to the output file.
+
+        Returns:
+            int: The result of the export process.
+        """
         ingest_instance = NIngest(projectID=project_id)
         return await ingest_instance.export_project(project_id, output_path)
 
 async def main():
+    """
+    Main function to handle command-line arguments and execute the appropriate action.
+    """
     parser = argparse.ArgumentParser(description='Ingest files into Neo4j database')
     parser.add_argument('action', choices=['create', 'update', 'delete', 'export'], help='Action to perform')
     parser.add_argument('--input_path', type=str, help='Path to file or directory to ingest')
@@ -972,6 +1507,9 @@ async def main():
         print(f"An error occurred: {e}")
 
 class TestNIngest(unittest.TestCase):
+    """
+    Unit tests for the NIngest class.
+    """
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
         self.project_id = str(uuid.uuid4())
@@ -981,6 +1519,9 @@ class TestNIngest(unittest.TestCase):
         shutil.rmtree(self.test_dir)
 
     def test_ingest_file(self):
+        """
+        Test ingesting a single file.
+        """
         test_file = os.path.join(self.test_dir, 'test.txt')
         with open(test_file, 'w') as f:
             f.write("Test content")
@@ -992,6 +1533,9 @@ class TestNIngest(unittest.TestCase):
         asyncio.run(run_test())
 
     def test_ingest_directory(self):
+        """
+        Test ingesting a directory.
+        """
         test_subdir = os.path.join(self.test_dir, 'subdir')
         os.makedirs(test_subdir)
         test_file = os.path.join(test_subdir, 'test.txt')
@@ -1005,6 +1549,9 @@ class TestNIngest(unittest.TestCase):
         asyncio.run(run_test())
 
     def test_gitignore(self):
+        """
+        Test ignoring files based on .gitignore patterns.
+        """
         with open(os.path.join(self.test_dir, '.gitignore'), 'w') as f:
             f.write("*.log\n")
         
