@@ -16,7 +16,7 @@ import clang.cindex
 import ast
 import syn
 from PyPDF2 import PdfReader
-from typing import List, Dict, Any, Union, Optional
+from typing import List, Dict, Any, Union, Optional, Generator
 import esprima
 from esprima import nodes
 import argparse
@@ -47,8 +47,8 @@ if not os.path.isfile(config_file):
                 "[Database]\nNEO4J_URL = bolt://localhost:7687\nNEO4J_USER = neo4j\nNEO4J_PASSWORD = password\n\n"
                 "[Ollama]\nOLLAMA_URL = http://localhost:11434\n\n"
                 "[Models]\nEMBEDDING_MODEL = nomic-embed-text")
-
-config.read(config_file)
+else:
+    config.read(config_file)
 
 MAX_FILE_SIZE = int(os.getenv('MAX_FILE_SIZE', config.get('Limits', 'MAX_FILE_SIZE')))
 MEDIUM_CHUNK_SIZE = int(os.getenv('MEDIUM_CHUNK_SIZE', config.get('Chunks', 'MEDIUM_CHUNK_SIZE')))
@@ -104,20 +104,18 @@ class NBaseImporter(ABC):
     async def chunk_and_create_nodes(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         async with self.driver.session() as session:
             try:
-                with open(inputPath, 'r') as file:
-                    text = file.read()
+                chunks = []
+                for chunk in read_file_in_chunks(inputPath, MEDIUM_CHUNK_SIZE):
+                    chunks.append(chunk)
+                previous_chunk_id = None
+
+                for i, chunk in enumerate(chunks):
+                    chunk_id = await self.create_chunk_node(session, chunk, inputPath, i, projectID)
+                    if previous_chunk_id:
+                        await self.create_chunk_relationship(session, previous_chunk_id, chunk_id, projectID)
+                    previous_chunk_id = chunk_id
             except Exception as e:
-                logger.error(f"Error reading file {inputPath}: {e}")
-                return
-
-            chunks = self.chunk_text(text, MEDIUM_CHUNK_SIZE)
-            previous_chunk_id = None
-
-            for i, chunk in enumerate(chunks):
-                chunk_id = await self.create_chunk_node(session, chunk, inputPath, i, projectID)
-                if previous_chunk_id:
-                    await self.create_chunk_relationship(session, previous_chunk_id, chunk_id, projectID)
-                previous_chunk_id = chunk_id
+                logger.error(f"Error processing file {inputPath}: {e}")
 
     def chunk_text(self, text: str, chunk_size: int) -> List[str]:
         return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
@@ -131,9 +129,14 @@ class NBaseImporter(ABC):
                 "CREATE (n:Chunk {id: $id, content: $content, embedding: $embedding, projectID: $projectID}) RETURN id(n)",
                 id=chunk_id, content=chunk, embedding=embedding, projectID=projectID
             )
-            node_id = result.single()['id']
-            logger.info(f"Created chunk node {chunk_id} with embedding")
-            return chunk_id
+            node = result.single()
+            if node:
+                node_id = node['id']
+                logger.info(f"Created chunk node {chunk_id} with embedding")
+                return chunk_id
+            else:
+                logger.error(f"No result returned for chunk node {chunk_id}")
+                return None
         except Exception as e:
             logger.error(f"Error creating chunk node: {e}")
             return None
@@ -141,11 +144,15 @@ class NBaseImporter(ABC):
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     async def create_chunk_relationship(self, session, chunk_id1: str, chunk_id2: str, projectID: str) -> None:
         try:
-            await session.run(
-                "MATCH (c1:Chunk {id: $id1, projectID: $projectID}), (c2:Chunk {id: $id2, projectID: $projectID}) CREATE (c1)-[:NEXT]->(c2)",
+            result = await session.run(
+                "MATCH (c1:Chunk {id: $id1, projectID: $projectID}), (c2:Chunk {id: $id2, projectID: $projectID}) "
+                "CREATE (c1)-[:NEXT]->(c2)",
                 id1=chunk_id1, id2=chunk_id2, projectID=projectID
             )
-            logger.info(f"Created relationship between {chunk_id1} and {chunk_id2}")
+            if result:
+                logger.info(f"Created relationship between {chunk_id1} and {chunk_id2}")
+            else:
+                logger.error(f"No result returned for creating relationship between {chunk_id1} and {chunk_id2}")
         except Exception as e:
             logger.error(f"Error creating chunk relationship: {e}")
 
@@ -195,41 +202,55 @@ class NNeo4JImporter(NBaseImporter):
                 await session.close()
 
     async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
-        file_type = self.ascertain_file_type(inputPath)
+        try:
+            file_type = self.ascertain_file_type(inputPath)
+        except Exception as e:
+            logger.error(f"Error ascertaining file type for {inputPath}: {e}")
+            return
+
         ingest_method = getattr(self, f"Ingest{file_type.capitalize()}", None)
         if ingest_method:
-            await ingest_method(inputPath, inputLocation, inputName, currentOutputPath, projectID)
+            try:
+                await ingest_method(inputPath, inputLocation, inputName, currentOutputPath, projectID)
+            except Exception as e:
+                logger.error(f"Error ingesting {file_type} file {inputPath}: {e}")
         else:
             logger.warning(f"No ingest method for file type: {file_type}")
 
     async def summarize_text(self, text: str) -> str:
-        return self.summarizer(text, max_length=50, min_length=25, do_sample=False)[0]['summary_text']
+        try:
+            return (await asyncio.to_thread(self.summarizer, text, max_length=50, min_length=25, do_sample=False))[0]['summary_text']
+        except Exception as e:
+            logger.error(f"Error summarizing text: {e}")
+            return ""
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     async def process_chunks(self, session, text, parent_node_id, parent_node_type, chunk_size, chunk_type, projectID):
         chunks = self.chunk_text(text, chunk_size)
         for i, chunk in enumerate(chunks):
-            chunk_node = await session.run(
-                f"CREATE (n:{chunk_type} {{content: $content, type: $chunk_type, projectID: $projectID}}) RETURN id(n)",
-                content=chunk, chunk_type=chunk_type, projectID=projectID
-            )
-            chunk_id = chunk_node.single()['id']
-            await session.run(
-                f"MATCH (p:{parent_node_type}), (c:{chunk_type}) WHERE id(p) = $parent_node_id AND id(c) = $chunk_id AND p.projectID = $projectID AND c.projectID = $projectID "
-                f"CREATE (p)-[:HAS_CHUNK]->(c), (c)-[:PART_OF]->(p)",
-                parent_node_id=parent_node_id, chunk_id=chunk_id, projectID=projectID
-            )
-            embedding = self.model.embed_text(chunk)
-            embedding_node = await session.run(
-                "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', projectID: $projectID}) RETURN id(n)",
-                embedding=embedding, projectID=projectID
-            )
-            embedding_id = embedding_node.single()['id']
-            await session.run(
-                f"MATCH (c:{chunk_type}), (e:Embedding) WHERE id(c) = $chunk_id AND id(e) = $embedding_id AND c.projectID = $projectID AND e.projectID = $projectID "
-                f"CREATE (c)-[:HAS_EMBEDDING]->(e)",
-                chunk_id=chunk_id, embedding_id=embedding_id, projectID=projectID
-            )
+            try:
+                chunk_node = await session.run(
+                    f"CREATE (n:{chunk_type} {{content: $content, type: $chunk_type, projectID: $projectID}}) RETURN id(n)",
+                    content=chunk, chunk_type=chunk_type, projectID=projectID
+                )
+                chunk_id = chunk_node.single()['id']
+                await session.run(
+                    f"MATCH (p:{parent_node_type}), (c:{chunk_type}) WHERE id(p) = $parent_node_id AND id(c) = $chunk_id AND p.projectID = $projectID AND c.projectID = $projectID "
+                    f"CREATE (p)-[:HAS_CHUNK]->(c), (c)-[:PART_OF]->(p)",
+                    parent_node_id=parent_node_id, chunk_id=chunk_id, projectID=projectID
+                )
+                embedding = self.model.embed_text(chunk)
+                embedding_node = await session.run(
+                    "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', projectID: $projectID}) RETURN id(n)",
+                    embedding=embedding, projectID=projectID
+                )
+                embedding_id = embedding_node.single()['id']
+                await session.run(
+                    f"MATCH (c:{chunk_type}), (e:Embedding) WHERE id(c) = $chunk_id AND id(e) = $embedding_id AND c.projectID = $projectID AND e.projectID = $projectID "
+                    f"CREATE (c)-[:HAS_EMBEDDING]->(e)",
+                    chunk_id=chunk_id, embedding_id=embedding_id, projectID=projectID
+                )
+            except Exception as e:
+                logger.error(f"Error processing chunk: {e}")
 
     async def IngestTxt(self, input_path: str, input_location: str, input_name: str, current_output_path: str, project_id: str) -> None:
         async with self.get_session() as session:
@@ -309,7 +330,7 @@ class NNeo4JImporter(NBaseImporter):
         with torch.no_grad():
             outputs = self.code_model(**inputs)
         return outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy().tolist()
-        
+
     async def IngestCpp(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         try:
             tu = self.index.parse(inputPath)
@@ -409,7 +430,7 @@ class NNeo4JImporter(NBaseImporter):
     async def summarize_python_function(self, func) -> str:
         description = f"Function {func.name} with arguments: {', '.join(arg.arg for arg in func.args.args)}. It performs the following tasks: "
         return await self.summarize_text(description)
-    
+
     async def IngestRust(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         try:
             tree = syn.parse_file(inputPath)
@@ -720,6 +741,18 @@ class NIngest:
 
     async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         await self.importer_.IngestFile(inputPath, inputLocation, inputName, currentOutputPath, projectID)
+
+def read_file_in_chunks(file_path: str, chunk_size: int = 1024) -> Generator[str, None, None]:
+    try:
+        with open(file_path, 'r') as file:
+            while True:
+                data = file.read(chunk_size)
+                if not data:
+                    break
+                yield data
+    except Exception as e:
+        logger.error(f"Error reading file {file_path}: {e}")
+        return
 
 async def main():
     parser = argparse.ArgumentParser(description='Ingest files into Neo4j database')
