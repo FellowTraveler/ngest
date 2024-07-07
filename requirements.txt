@@ -12,3 +12,5 @@ tqdm
 aiohttp
 tenacity
 python-dotenv
+aiofiles
+aiorate
