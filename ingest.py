@@ -405,7 +405,7 @@ class NNeo4JImporter(NBaseImporter):
             raise FileProcessingError(f"Error processing file {inputPath}: {e}")
         logger.info(f"Completed ingestion for file: {inputPath}")
 
-    async def summarize_text(self, text: str) -> str:
+    async def summarize_text(self, text: str, max_length=50, min_length=25) -> str:
         """
         Summarize the given text using a pre-trained model.
 
@@ -416,7 +416,7 @@ class NNeo4JImporter(NBaseImporter):
             str: The summary of the text.
         """
         try:
-            return (await asyncio.to_thread(self.summarizer, text, max_length=50, min_length=10, do_sample=False))[0]['summary_text']
+            return (await asyncio.to_thread(self.summarizer, text, max_length=max_length, min_length=min_length, do_sample=False))[0]['summary_text']
         except Exception as e:
             logger.error(f"Error summarizing text: {e}")
             return ""
@@ -594,6 +594,178 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Error storing image features: {e}")
             raise DatabaseError(f"Error storing image features: {e}")
 
+    async def summarize_cpp_class_public_interface(self, cls) -> (str, str, str, str):
+        """
+        Summarize the public interface of a C++ class, including inherited public members from base classes,
+        and indicate whether they are exported.
+
+        Args:
+            cls: The class node.
+
+        Returns:
+            tuple: A tuple containing the class name, fully-qualified name, and the summary.
+        """
+        def get_full_scope(node):
+            scopes = []
+            current = node.semantic_parent
+            while current and current.kind != clang.cindex.CursorKind.TRANSLATION_UNIT:
+                scopes.append(current.spelling)
+                current = current.semantic_parent
+            return "::".join(reversed(scopes))
+        
+        def is_exported(node):
+            # Example check for __declspec(dllexport) or visibility attribute
+            for token in node.get_tokens():
+                if token.spelling in ["__declspec(dllexport)", "__attribute__((visibility(\"default\")))"]:
+                    return True
+            return False
+        
+        class_name = cls.spelling
+        full_scope = get_full_scope(cls)
+        fully_qualified_name = f"{full_scope}::{class_name}" if full_scope else class_name
+        file_path = cls.location.file.name if cls.location.file else "unknown"
+
+        description = f"Class {class_name} in scope {full_scope} defined in {file_path}"
+
+        if cls.raw_comment:
+            description += f" with documentation: {cls.raw_comment.strip()}"
+        
+        export_status = "exported" if is_exported(cls) else "not exported"
+        description += f" ({export_status})"
+        
+        # Base classes
+        bases = [base for base in cls.get_children() if base.kind == clang.cindex.CursorKind.CXX_BASE_SPECIFIER]
+        if bases:
+            base_names = [f"{base.spelling} in scope {get_full_scope(base.type.get_declaration())}" for base in bases]
+            description += f". Inherits from: {', '.join(base_names)}"
+        
+        # Public members of the class
+        members = []
+        
+        def get_public_members(node, inherited=False):
+            for member in node.get_children():
+                if member.access_specifier == clang.cindex.AccessSpecifier.PUBLIC:
+                    origin = " (inherited)" if inherited else ""
+                    export_status = "exported" if is_exported(member) else "not exported"
+                    if member.kind == clang.cindex.CursorKind.CXX_METHOD:
+                        members.append(f"public method {member.spelling} in scope {get_full_scope(member)} ({export_status}){origin}")
+                    elif member.kind == clang.cindex.CursorKind.FIELD_DECL:
+                        members.append(f"public attribute {member.spelling} of type {member.type.spelling} in scope {get_full_scope(member)} ({export_status}){origin}")
+
+        # Get public members of the class itself
+        get_public_members(cls, inherited=False)
+        
+        # Get public members of base classes
+        for base in bases:
+            if base.type and base.type.get_declaration().kind == clang.cindex.CursorKind.CLASS_DECL:
+                base_class = base.type.get_declaration()
+                get_public_members(base_class, inherited=True)
+        
+        if members:
+            description += ". Public interface: " + ", ".join(members)
+        
+        background = (
+            "Speaking as a senior developer and software architect, describe the purpose and usage of this class in your own words. "
+            "Meditate on the provided description and public interface first, before writing your final summary. "
+            "Then enclose those meditations in opening and closing <thoughts> tags, and then write your final summary."
+        )
+        
+        # Combine background and description with clear separation
+        full_prompt = f"{background}\n\nClass Details:\n{description}"
+        
+        summary = await self.summarize_text(full_prompt, 200, 25)
+        
+        return class_name, fully_qualified_name, description, summary
+
+    async def summarize_cpp_class_implementation(self, cls) -> (str, str):
+        """
+        Summarize the implementation details of a C++ class, including private methods, properties, static members,
+        and inherited protected members.
+
+        Args:
+            cls: The class node.
+
+        Returns:
+            tuple: A tuple containing the class name, fully-qualified name, and the summary.
+        """
+        def get_full_scope(node):
+            scopes = []
+            current = node.semantic_parent
+            while current and current.kind != clang.cindex.CursorKind.TRANSLATION_UNIT:
+                scopes.append(current.spelling)
+                current = current.semantic_parent
+            return "::".join(reversed(scopes))
+        
+        def is_exported(node):
+            # Example check for __declspec(dllexport) or visibility attribute
+            for token in node.get_tokens():
+                if token.spelling in ["__declspec(dllexport)", "__attribute__((visibility(\"default\")))"]:
+                    return True
+            return False
+        
+        class_name = cls.spelling
+        full_scope = get_full_scope(cls)
+        fully_qualified_name = f"{full_scope}::{class_name}" if full_scope else class_name
+        file_path = cls.location.file.name if cls.location.file else "unknown"
+        
+        description = f"Class {class_name} in scope {full_scope} implementation details defined in {file_path}"
+        
+        if cls.raw_comment:
+            description += f" with documentation: {cls.raw_comment.strip()}"
+        
+        export_status = "exported" if is_exported(cls) else "not exported"
+        description += f" ({export_status})"
+        
+        # Base classes
+        bases = [base for base in cls.get_children() if base.kind == clang.cindex.CursorKind.CXX_BASE_SPECIFIER]
+        if bases:
+            base_names = [f"{base.spelling} in scope {get_full_scope(base.type.get_declaration())}" for base in bases]
+            description += f". Inherits from: {', '.join(base_names)}"
+        
+        # Implementation members of the class
+        members = []
+        
+        def get_implementation_members(node, inherited=False):
+            for member in node.get_children():
+                origin = " (inherited)" if inherited else ""
+                if member.access_specifier == clang.cindex.AccessSpecifier.PRIVATE:
+                    if member.kind == clang.cindex.CursorKind.CXX_METHOD:
+                        members.append(f"private method {member.spelling} in scope {get_full_scope(member)}{origin}")
+                    elif member.kind == clang.cindex.CursorKind.FIELD_DECL:
+                        members.append(f"private attribute {member.spelling} of type {member.type.spelling} in scope {get_full_scope(member)}{origin}")
+                    elif member.kind == clang.cindex.CursorKind.VAR_DECL:
+                        members.append(f"private static {member.spelling} of type {member.type.spelling} in scope {get_full_scope(member)}{origin}")
+                elif member.access_specifier == clang.cindex.AccessSpecifier.PROTECTED and inherited:
+                    if member.kind == clang.cindex.CursorKind.CXX_METHOD:
+                        members.append(f"protected method {member.spelling} in scope {get_full_scope(member)}{origin}")
+                    elif member.kind == clang.cindex.CursorKind.FIELD_DECL:
+                        members.append(f"protected attribute {member.spelling} of type {member.type.spelling} in scope {get_full_scope(member)}{origin}")
+
+        # Get implementation members of the class itself
+        get_implementation_members(cls, inherited=False)
+        
+        # Get protected members of base classes
+        for base in bases:
+            if base.type and base.type.get_declaration().kind == clang.cindex.CursorKind.CLASS_DECL:
+                base_class = base.type.get_declaration()
+                get_implementation_members(base_class, inherited=True)
+        
+        if members:
+            description += ". Implementation details: " + ", ".join(members)
+        
+        background = (
+            "Speaking as a senior developer and software architect, describe the implementation and inner workings of this class in your own words. "
+            "Meditate on the provided description first, before writing your final summary. "
+            "Then enclose those meditations in opening and closing <thoughts> tags, and then write your final summary."
+        )
+        
+        # Combine background and description with clear separation
+        full_prompt = f"{background}\n\nClass and Implementation Details:\n{description}"
+        
+        summary = await self.summarize_text(full_prompt, 200, 25)
+        
+        return summary, description
+
     async def summarize_cpp_class(self, cls) -> str:
         """
         Summarize a C++ class.
@@ -604,10 +776,11 @@ class NNeo4JImporter(NBaseImporter):
         Returns:
             str: The summary of the class.
         """
-        description = f"Class {cls.spelling} with public methods: "
-        public_methods = [c.spelling for c in cls.get_children() if c.access_specifier == clang.cindex.AccessSpecifier.PUBLIC]
-        description += ", ".join(public_methods)
-        return await self.summarize_text(description)
+        
+        class_name, fully_qualified_name, interface_description, interface_summary = await self.summarize_cpp_class_public_interface(cls)
+        implementation_summary, implementation_description = await self.summarize_cpp_class_implementation(cls)
+        
+        return interface_summary + "\n\n" + interface_description
 
     async def summarize_cpp_function(self, func) -> str:
         """
@@ -619,8 +792,55 @@ class NNeo4JImporter(NBaseImporter):
         Returns:
             str: The summary of the function.
         """
-        description = f"Function {func.spelling} in namespace {func.semantic_parent.spelling}. It performs the following tasks: "
-        return await self.summarize_text(description)
+        def get_full_scope(node):
+            scopes = []
+            current = node.semantic_parent
+            while current and current.kind != clang.cindex.CursorKind.TRANSLATION_UNIT:
+                scopes.append(current.spelling)
+                current = current.semantic_parent
+            return "::".join(reversed(scopes))
+        
+        def is_exported(node):
+            # Example check for __declspec(dllexport) or visibility attribute
+            for token in node.get_tokens():
+                if token.spelling in ["__declspec(dllexport)", "__attribute__((visibility(\"default\")))"]:
+                    return True
+            return False
+        
+        function_name = func.spelling
+        full_scope = get_full_scope(func)
+        fully_qualified_name = f"{full_scope}::{function_name}" if full_scope else function_name
+        file_path = func.location.file.name if func.location.file else "unknown"
+        
+        description = f"Function {function_name} in scope {full_scope} defined in {file_path}"
+        
+        if func.raw_comment:
+            description += f" with documentation: {func.raw_comment.strip()}"
+        
+        export_status = "exported" if is_exported(func) else "not exported"
+        description += f" ({export_status})"
+        
+        # Parameters and return type
+        params = [f"{param.type.spelling} {param.spelling}" for param in func.get_arguments()]
+        return_type = func.result_type.spelling
+        description += f". Returns {return_type} and takes parameters: {', '.join(params)}"
+        
+        # Task summary (basic placeholder for now)
+        description += "."
+        
+        # Background for summarization
+        background = (
+            "Speaking as a senior developer and software architect, describe the implementation and inner workings of this function in your own words. "
+            "Meditate on the provided description first, before writing your final summary. "
+            "Then enclose those meditations in opening and closing <thoughts> tags, and then write your final summary."
+        )
+        
+        # Combine background and description with clear separation
+        full_prompt = f"{background}\n\nFunction Details:\n{description}"
+        
+        summary = await self.summarize_text(full_prompt)
+        
+        return summary, description
 
     def get_code_features(self, code: str) -> List[float]:
         """
@@ -668,8 +888,10 @@ class NNeo4JImporter(NBaseImporter):
                     embedding = await self.generate_embedding(class_summary)
                     async with self.rate_limiter:
                         class_id = await self.run_query_and_get_element_id(session,
-                            "CREATE (n:Class {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
-                            name=cls.spelling, summary=class_summary, embedding=embedding, projectID=projectID
+                            "MERGE (n:Class {name: $name, projectID: $projectID, namespace: $namespace}) "
+                            "ON CREATE SET n.summary = $summary, n.embedding = $embedding "
+                            "RETURN elementId(n)",
+                            name=cls.spelling, summary=class_summary, embedding=embedding, projectID=projectID, namespace=namespace
                         )
                     
                     for func in cls.get_children():
@@ -679,14 +901,16 @@ class NNeo4JImporter(NBaseImporter):
                             embedding = await self.generate_embedding(function_summary)
                             async with self.rate_limiter:
                                 function_id = await self.run_query_and_get_element_id(session,
-                                    "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
-                                    name=func.spelling, summary=function_summary, embedding=embedding, projectID=projectID
+                                    "MERGE (n:Function {name: $name, projectID: $projectID, namespace: $namespace})
+                                    "ON CREATE SET n.summary = $summary, n.embedding = $embedding
+                                    "RETURN elementId(n)",
+                                    name=func.spelling, summary=function_summary, embedding=embedding, projectID=projectID, namespace=namespace
                                 )
                                 
                                 await session.run(
-                                    "MATCH (c:Class), (f:Function) "
-                                    "WHERE elementId(c) = $class_id AND elementId(f) = $function_id AND c.projectID = $projectID AND f.projectID = $projectID "
-                                    "CREATE (c)-[:HAS_METHOD]->(f)",
+                                    "MATCH (c:Class) WHERE elementId(c) = $class_id AND c.projectID = $projectID "
+                                    "MATCH (f:Function) WHERE elementId(f) = $function_id AND f.projectID = $projectID "
+                                    "MERGE (c)-[:HAS_METHOD]->(f)",
                                     {"class_id": class_id, "function_id": function_id, "projectID": projectID}
                                 )
 
