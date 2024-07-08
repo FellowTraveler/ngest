@@ -90,6 +90,14 @@ EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', config.get('Models', 'EMBEDDING_M
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Set the logging level based on a condition (e.g., a command-line argument or an environment variable)
+hide_info_logs = False  # Set this to True to hide info logs
+
+if hide_info_logs:
+    logging.getLogger().setLevel(logging.WARNING)
+else:
+    logging.getLogger().setLevel(logging.INFO)
+
 def ollama_generate_embedding_sync(prompt: str) -> List[float]:
     response = ollama.embeddings(model=EMBEDDING_MODEL, prompt=prompt)
     if 'embedding' in response:
@@ -314,7 +322,7 @@ class NNeo4JImporter(NBaseImporter):
         self.code_model = AutoModel.from_pretrained("microsoft/codebert-base").to(self.device)
         self.code_model.eval()
 
-        self.rate_limiter = AsyncLimiter(1, 10)  # 1 operations per 10 seconds
+        self.rate_limiter = AsyncLimiter(1, 1)  # 1 operations per 1 seconds
         
         self.bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
         self.bert_model = BertModel.from_pretrained('bert-base-uncased').to(self.device)
@@ -361,6 +369,7 @@ class NNeo4JImporter(NBaseImporter):
 #            logger.error(f"Error generating embedding: {e}")
 #            raise
 
+
     async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         """
         Ingest a file by determining its type and using the appropriate ingestion method.
@@ -372,26 +381,29 @@ class NNeo4JImporter(NBaseImporter):
             currentOutputPath (str): The current output path.
             projectID (str): The project ID.
         """
+        logger.info(f"Starting ingestion for file: {inputPath}")
         try:
             file_type = self.ascertain_file_type(inputPath)
             if file_type == 'text':
                 async with aiofiles.open(inputPath, 'r') as file:
                     content = await file.read()
                 embedding = await self.generate_embedding(content)
-                print(f"Generated embedding for {inputName}: {embedding}")
+                print(f"Generated embedding for {inputName}")
+
+            # Dynamic method lookup for ingestion methods
+            ingest_method = getattr(self, f"Ingest{file_type.capitalize()}", None)
+            if ingest_method:
+                try:
+                    await ingest_method(inputPath, inputLocation, inputName, currentOutputPath, projectID)
+                except Exception as e:
+                    logger.error(f"Error ingesting {file_type} file {inputPath}: {e}")
+                    raise FileProcessingError(f"Error ingesting {file_type} file {inputPath}: {e}")
+            else:
+                logger.warning(f"No ingest method for file type: {file_type}")
         except Exception as e:
             logger.error(f"Error processing file {inputPath}: {e}")
             raise FileProcessingError(f"Error processing file {inputPath}: {e}")
-
-        ingest_method = getattr(self, f"Ingest{file_type.capitalize()}", None)
-        if ingest_method:
-            try:
-                await ingest_method(inputPath, inputLocation, inputName, currentOutputPath, projectID)
-            except Exception as e:
-                logger.error(f"Error ingesting {file_type} file {inputPath}: {e}")
-                raise FileProcessingError(f"Error ingesting {file_type} file {inputPath}: {e}")
-        else:
-            logger.warning(f"No ingest method for file type: {file_type}")
+        logger.info(f"Completed ingestion for file: {inputPath}")
 
     async def summarize_text(self, text: str) -> str:
         """
@@ -445,7 +457,9 @@ class NNeo4JImporter(NBaseImporter):
                 content=chunk, chunk_type=chunk_type, projectID=projectID
             )
             await session.run(
-                f"MATCH (p:{parent_node_type} {{elementId: $parent_node_id, projectID: $projectID}}), (c:{chunk_type} {{elementId: $chunk_id, projectID: $projectID}}) CREATE (p)-[:HAS_CHUNK]->(c), (c)-[:PART_OF]->(p)",
+                f"MATCH (p:{parent_node_type} {{elementId: $parent_node_id, projectID: $projectID}}) "
+                f"MATCH (c:{chunk_type} {{elementId: $chunk_id, projectID: $projectID}}) "
+                f"CREATE (p)-[:HAS_CHUNK]->(c), (c)-[:PART_OF]->(p)",
                 parent_node_id=parent_node_id, chunk_id=chunk_id, projectID=projectID
             )
             embedding = await self.generate_embedding(chunk)
@@ -454,7 +468,8 @@ class NNeo4JImporter(NBaseImporter):
                 embedding=embedding, projectID=projectID
             )
             await session.run(
-                f"MATCH (c:{chunk_type}), (e:Embedding) WHERE elementId(c) = $chunk_id AND elementId(e) = $embedding_id AND c.projectID = $projectID AND e.projectID = $projectID "
+                f"MATCH (c:{chunk_type} {{elementId: $chunk_id, projectID: $projectID}}) "
+                f"MATCH (e:Embedding {{elementId: $embedding_id, projectID: $projectID}}) "
                 f"CREATE (c)-[:HAS_EMBEDDING]->(e)",
                 chunk_id=chunk_id, embedding_id=embedding_id, projectID=projectID
             )
@@ -622,6 +637,7 @@ class NNeo4JImporter(NBaseImporter):
             outputs = self.code_model(**inputs)
         return outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy().tolist()
 
+
     async def IngestCpp(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         """
         Ingest a C++ file by parsing it, summarizing classes and functions, and storing them in the database.
@@ -688,6 +704,35 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Error ingesting C++ file {inputPath}: {e}")
             raise FileProcessingError(f"Error ingesting C++ file {inputPath}: {e}")
 
+
+#        class_summary = await self.summarize_cpp_class(cls)
+#        embedding = self.generate_embedding(class_summary)
+
+#    async def IngestCpp(self, inputPath, inputLocation, inputName, currentOutputPath, projectID):
+#        logger.warning("Entering IngestCpp...")
+#        logger.warning(f"Parsing file: {inputPath}")
+#        index = clang.cindex.Index.create()
+#        translation_unit = index.parse(inputPath)
+#        logger.warning(f"File parsed successfully: {inputPath}")
+#        class_list = []
+#        function_list = []
+#        await self.process_nodes(translation_unit.cursor, class_list, function_list, inputLocation)
+#        logger.warning(f"Classes found: {len(class_list)}, Functions found: {len(function_list)}")
+# 
+#    async def process_nodes(self, node, class_list, function_list, project_path):
+#        for child in node.get_children():
+#            file_name = child.location.file.name if child.location.file else ''
+#            if project_path in file_name:
+#                if child.kind == clang.cindex.CursorKind.CLASS_DECL:
+#                    logger.warning(f"Class Declaration found: {child.spelling} at {file_name}")
+#                    class_list.append(child.spelling)
+#                    await self.process_nodes(child, class_list, function_list, project_path)
+#                elif child.kind == clang.cindex.CursorKind.CXX_METHOD:
+#                    logger.warning(f"Method found: {child.spelling} in class {node.spelling} at {file_name}")
+#                    function_list.append((node.spelling, child.spelling))
+#                else:
+#                    await self.process_nodes(child, class_list, function_list, project_path)
+    
     async def IngestPython(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
         """
         Ingest a Python file by parsing it, summarizing classes and functions, and storing them in the database.
@@ -716,7 +761,7 @@ class NNeo4JImporter(NBaseImporter):
                             "CREATE (n:Class {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
                             name=cls.name, summary=class_summary, embedding=embedding, projectID=projectID
                         )
-                    
+
                     for func in cls.body:
                         if isinstance(func, ast.FunctionDef):
                             function_summary = await self.summarize_python_function(func)
@@ -727,7 +772,8 @@ class NNeo4JImporter(NBaseImporter):
                                     name=func.name, summary=function_summary, embedding=embedding, projectID=projectID
                                 )
                                 await session.run(
-                                    "MATCH (c:Class), (f:Function) WHERE elementId(c) = $class_id AND elementId(f) = $function_id AND c.projectID = $projectID AND f.projectID = $projectID "
+                                    "MATCH (c:Class {elementId: $class_id, projectID: $projectID}) "
+                                    "MATCH (f:Function {elementId: $function_id, projectID: $projectID}) "
                                     "CREATE (c)-[:HAS_METHOD]->(f)",
                                     class_id=class_id, function_id=function_id, projectID=projectID
                                 )
@@ -799,7 +845,7 @@ class NNeo4JImporter(NBaseImporter):
                             "CREATE (n:Impl {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
                             name=impl.trait_.path.segments[0].ident, summary=impl_summary, embedding=embedding, projectID=projectID
                         )
-                    
+
                     for item in impl.items:
                         if isinstance(item, syn.ImplItemMethod):
                             function_summary = await self.summarize_rust_function(item)
@@ -810,7 +856,8 @@ class NNeo4JImporter(NBaseImporter):
                                     name=item.sig.ident, summary=function_summary, embedding=embedding, projectID=projectID
                                 )
                                 await session.run(
-                                    "MATCH (i:Impl), (f:Function) WHERE elementId(i) = $impl_id AND elementId(f) = $function_id AND i.projectID = $projectID AND f.projectID = $projectID "
+                                    "MATCH (i:Impl {elementId: $impl_id, projectID: $projectID}), "
+                                    "MATCH (f:Function {elementId: $function_id, projectID: $projectID}) "
                                     "CREATE (i)-[:HAS_METHOD]->(f)",
                                     impl_id=impl_id, function_id=function_id, projectID=projectID
                                 )
@@ -854,45 +901,6 @@ class NNeo4JImporter(NBaseImporter):
         """
         description = f"Function {func.sig.ident} with arguments: {', '.join(arg.pat.ident for arg in func.sig.inputs)}. It performs the following tasks: "
         return await self.summarize_text(description)
-
-    async def IngestJavascript(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
-        """
-        Ingest a JavaScript file by parsing it, summarizing classes, functions, and variables, and storing them in the database.
-
-        Args:
-            inputPath (str): The path to the input file.
-            inputLocation (str): The location of the input file.
-            inputName (str): The name of the input file.
-            currentOutputPath (str): The current output path.
-            projectID (str): The project ID.
-        """
-        try:
-            async with aiofiles.open(inputPath, 'r') as file:
-                content = await file.read()
-
-            ast = esprima.parseModule(content, {'loc': True, 'range': True})
-        except Exception as e:
-            logger.error(f"Error parsing JavaScript file {inputPath}: {e}")
-            raise FileProcessingError(f"Error parsing JavaScript file {inputPath}: {e}")
-
-        async with self.get_session() as session:
-            try:
-                async with self.rate_limiter:
-                    file_id = await self.run_query_and_get_element_id(session,
-                        "CREATE (n:JavaScriptFile {name: $name, path: $path, projectID: $projectID}) RETURN elementId(n)",
-                        name=inputName, path=inputPath, projectID=projectID
-                    )
-
-                for node in ast.body:
-                    if isinstance(node, nodes.FunctionDeclaration):
-                        await self.process_js_function(session, node, file_id, projectID)
-                    elif isinstance(node, nodes.ClassDeclaration):
-                        await self.process_js_class(session, node, file_id, projectID)
-                    elif isinstance(node, nodes.VariableDeclaration):
-                        await self.process_js_variable(session, node, file_id, projectID)
-            except Exception as e:
-                logger.error(f"Error ingesting JavaScript file {inputPath}: {e}")
-                raise DatabaseError(f"Error ingesting JavaScript file {inputPath}: {e}")
 
     async def summarize_js_function(self, func_node) -> str:
         """
@@ -942,6 +950,45 @@ class NNeo4JImporter(NBaseImporter):
         description += ", ".join(methods)
         return await self.summarize_text(description)
 
+    async def IngestJavascript(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
+        """
+        Ingest a JavaScript file by parsing it, summarizing classes, functions, and variables, and storing them in the database.
+
+        Args:
+            inputPath (str): The path to the input file.
+            inputLocation (str): The location of the input file.
+            inputName (str): The name of the input file.
+            currentOutputPath (str): The current output path.
+            projectID (str): The project ID.
+        """
+        try:
+            async with aiofiles.open(inputPath, 'r') as file:
+                content = await file.read()
+
+            ast = esprima.parseModule(content, {'loc': True, 'range': True})
+        except Exception as e:
+            logger.error(f"Error parsing JavaScript file {inputPath}: {e}")
+            raise FileProcessingError(f"Error parsing JavaScript file {inputPath}: {e}")
+
+        async with self.get_session() as session:
+            try:
+                async with self.rate_limiter:
+                    file_id = await self.run_query_and_get_element_id(session,
+                        "CREATE (n:JavaScriptFile {name: $name, path: $path, projectID: $projectID}) RETURN elementId(n)",
+                        name=inputName, path=inputPath, projectID=projectID
+                    )
+
+                for node in ast.body:
+                    if isinstance(node, nodes.FunctionDeclaration):
+                        await self.process_js_function(session, node, file_id, projectID)
+                    elif isinstance(node, nodes.ClassDeclaration):
+                        await self.process_js_class(session, node, file_id, projectID)
+                    elif isinstance(node, nodes.VariableDeclaration):
+                        await self.process_js_variable(session, node, file_id, projectID)
+            except Exception as e:
+                logger.error(f"Error ingesting JavaScript file {inputPath}: {e}")
+                raise DatabaseError(f"Error ingesting JavaScript file {inputPath}: {e}")
+
     async def process_js_function(self, session, func_node, file_id: int, projectID: str) -> None:
         func_name = func_node.id.name if func_node.id else 'anonymous'
         func_summary = await self.summarize_js_function(func_node)
@@ -955,7 +1002,7 @@ class NNeo4JImporter(NBaseImporter):
                 )
 
                 await session.run(
-                    "MATCH (f:JavaScriptFile), (func:JavaScriptFunction) WHERE elementId(f) = $file_id AND elementId(func) = $func_id AND f.projectID = $projectID AND func.projectID = $projectID "
+                    "MATCH (f:JavaScriptFile {elementId: $file_id, projectID: $projectID}), (func:JavaScriptFunction {elementId: $func_id, projectID: $projectID}) "
                     "CREATE (f)-[:CONTAINS]->(func)",
                     file_id=file_id, func_id=func_db_id, projectID=projectID
                 )
@@ -976,7 +1023,7 @@ class NNeo4JImporter(NBaseImporter):
                 )
 
                 await session.run(
-                    "MATCH (f:JavaScriptFile), (c:JavaScriptClass) WHERE elementId(f) = $file_id AND elementId(c) = $class_id AND f.projectID = $projectID AND c.projectID = $projectID "
+                    "MATCH (f:JavaScriptFile {elementId: $file_id, projectID: $projectID}), (c:JavaScriptClass {elementId: $class_id, projectID: $projectID}) "
                     "CREATE (f)-[:CONTAINS]->(c)",
                     file_id=file_id, class_id=class_db_id, projectID=projectID
                 )
@@ -1003,7 +1050,7 @@ class NNeo4JImporter(NBaseImporter):
                     )
 
                     await session.run(
-                        "MATCH (f:JavaScriptFile), (v:JavaScriptVariable) WHERE elementId(f) = $file_id AND elementId(v) = $var_id AND f.projectID = $projectID AND v.projectID = $projectID "
+                        "MATCH (f:JavaScriptFile {elementId: $file_id, projectID: $projectID}), (v:JavaScriptVariable {elementId: $var_id, projectID: $projectID}) "
                         "CREATE (f)-[:CONTAINS]->(v)",
                         file_id=file_id, var_id=var_db_id, projectID=projectID
                     )
@@ -1033,7 +1080,7 @@ class NNeo4JImporter(NBaseImporter):
                 )
 
                 await session.run(
-                    "MATCH (c:JavaScriptClass), (m:JavaScriptMethod) WHERE elementId(c) = $class_id AND elementId(m) = $method_id AND c.projectID = $projectID AND m.projectID = $projectID "
+                    "MATCH (c:JavaScriptClass {elementId: $class_id, projectID: $projectID}), (m:JavaScriptMethod {elementId: $method_id, projectID: $projectID}) "
                     "CREATE (c)-[:HAS_METHOD]->(m)",
                     class_id=class_id, method_id=method_db_id, projectID=projectID
                 )
@@ -1084,7 +1131,7 @@ class NNeo4JImporter(NBaseImporter):
                         )
 
                         await session.run(
-                            "MATCH (p:PDF {elementId: $pdf_id, projectID: $projectID}), (c:MediumChunk {elementId: $chunk_id, projectID: $projectID}) CREATE (p)-[:HAS_CHUNK]->(c), (c)-[:PART_OF]->(p)",
+                            "MATCH (p:PDF {elementId: $pdf_id, projectID: $projectID}) MATCH (c:MediumChunk {elementId: $chunk_id, projectID: $projectID}) CREATE (p)-[:HAS_CHUNK]->(c), (c)-[:PART_OF]->(p)",
                             {"pdf_id": pdf_id, "chunk_id": medium_chunk_id, "projectID": projectID}
                         )
 
@@ -1097,7 +1144,6 @@ class NNeo4JImporter(NBaseImporter):
 
                             await session.run(
                                 "MATCH (mc:MediumChunk {elementId: $medium_chunk_id, projectID: $projectID}) "
-                                "WITH mc "
                                 "MATCH (sc:SmallChunk {elementId: $small_chunk_id, projectID: $projectID}) "
                                 "CREATE (mc)-[:HAS_CHUNK]->(sc), (sc)-[:PART_OF]->(mc)",
                                 {"medium_chunk_id": medium_chunk_id, "small_chunk_id": small_chunk_id, "projectID": projectID}
@@ -1110,7 +1156,9 @@ class NNeo4JImporter(NBaseImporter):
                             )
 
                             await session.run(
-                                "MATCH (sc:SmallChunk {elementId: $small_chunk_id, projectID: $projectID}), (e:Embedding {elementId: $embedding_id, projectID: $projectID}) CREATE (sc)-[:HAS_EMBEDDING]->(e)",
+                                "MATCH (sc:SmallChunk {elementId: $small_chunk_id, projectID: $projectID}) "
+                                "MATCH (e:Embedding {elementId: $embedding_id, projectID: $projectID}) "
+                                "CREATE (sc)-[:HAS_EMBEDDING]->(e)",
                                 {"small_chunk_id": small_chunk_id, "embedding_id": embedding_id, "projectID": projectID}
                             )
         except Exception as e:
@@ -1178,7 +1226,12 @@ class NIngest:
             int: The total number of files.
         """
         total = 0
+        if self.should_ignore_file(path):
+            return total
+            
         for entry in os.scandir(path):
+            if self.should_ignore_file(entry.path):
+                continue
             if entry.is_file():
                 total += 1
             elif entry.is_dir():
