@@ -41,9 +41,11 @@ import aiorate
 import ollama
 from aiolimiter import AsyncLimiter
 from typing import AsyncGenerator
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, Tuple
 import magic
 from collections import defaultdict
+import copy
+import pprint
 
 # Load environment variables
 dotenv.load_dotenv()
@@ -177,19 +179,18 @@ class NBaseImporter(ABC):
         # Implement the actual graph node creation logic here
 
     async def chunk_and_create_nodes(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
-        async with self.driver.session() as session:
-            try:
-                chunks = [chunk async for chunk in read_file_in_chunks(inputPath, MEDIUM_CHUNK_SIZE)]
-                previous_chunk_id = None
+        try:
+            chunks = [chunk async for chunk in read_file_in_chunks(inputPath, MEDIUM_CHUNK_SIZE)]
+            previous_chunk_id = None
 
-                for i, chunk in enumerate(chunks):
-                    chunk_id = await self.handle_chunk_creation(session, chunk, inputPath, i, projectID)
-                    if previous_chunk_id:
-                        await self.create_chunk_relationship(session, previous_chunk_id, chunk_id, projectID)
-                    previous_chunk_id = chunk_id
-            except Exception as e:
-                logger.error(f"Error processing file {inputPath}: {e}")
-                raise FileProcessingError(f"Error processing file {inputPath}: {e}")
+            for i, chunk in enumerate(chunks):
+                chunk_id = await self.handle_chunk_creation(chunk, inputPath, i, projectID)
+                if previous_chunk_id:
+                    await self.create_chunk_relationship(previous_chunk_id, chunk_id, projectID)
+                previous_chunk_id = chunk_id
+        except Exception as e:
+            logger.error(f"Error processing file {inputPath}: {e}")
+            raise FileProcessingError(f"Error processing file {inputPath}: {e}")
 
 
     def chunk_text(self, text: str, chunk_size: int) -> List[str]:
@@ -197,13 +198,12 @@ class NBaseImporter(ABC):
 
 
 
-    @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=4, max=10))
-    async def create_chunk_node(self, session, chunk: str, inputPath: str, index: int, projectID: str) -> Optional[str]:
+#    @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=15, max=30))
+    async def create_chunk_node(self, chunk: str, inputPath: str, index: int, projectID: str) -> Optional[str]:
         """
         Create a chunk node in the Neo4j database.
 
         Args:
-            session: The Neo4j session.
             chunk (str): The text chunk.
             inputPath (str): The path to the input file.
             index (int): The index of the chunk.
@@ -217,63 +217,65 @@ class NBaseImporter(ABC):
 
             # Check if the chunk node already exists
             async with self.rate_limiter_db:
-                existing_node = await self.run_query_and_get_element_id(session,
-                    "MATCH (n:Chunk {elementId: $id}) RETURN elementId(n)",
-                    id=chunk_id
-                )
-
-            if existing_node:
-                logger.info(f"Chunk node {chunk_id} already exists, skipping creation")
-                return chunk_id
+                async with self.get_session() as session:
+                    existing_node = await self.run_query_and_get_element_id(session,
+                        "MATCH (n:Chunk {elementId: $id}) RETURN elementId(n)",
+                        id=chunk_id
+                    )
+                if existing_node:
+                    logger.info(f"Chunk node {chunk_id} already exists, skipping creation")
+                    return chunk_id
 
             embedding = await self.make_embedding(chunk)
                 
             async with self.rate_limiter_db:
-                node_id = await self.run_query_and_get_element_id(session,
-                    "CREATE (n:Chunk {elementId: $id, content: $content, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
-                    id=chunk_id, content=chunk, embedding=embedding, projectID=projectID
-                )
-                if node_id:
-                    logger.info(f"Created chunk node {chunk_id} with embedding")
-                    return chunk_id
-                else:
-                    logger.error(f"No result returned for chunk node {chunk_id}")
-                    return None
+                async with self.get_session() as session:
+                    node_id = await self.run_query_and_get_element_id(session,
+                        "CREATE (n:Chunk {elementId: $id, content: $content, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
+                        id=chunk_id, content=chunk, embedding=embedding, projectID=projectID
+                    )
+                    if node_id:
+                        logger.info(f"Created chunk node {chunk_id} with embedding")
+                        return chunk_id
+                    else:
+                        logger.error(f"No result returned for chunk node {chunk_id}")
+                        return None
         except Exception as e:
             logger.error(f"Error creating chunk node: {e}")
             raise DatabaseError(f"Error creating chunk node: {e}")
 
 
     @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=4, max=10))
-    async def create_chunk_relationship(self, session, chunk_id1: str, chunk_id2: str, projectID: str) -> None:
+    async def create_chunk_relationship(self, chunk_id1: str, chunk_id2: str, projectID: str) -> None:
         """
         Create a relationship between two chunks in the Neo4j database.
 
         Args:
-            session: The Neo4j session.
             chunk_id1 (str): The ID of the first chunk.
             chunk_id2 (str): The ID of the second chunk.
             projectID (str): The project ID.
         """
         try:
-            result = await session.run(
-                "MATCH (c1:Chunk {elementId: $id1, projectID: $projectID}), (c2:Chunk {elementId: $id2, projectID: $projectID}) CREATE (c1)-[:NEXT]->(c2)",
-                id1=chunk_id1, id2=chunk_id2, projectID=projectID
-            )
-            if result:
-                logger.info(f"Created relationship between {chunk_id1} and {chunk_id2}")
-            else:
-                logger.error(f"No result returned for creating relationship between {chunk_id1} and {chunk_id2}")
+            async with self.rate_limiter_db:
+                async with self.get_session() as session:
+                    result = await (await session.run(
+                        "MATCH (c1:Chunk {elementId: $id1, projectID: $projectID}), (c2:Chunk {elementId: $id2, projectID: $projectID}) CREATE (c1)-[:NEXT]->(c2)",
+                        id1=chunk_id1, id2=chunk_id2, projectID=projectID
+                    )).consume()
+                    if result:
+                        logger.info(f"Created relationship between {chunk_id1} and {chunk_id2}")
+                    else:
+                        logger.error(f"No result returned for creating relationship between {chunk_id1} and {chunk_id2}")
         except Exception as e:
             logger.error(f"Error creating chunk relationship: {e}")
             raise DatabaseError(f"Error creating chunk relationship: {e}")
 
-    async def handle_chunk_creation(self, session, chunk, inputPath, index, projectID):
+
+    async def handle_chunk_creation(self, chunk, inputPath, index, projectID):
         """
         Handle the creation of a chunk node.
 
         Args:
-            session: The Neo4j session.
             chunk: The text chunk.
             inputPath: The path to the input file.
             index: The index of the chunk.
@@ -283,7 +285,7 @@ class NBaseImporter(ABC):
             The chunk ID.
         """
         try:
-            chunk_id = await self.create_chunk_node(session, chunk, inputPath, index, projectID)
+            chunk_id = await self.create_chunk_node(chunk, inputPath, index, projectID)
             return chunk_id
         except Exception as e:
             logger.error(f"Error creating chunk node for chunk {index} in file {inputPath}: {e}")
@@ -331,6 +333,10 @@ class NNeo4JImporter(NBaseImporter):
         
         logging.getLogger("transformers").setLevel(logging.ERROR)
 
+        self.semaphore_summarizer = asyncio.Semaphore(1)  # Limit to 1 concurrent tasks
+        self.semaphore_embedding = asyncio.Semaphore(1)  # Limit to 1 concurrent tasks
+
+        self.lock_summarizer = asyncio.Lock()
         self.summarizer = pipeline("summarization", model="google/pegasus-xsum", device=self.device)
 #        self.summarizer = pipeline("summarization", model="facebook/bart-large-cnn", device=self.device)
         
@@ -341,26 +347,28 @@ class NNeo4JImporter(NBaseImporter):
         self.code_model = AutoModel.from_pretrained("microsoft/codebert-base").to(self.device)
         self.code_model.eval()
 
-        self.rate_limiter_db = AsyncLimiter(1, 2)  # 1 operations per 2 seconds
-        self.rate_limiter_summary = AsyncLimiter(1, 6)  # 1 operations per 6 seconds
-        self.rate_limiter_embedding = AsyncLimiter(1, 6)  # 1 operations per 6 seconds
+        self.rate_limiter_db = AsyncLimiter(50, 1)  # 1 operations per 2 seconds
+        self.rate_limiter_summary = AsyncLimiter(2, 1)  # 2 operations per 1 seconds
+        self.rate_limiter_embedding = AsyncLimiter(2, 1)  # 2 operations per 1 seconds
 
         self.bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
         self.bert_model = BertModel.from_pretrained('bert-base-uncased').to(self.device)
         self.bert_model.eval()
         
-        self.semaphore = asyncio.Semaphore(1)  # Limit to 1 concurrent tasks
-
         self.classes = defaultdict(dict)
         self.functions = defaultdict(dict)
         self.methods = defaultdict(dict)
         self.header_files = {}
-        
+
+        self.file_paths = []
+        self.file_paths_lock = asyncio.Lock()
+
         self.lock_classes = asyncio.Lock()  # Create a lock instance
         self.lock_functions = asyncio.Lock()  # Create a lock instance
         self.lock_methods = asyncio.Lock()  # Create a lock instance
+        self.lock_file_paths = asyncio.Lock()  # Create a lock instance
         self.lock_header_files = asyncio.Lock()  # Create a lock instance
-        
+
         self.progress_callback_scan = None
         self.progress_callback_summarize = None
         self.progress_callback_store = None
@@ -380,6 +388,22 @@ class NNeo4JImporter(NBaseImporter):
     def set_progress_callback_store_start(self, callback):
         self.progress_callback_store_start = callback
 
+
+    async def add_file_path(self, path: str):
+        async with self.file_paths_lock:
+            self.file_paths.append(path)
+
+    async def get_file_paths(self) -> List[str]:
+        async with self.file_paths_lock:
+            return self.file_paths.copy()
+
+    async def get_file_paths_length(self) -> int:
+        async with self.file_paths_lock:
+            return len(self.file_paths)
+
+    async def closeDB(self):
+        await self.driver.close()
+
     @asynccontextmanager
     @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=4, max=10), retry=retry_if_exception_type(ServiceUnavailable))
     async def get_session(self):
@@ -392,6 +416,8 @@ class NNeo4JImporter(NBaseImporter):
         async with self.driver.session() as session:
             try:
                 yield session
+            except Exception as e:
+                logger.error(f"Errpr in get_session: {e}")
             finally:
                 await session.close()
 
@@ -401,12 +427,14 @@ class NNeo4JImporter(NBaseImporter):
         async with self.rate_limiter_embedding:
             return await self.generate_embedding(text)
 
-    @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=10, max=20))
+    @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=15, max=30))
     async def generate_embedding(self, text: str) -> List[float]:
-        async with self.semaphore:  # Ensure only 5 concurrent tasks
+        async with self.semaphore_embedding:  # Ensure only 5 concurrent tasks
             try:
                 loop = asyncio.get_running_loop()
+#                logger.info(f"Started generating an embedding.")
                 embedding = await loop.run_in_executor(None, self._generate_embedding, text)
+#                logger.info(f"Finished generating an embedding.")
                 return embedding
             except Exception as e:
                 logger.error(f"Error generating embedding: {e}")
@@ -443,11 +471,17 @@ class NNeo4JImporter(NBaseImporter):
             currentOutputPath (str): The current output path.
             projectID (str): The project ID.
         """
-        logger.info(f"Starting scanning for file: {inputPath}")
+#        logger.info(f"Starting scanning for file: {inputPath}")
         try:
             file_type = self.ascertain_file_type(inputPath)
             ingest_method = getattr(self, f"Ingest{file_type.capitalize()}", None)
             if ingest_method:
+                
+                
+                ## RESUME
+                
+                await self.add_file_path(inputPath)
+                
                 await ingest_method(inputPath, inputLocation, inputName, currentOutputPath, projectID)
             else:
                 logger.warning(f"No ingest method for file type: {file_type}")
@@ -457,7 +491,10 @@ class NNeo4JImporter(NBaseImporter):
         finally:
             # Update progress for scanning phase
             await self.update_progress_scan(1)
-        logger.info(f"Completed scanning for file: {inputPath}")
+            await self.update_progress_summarize(1)
+            await self.update_progress_store(1)
+
+#        logger.info(f"Completed scanning for file: {inputPath}")
 
 
     async def do_summarize_text(self, text, max_length=50, min_length=25) -> str:
@@ -465,7 +502,7 @@ class NNeo4JImporter(NBaseImporter):
         async with self.rate_limiter_summary:
             return await self.summarize_text(text, max_length, min_length)
 
-    @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=4, max=10))
+    @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=15, max=30))
     async def summarize_text(self, text, max_length=50, min_length=25) -> str:
         """
         Summarize the given text using a pre-trained model.
@@ -476,20 +513,23 @@ class NNeo4JImporter(NBaseImporter):
         Returns:
             str: The summary of the text.
         """
-        async with self.semaphore:  # Ensure only 5 concurrent tasks
+        async with self.semaphore_summarizer:  # Ensure only 5 concurrent tasks
             try:
                 loop = asyncio.get_running_loop()
-                return await loop.run_in_executor(None, lambda: self.summarizer(text, max_length=max_length, min_length=min_length, do_sample=False)[0]['summary_text'])
+#                logger.info(f"Summarizing text...")
+                async with self.lock_summarizer:
+                    retval = await loop.run_in_executor(None, lambda: self.summarizer(text, max_length=max_length, min_length=min_length, do_sample=False)[0]['summary_text'])
+#                logger.info(f"Finished summarizing text.")
+                return retval
             except Exception as e:
                 logger.error(f"Error summarizing text: {e}")
                 return ""
         
-    async def process_chunks(self, session, text, parent_node_id, parent_node_type, chunk_size, chunk_type, projectID):
+    async def process_chunks(self, text, parent_node_id, parent_node_type, chunk_size, chunk_type, projectID):
         """
         Process text chunks and create corresponding nodes in the Neo4j database.
 
         Args:
-            session: The Neo4j session.
             text: The text to be chunked.
             parent_node_id: The ID of the parent node.
             parent_node_type: The type of the parent node.
@@ -499,14 +539,13 @@ class NNeo4JImporter(NBaseImporter):
         """
         chunks = self.chunk_text(text, chunk_size)
         for i, chunk in enumerate(chunks):
-            await self.create_chunk_with_embedding(session, chunk, parent_node_id, parent_node_type, chunk_type, projectID)
+            await self.create_chunk_with_embedding(chunk, parent_node_id, parent_node_type, chunk_type, projectID)
 
-    async def create_chunk_with_embedding(self, session, chunk, parent_node_id, parent_node_type, chunk_type, projectID):
+    async def create_chunk_with_embedding(self, chunk, parent_node_id, parent_node_type, chunk_type, projectID):
         """
         Create a chunk node with embedding in the Neo4j database.
 
         Args:
-            session: The Neo4j session.
             chunk: The text chunk.
             parent_node_id: The ID of the parent node.
             parent_node_type: The type of the parent node.
@@ -515,46 +554,48 @@ class NNeo4JImporter(NBaseImporter):
         """
         try:
             async with self.rate_limiter_db:
-                chunk_id = await self.run_query_and_get_element_id(session,
-                    f"CREATE (n:{chunk_type} {{content: $content, type: $chunk_type, projectID: $projectID}}) RETURN elementId(n)",
-                    content=chunk, chunk_type=chunk_type, projectID=projectID
-                )
-                await (await session.run(
-                    f"MATCH (p:{parent_node_type} {{elementId: $parent_node_id, projectID: $projectID}}) "
-                    f"MATCH (c:{chunk_type} {{elementId: $chunk_id, projectID: $projectID}}) "
-                    f"CREATE (p)-[:HAS_CHUNK]->(c), (c)-[:PART_OF]->(p)",
-                    parent_node_id=parent_node_id, chunk_id=chunk_id, projectID=projectID
-                )).consume()
-                
+                async with self.get_session() as session:
+                    chunk_id = await self.run_query_and_get_element_id(session,
+                        f"CREATE (n:{chunk_type} {{content: $content, type: $chunk_type, projectID: $projectID}}) RETURN elementId(n)",
+                        content=chunk, chunk_type=chunk_type, projectID=projectID
+                    )
+                    await (await session.run(
+                        f"MATCH (p:{parent_node_type} {{elementId: $parent_node_id, projectID: $projectID}}) "
+                        f"MATCH (c:{chunk_type} {{elementId: $chunk_id, projectID: $projectID}}) "
+                        f"CREATE (p)-[:HAS_CHUNK]->(c), (c)-[:PART_OF]->(p)",
+                        parent_node_id=parent_node_id, chunk_id=chunk_id, projectID=projectID
+                    )).consume()
         except Exception as e:
             logger.error(f"Error creating chunk during db query.")
             raise DatabaseError(f"Error creating chunk during db query.")
 
         try:
+#            logger.info(f"Making embedding for chunk_id: {chunk_id}")
             embedding = await self.make_embedding(chunk)
+#            logger.info(f"Finished making embedding for chunk_id: {chunk_id}")
         except Exception as e:
             logger.error(f"Error creating chunk embedding: {e}")
             raise DatabaseError(f"Error creating chunk embedding: {e}")
         
         try:
             async with self.rate_limiter_db:
-                embedding_id = await self.run_query_and_get_element_id(session,
-                    "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', projectID: $projectID}) RETURN elementId(n)",
-                    embedding=embedding, projectID=projectID
-                )
-                await (await session.run(
-                    f"MATCH (c:{chunk_type} {{elementId: $chunk_id, projectID: $projectID}}) "
-                    f"MATCH (e:Embedding {{elementId: $embedding_id, projectID: $projectID}}) "
-                    f"CREATE (c)-[:HAS_EMBEDDING]->(e)",
-                    chunk_id=chunk_id, embedding_id=embedding_id, projectID=projectID
-                )).consume()
+                async with self.get_session() as session:
+                    embedding_id = await self.run_query_and_get_element_id(session,
+                        "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', projectID: $projectID}) RETURN elementId(n)",
+                        embedding=embedding, projectID=projectID
+                    )
+                    await (await session.run(
+                        f"MATCH (c:{chunk_type} {{elementId: $chunk_id, projectID: $projectID}}) "
+                        f"MATCH (e:Embedding {{elementId: $embedding_id, projectID: $projectID}}) "
+                        f"CREATE (c)-[:HAS_EMBEDDING]->(e)",
+                        chunk_id=chunk_id, embedding_id=embedding_id, projectID=projectID
+                    )).consume()
         except Exception as e:
             logger.error(f"Error storing chunk with embedding: {e}")
             raise DatabaseError(f"Error storing chunk with embedding: {e}")
 
 
     async def IngestText(self, input_path: str, input_location: str, input_name: str, current_output_path: str, project_id: str) -> None:
-        async with self.get_session() as session:
             try:
                 # File reading operation - doesn't need rate limiting
                 async with aiofiles.open(input_path, 'r') as file:
@@ -566,24 +607,19 @@ class NNeo4JImporter(NBaseImporter):
             try:
                 # Database operation - needs rate limiting
                 async with self.rate_limiter_db:
-                    parent_doc_id = await self.run_query_and_get_element_id(session,
-                        "CREATE (n:Document {name: $name, type: 'text', projectID: $projectID}) RETURN elementId(n)",
-                        name=input_name, projectID=project_id
-                    )
+                    async with self.get_session() as session:
+                        parent_doc_id = await self.run_query_and_get_element_id(session,
+                            "CREATE (n:Document {name: $name, type: 'text', projectID: $projectID}) RETURN elementId(n)",
+                            name=input_name, projectID=project_id
+                        )
 
                 # This method likely contains multiple database operations,
                 # so we don't wrap it in rate_limiter here. It should handle its own rate limiting internally.
-                await self.process_chunks(session, file_content, parent_doc_id, "Document", MEDIUM_CHUNK_SIZE, "MediumChunk", project_id)
-
+                await self.process_chunks(file_content, parent_doc_id, "Document", MEDIUM_CHUNK_SIZE, "MediumChunk", project_id)
+        
             except Exception as e:
                 logger.error(f"Error ingesting text file {input_path}: {e}")
                 raise DatabaseError(f"Error ingesting text file {input_path}: {e}")
-            
-            finally:
-                # Ensure progress is updated even if an exception occurs
-                await self.update_progress_scan(1)
-                await self.update_progress_summarize(1)
-                await self.update_progress_store(1)
 
     async def extract_image_features(self, image: PIL.Image.Image) -> List[float]:
         """
@@ -624,6 +660,7 @@ class NNeo4JImporter(NBaseImporter):
         try:
             image = PIL.Image.open(input_path)
             await self.process_image_file(image, input_name, project_id)
+            
         except Exception as e:
             logger.error(f"Error ingesting image: {e}")
             raise FileProcessingError(f"Error ingesting image: {e}")
@@ -638,35 +675,33 @@ class NNeo4JImporter(NBaseImporter):
             project_id (str): The project ID.
         """
         features = await self.extract_image_features(image)
+        await self.store_image_features(features, input_name, project_id)
 
-        async with self.get_session() as session:
-            await self.store_image_features(session, features, input_name, project_id)
-
-    async def store_image_features(self, session, features: List[float], input_name: str, project_id: str):
+    async def store_image_features(self, features: List[float], input_name: str, project_id: str):
         """
         Store the extracted image features in the database.
 
         Args:
-            session: The Neo4j session.
             features (List[float]): The extracted features.
             input_name (str): The name of the input file.
             project_id (str): The project ID.
         """
         try:
             async with self.rate_limiter_db:
-                image_id = await self.run_query_and_get_element_id(session,
-                    "CREATE (n:Image {name: $name, type: 'image', projectID: $projectID}) RETURN elementId(n)",
-                    name=input_name, projectID=project_id
-                )
-                features_id = await self.run_query_and_get_element_id(session,
-                    "CREATE (n:ImageFeatures {features: $features, type: 'image_features', projectID: $projectID}) RETURN elementId(n)",
-                    features=features, projectID=project_id
-                )
-                await (await session.run(
-                    "MATCH (i:Image), (f:ImageFeatures) WHERE elementId(i) = $image_id AND elementId(f) = $features_id AND i.projectID = $projectID AND f.projectID = $projectID "
-                    "CREATE (i)-[:HAS_FEATURES]->(f)",
-                    image_id=image_id, features_id=features_id, projectID=project_id).consume()
-                )
+                async with self.get_session() as session:
+                    image_id = await self.run_query_and_get_element_id(session,
+                        "CREATE (n:Image {name: $name, type: 'image', projectID: $projectID}) RETURN elementId(n)",
+                        name=input_name, projectID=project_id
+                    )
+                    features_id = await self.run_query_and_get_element_id(session,
+                        "CREATE (n:ImageFeatures {features: $features, type: 'image_features', projectID: $projectID}) RETURN elementId(n)",
+                        features=features, projectID=project_id
+                    )
+                    await (await session.run(
+                        "MATCH (i:Image), (f:ImageFeatures) WHERE elementId(i) = $image_id AND elementId(f) = $features_id AND i.projectID = $projectID AND f.projectID = $projectID "
+                        "CREATE (i)-[:HAS_FEATURES]->(f)",
+                        image_id=image_id, features_id=features_id, projectID=project_id).consume()
+                    )
         except Exception as e:
             logger.error(f"Error storing image features: {e}")
             raise DatabaseError(f"Error storing image features: {e}")
@@ -697,29 +732,36 @@ class NNeo4JImporter(NBaseImporter):
         Returns:
             tuple: A tuple containing the class name, fully-qualified name, and the summary.
         """
-                
-        type_name = class_info['type']
-        full_name = class_info['name']
-        full_scope = class_info['scope']
-        short_name = class_info['short_name']
-        raw_code = class_info['raw_code']
-        file_path = class_info['file_path']
-        raw_comment = class_info['raw_comment']
-        description = class_info['description']
-        interface_description = class_info['interface_description'] if class_info['interface_description'] else ''
+        
+        try:
+            type_name = class_info.get('type', 'Class')
+            full_name = class_info.get('name', 'anonymous')
+            full_scope = class_info.get('scope', '')
+            short_name = class_info.get('short_name', '')
+            raw_code = class_info.get('raw_code', '')
+            file_path = class_info.get('file_path', '')
+            raw_comment = class_info.get('raw_comment', '')
+            description = class_info.get('description', '')
+            interface_description = class_info.get('interface_description', raw_code)
 
-        background = (
-            "Speaking as a senior developer and software architect, describe the purpose and usage of this class in your own words. "
-            "Meditate on the provided description and public interface first, before writing your final summary. "
-            "Then enclose those meditations in opening and closing <thoughts> tags, and then write your final summary."
-        )
-        
-        # Combine background and description with clear separation
-        full_prompt = f"{background}\n\nClass Details:\n{description}. {interface_description}"
-        
-        summary = await self.do_summarize_text(full_prompt, 200, 25)
-        
-        return full_name, full_scope, summary, description + ". " + interface_description
+            background = (
+                "Speaking as a senior developer and software architect, describe the purpose and usage of this class in your own words. "
+                "Meditate on the provided description and public interface first, before writing your final summary. "
+                "Then enclose those meditations in opening and closing <thoughts> tags, and then write your final summary."
+            )
+            
+            # Combine background and description with clear separation
+            full_prompt = f"{background}\n\nClass Details:\n{description}. {interface_description}"
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_class_public_interface accessing dict: {e}")
+            raise DatabaseError(f"Error in summarize_cpp_class_public_interface accessing dict: {e}")
+
+        try:
+            summary = await self.do_summarize_text(full_prompt, 200, 25)
+            return full_name, full_scope, summary, description + ". " + interface_description
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_class_public_interface: {e}")
+            raise DatabaseError(f"Error in summarize_cpp_class_public_interface: {e}")
                 
 
     async def summarize_cpp_class_implementation(self, class_info) -> (str, str):
@@ -733,28 +775,37 @@ class NNeo4JImporter(NBaseImporter):
         Returns:
             tuple: A tuple containing the class name, fully-qualified name, and the summary.
         """
-        type_name = class_info['type']
-        full_name = class_info['name']
-        full_scope = class_info['scope']
-        short_name = class_info['short_name']
-        raw_code = class_info['raw_code']
-        file_path = class_info['file_path']
-        raw_comment = class_info['raw_comment']
-        description = class_info['description']
-        implementation_description = class_info['implementation_description'] if class_info['implementation_description'] else ''
+        
+        try:
+            type_name = class_info.get('type', 'Class')
+            full_name = class_info.get('name', 'anonymous')
+            full_scope = class_info.get('scope', '')
+            short_name = class_info.get('short_name', '')
+            raw_code = class_info.get('raw_code', '')
+            file_path = class_info.get('file_path', '')
+            raw_comment = class_info.get('raw_comment', '')
+            description = class_info.get('description', '')
+            implementation_description = class_info.get('implementation_description', raw_code)
 
-        background = (
-            "Speaking as a senior developer and software architect, describe the implementation and inner workings of this class in your own words. "
-            "Meditate on the provided description below, before writing your final summary. "
-            "Then enclose those meditations in opening and closing <thoughts> tags, and then write your final summary."
-        )
-        
-        # Combine background and description with clear separation
-        full_prompt = f"{background}\n\nClass Details: {description}. {implementation_description}"
-        
-        summary = await self.do_summarize_text(full_prompt, 200, 25)
-        
-        return summary, description + ". " + implementation_description
+            background = (
+                "Speaking as a senior developer and software architect, describe the implementation and inner workings of this class in your own words. "
+                "Meditate on the provided description below, before writing your final summary. "
+                "Then enclose those meditations in opening and closing <thoughts> tags, and then write your final summary."
+            )
+            
+            # Combine background and description with clear separation
+            full_prompt = f"{background}\n\nClass Details: {description}. {implementation_description}"
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_class_implementation accessing dict: {e}")
+            raise DatabaseError(f"Error in summarize_cpp_class_implementation accessing dict: {e}")
+
+        try:
+            summary = await self.do_summarize_text(full_prompt, 200, 25)
+            return summary, description + ". " + implementation_description
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_class_implementation: {e}")
+            raise DatabaseError(f"Error in summarize_cpp_class_implementation: {e}")
+
 
     async def summarize_cpp_class(self, class_info) -> (str, str, str, str):
         """
@@ -767,9 +818,20 @@ class NNeo4JImporter(NBaseImporter):
             str: The summary of the class.
         """
         
-        class_name, full_scope, interface_summary, interface_description = await self.summarize_cpp_class_public_interface(class_info)
-        implementation_summary, implementation_description = await self.summarize_cpp_class_implementation(class_info)
-        
+        try:
+#            logger.info(f"Summarizing class public interface: {class_info['name']}")
+            class_name, full_scope, interface_summary, interface_description = await self.summarize_cpp_class_public_interface(class_info)
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_class_public_interface for {class_name}: {e}")
+            raise DatabaseError(f"Error in summarize_cpp_class_public_interface for {class_name}: {e}")
+        try:
+#            logger.info(f"Summarizing class implementation: {class_info['name']}")
+            implementation_summary, implementation_description = await self.summarize_cpp_class_implementation(class_info)
+#            logger.info(f"Finished summarizing/embedding CPP class: {class_name}")
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_class_implementationfor {class_name}: {e}")
+            raise DatabaseError(f"Error in summarize_cpp_class_implementation for {class_name}: {e}")
+
         return class_name, full_scope, interface_summary + "\n\n" + interface_description, implementation_summary + "\n\n" + implementation_description
 
     async def summarize_cpp_function(self, node_info) -> (str, str, str):
@@ -782,16 +844,20 @@ class NNeo4JImporter(NBaseImporter):
         Returns:
             str: The summary of the function or method.
         """
-                
-        type_name = node_info['type']
-        full_name = node_info['name']
-        full_scope = node_info['scope']
-        short_name = node_info['short_name']
-        raw_code = node_info['raw_code']
-        file_path = node_info['file_path']
-        raw_comment = node_info['raw_comment']
-        description = node_info['description']
-        is_cpp_file = node_info['is_cpp_file']
+        
+        type_name = node_info.get('type', 'Function')
+        full_name = node_info.get('name', 'anonymous')
+        full_scope = node_info.get('scope', '')
+        short_name = node_info.get('short_name', '')
+        raw_code = node_info.get('raw_code', '')
+        file_path = node_info.get('file_path', '')
+        raw_comment = node_info.get('raw_comment', '')
+        description = node_info.get('description', '')
+        is_cpp_file = node_info.get('is_cpp_file', False)
+
+        if type_name is None:
+            logger.error(f"Error in summarize_cpp_function - type_name is None")
+            raise DatabaseError(f"Error in summarize_cpp_function: type_name is None")
 
         # Background for summarization
         background = (
@@ -803,9 +869,20 @@ class NNeo4JImporter(NBaseImporter):
         # Combine background and description with clear separation
         full_prompt = f"{background}\n\n{type_name} Details:\n{description}"
         
-        summary = await self.do_summarize_text(full_prompt)
+        try:
+            summary = await self.do_summarize_text(full_prompt)
+#            logger.info(f"Finished summarizing/embedding CPP {type_name}: {full_name}")
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_function calling do_summarize_text: {e}")
+            raise DatabaseError(f"Error in summarize_cpp_function calling do_summarize_text: {e}")
         
-        return full_name, full_scope, summary + "\n\n" + description
+        try:
+            retval = full_name, full_scope, summary + "\n\n" + description
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_function appending strings: {e}\nnode_info contents:\n{pprint.pformat(node_info, indent=4)}")
+            raise DatabaseError(f"Error in summarize_cpp_function appending strings: {e}\nnode_info contents:\n{pprint.pformat(node_info, indent=4)}")
+
+        return retval
 #
 #    async def IngestCpp(self, inputPath, inputLocation, inputName, currentOutputPath, projectID):
 #        try:
@@ -937,20 +1014,19 @@ class NNeo4JImporter(NBaseImporter):
     
     async def IngestCpp(self, inputPath, inputLocation, inputName, currentOutputPath, projectID):
         try:
-            async with self.get_session() as session:
-                logger.info(f"Parsing file: {inputPath}")
-                index = clang.cindex.Index.create()
-                translation_unit = index.parse(inputPath)
-                logger.info(f"File parsed successfully: {inputPath}")
-                
-                # Save raw code of header files
-                if inputPath.endswith('.hpp') or inputPath.endswith('.h'):
-                    with open(inputPath, 'r') as file:
-                        file_contents = file.read()
-                        async with self.lock_header_files:
-                            self.header_files[inputPath] = file_contents
-                
-                await self.process_nodes(session, translation_unit.cursor, inputLocation, projectID, inputPath.endswith('.cpp'))
+#            logger.info(f"Parsing file: {inputPath}")
+            index = clang.cindex.Index.create()
+            translation_unit = index.parse(inputPath)
+#            logger.info(f"File parsed successfully: {inputPath}")
+            
+            # Save raw code of header files
+            if inputPath.endswith('.hpp') or inputPath.endswith('.h'):
+                with open(inputPath, 'r') as file:
+                    file_contents = file.read()
+                    async with self.lock_header_files:
+                        self.header_files[inputPath] = file_contents
+            
+            await self.process_nodes(translation_unit.cursor, inputLocation, projectID, inputPath.endswith('.cpp'))
                 
         except Exception as e:
             logger.error(f"Error ingesting C++ file {inputPath}: {e}")
@@ -969,7 +1045,7 @@ class NNeo4JImporter(NBaseImporter):
         async with self.lock_functions:  # Acquire the lock
             self.functions[full_name].update(details)
 
-    async def process_nodes(self, session, node, project_path, projectID, is_cpp_file):
+    async def process_nodes(self, node, project_path, projectID, is_cpp_file):
         def is_exported(node):
             # Example check for __declspec(dllexport) or visibility attribute
             for token in node.get_tokens():
@@ -989,7 +1065,7 @@ class NNeo4JImporter(NBaseImporter):
                     implementation_description = ""
 
                     description = f"Class {class_name} in scope {full_scope} defined in {file_name}"
-                    raw_comment = child.raw_comment if child.raw_comment else None
+                    raw_comment = child.raw_comment if child.raw_comment else ''
                     if raw_comment:
                         description += f" with documentation: {raw_comment.strip()}"
 
@@ -1076,7 +1152,7 @@ class NNeo4JImporter(NBaseImporter):
                     }
                     await self.update_classes(fully_qualified_name, details)
                     
-                    await self.process_nodes(session, child, project_path, projectID, is_cpp_file)
+                    await self.process_nodes(child, project_path, projectID, is_cpp_file)
                     
                 elif child.kind == clang.cindex.CursorKind.CXX_METHOD:
                     type_name = "Method"
@@ -1086,7 +1162,7 @@ class NNeo4JImporter(NBaseImporter):
                     fully_qualified_method_name = f"{class_name}::{method_name}" if class_name else method_name
                     
                     description = f"Method {method_name} in class {full_scope} defined in {file_name}"
-                    raw_comment = child.raw_comment if child.raw_comment else None
+                    raw_comment = child.raw_comment if child.raw_comment else ''
                     if raw_comment:
                         description += f" with documentation: {raw_comment.strip()}"
 
@@ -1129,7 +1205,7 @@ class NNeo4JImporter(NBaseImporter):
                     fully_qualified_function_name = f"{full_scope}::{function_name}" if full_scope else function_name
                     
                     description = f"Function {function_name} in scope {full_scope} defined in {file_name}"
-                    raw_comment = child.raw_comment if child.raw_comment else None
+                    raw_comment = child.raw_comment if child.raw_comment else ''
                     if raw_comment:
                         description += f" with documentation: {raw_comment.strip()}"
 
@@ -1165,7 +1241,7 @@ class NNeo4JImporter(NBaseImporter):
                         # Cache function information
                         await self.update_functions(fully_qualified_function_name, details)
                 else:
-                    await self.process_nodes(session, child, project_path, projectID, is_cpp_file)
+                    await self.process_nodes(child, project_path, projectID, is_cpp_file)
 
     def get_raw_code(self, node):
         # Extract raw code from the source node
@@ -1180,223 +1256,456 @@ class NNeo4JImporter(NBaseImporter):
     async def update_progress_scan(self, increment=1):
         if self.progress_callback_scan:
             await self.progress_callback_scan(increment)
+            
     async def update_progress_summarize(self, increment=1):
         if self.progress_callback_summarize:
             await self.progress_callback_summarize(increment)
+            
     async def update_progress_store(self, increment=1):
         if self.progress_callback_store:
             await self.progress_callback_store(increment)
 
-    async def start_progress_summarize(self, total):
-        if self.progress_callback_summarize_start:
-            await self.progress_callback_summarize_start(total)
-    async def start_progress_store(self, total):
-        if self.progress_callback_store_start:
-            await self.progress_callback_store_start(total)
-
     async def summarize_all_cpp(self, projectID):
-        logger.info("Starting summarization of collected data.")
+#        logger.info("Starting summarization of collected data.")
         
-        async with self.lock_classes:
+        try:
+            tasks = []
+            async with self.lock_classes:
+                for class_name, class_info in self.classes.items():
+                    name = class_info.get('name', 'anonymous')
+                    class_info['name'] = name
+                    info_copy = copy.deepcopy(class_info)
+                    tasks.append(self.summarize_cpp_class_prep(name, info_copy))
+#                    logger.info(f"Added task for summarizing cpp class {class_info['name']}")
+
             async with self.lock_methods:
-                async with self.lock_functions:
-                    total_count = len(self.classes) + len(self.methods) + len(self.functions)
+                for method_name, method_info in self.methods.items():
+                    name = method_info.get('name', 'anonymous')
+                    method_info['name'] = name
+                    info_copy = copy.deepcopy(method_info)
+                    tasks.append(self.summarize_cpp_method_prep(name, info_copy))
+#                    logger.info(f"Added task for summarizing cpp method {method_info['name']}")
 
-        # Set the progress bar here for summarization.
-        await self.start_progress_summarize(total_count)
+            async with self.lock_functions:
+                for function_name, function_info in self.functions.items():
+                    name = function_info.get('name', 'anonymous')
+                    function_info['name'] = name
+                    info_copy = copy.deepcopy(function_info)
+                    tasks.append(self.summarize_cpp_function_prep(name, info_copy))
+#                    logger.info(f"Added task for summarizing cpp function {function_info['name']}")
 
-        tasks = []
+        except Exception as e:
+            logger.error(f"Error while appending tasks to queue: {e}")
+            raise FileProcessingError(f"Error while appending tasks to queue: {e}")
 
-        async with self.lock_classes:
-            for class_name, class_info in self.classes.items():
-                tasks.append(self.summarize_cpp_class_prep(class_info))
+#        logger.info("Gathering summarization and embedding tasks...")
+        try:
+            results = await asyncio.gather(*tasks)
+        except Exception as e:
+            logger.error(f"Error while gathering summarization and embedding tasks: {e}")
+            raise FileProcessingError(f"Error while gathering summarization and embedding tasks: {e}")
 
-        async with self.lock_methods:
-            for method_name, method_info in self.methods.items():
-                tasks.append(self.summarize_cpp_method_prep(method_info))
-        
-        async with self.lock_functions:
-            for function_name, function_info in self.functions.items():
-                tasks.append(self.summarize_cpp_function_prep(function_info))
-
-        results = await asyncio.gather(*tasks)
-
-        logger.info("Summarization complete. Starting storage phase.")
+#        logger.info("Finished summarization and embedding tasks. Starting storage phase...")
     
 
-    async def summarize_cpp_class_prep(self, class_info):
-        class_name, class_scope, interface_summary, implementation_summary = await self.summarize_cpp_class(class_info)
-        interface_embedding = await self.make_embedding(interface_summary)
-        implementation_embedding = await self.make_embedding(implementation_summary)
+    async def summarize_cpp_class_prep(self, name, class_info):
+    
+#        logger.info(f"Summarizing class: {class_info['name']}")
+        try:
+            if name is None:
+                logger.info(f"Skipping anonymous class")
+                return class_info
+                
+            class_name, class_scope, interface_summary, implementation_summary = await self.summarize_cpp_class(class_info)
+            
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_class_prep calling summarize_cpp_class: {e}")
+            raise FileProcessingError(f"Error in summarize_cpp_class_prep calling summarize_cpp_class: {e}")
+#        logger.info(f"Finished summarizing class: {name}")
+
+        try:
+            interface_embedding = await self.make_embedding(interface_summary)
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_class_prep calling make_embedding for interface_summary: {e}")
+            raise FileProcessingError(f"Error in summarize_cpp_class_prep calling make_embedding for interface_summary: {e}")
+#        logger.info(f"Finished generating embedding for class interface: {name}")
+        
+        try:
+            implementation_embedding = await self.make_embedding(implementation_summary)
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_class_prep calling make_embedding for implementation_summary: {e}")
+            raise FileProcessingError(f"Error in summarize_cpp_class_prep calling make_embedding for implementation_summary: {e}")
+#        logger.info(f"Finished generating embedding for class implementation: {name}")
+        
         details = {
             'interface_summary': interface_summary,
             'implementation_summary': implementation_summary,
             'interface_embedding': interface_embedding,
             'implementation_embedding': implementation_embedding
         }
-        await self.update_classes(class_name, details)
+#        logger.info(f"Updating classes at the bottom of summarize_cpp_class_prep.")
+        await self.update_classes(name, details)
         await self.update_progress_summarize(1)
+        logger.info(f"Finished summarizing/embedding class: {name}")
         return class_info
 
-    async def summarize_cpp_method_prep(self, method_info):
-        raw_code = method_info['raw_code']
 
-        function_name, function_scope, function_summary = await self.summarize_cpp_function(method_info)
-        embedding = await self.make_embedding(function_summary)
+    async def summarize_cpp_method_prep(self, name, method_info):
+#        logger.info(f"Summarizing cpp method: {method_info['name']}")
+        try:
+            if name is None:
+                logger.info(f"Skipping anonymous method")
+                return method_info
+            function_name, function_scope, function_summary = await self.summarize_cpp_function(method_info)
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_method_prep: {e}\nmethod_info contents:\n{pprint.pformat(method_info, indent=4)}")
+            raise FileProcessingError(f"Error in summarize_cpp_method_prep calling summarize_cpp_function for method {name}: {e}")
+#        logger.info(f"Finished summarizing cpp method: {name}")
+        
+        try:
+            embedding = await self.make_embedding(function_summary)
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_method_prep calling make_embedding: {e}")
+            raise FileProcessingError(f"Error in summarize_cpp_method_prep calling make_embedding: {e}")
+#        logger.info(f"Finished creating embedding for cpp method: {name}")
 
         details = {
             'summary': function_summary,
             'embedding': embedding
         }
-        await self.update_methods(function_name, details)
+#        logger.info(f"Updating methods at the bottom of summarize_cpp_method_prep.")
+        await self.update_methods(name, details)
         await self.update_progress_summarize(1)
+        logger.info(f"Finished summarizing/embedding cpp method: {name}")
         return method_info
 
-    async def summarize_cpp_function_prep(self, function_info):
-        raw_code = function_info['raw_code']
-        function_name, function_scope, function_summary = await self.summarize_cpp_function(function_info)
-        embedding = await self.make_embedding(function_summary)
+    async def summarize_cpp_function_prep(self, name, function_info):
+        try:
+            if name is None:
+                logger.info(f"Skipping anonymous function")
+                return function_info
+            
+
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_function_prep grabbing dict values: {e}")
+            raise FileProcessingError(f"Error in summarize_cpp_function_prep grabbing dict values: {e}")
+
+#        logger.info(f"Summarizing cpp function: {name}")
+        
+        try:
+            function_name, function_scope, function_summary = await self.summarize_cpp_function(function_info)
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_function_prep calling summarize_cpp_function: {e}")
+            raise FileProcessingError(f"Error in summarize_cpp_function_prep calling summarize_cpp_function: {e}")
+#        logger.info(f"Finished summarizing cpp function: {name}")
+
+        try:
+            embedding = await self.make_embedding(function_summary)
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_function_prep calling make_embedding: {e}")
+            raise FileProcessingError(f"Error in summarize_cpp_function_prep calling make_embedding: {e}")
+#        logger.info(f"Finished making embedding for cpp function: {name}")
+        
         details = {
             'summary': function_summary,
             'embedding': embedding
         }
-        await self.update_functions(function_name, details)
-        await self.update_progress_summarize(1)
+#        logger.info(f"Updating functions at the bottom of summarize_cpp_function_prep.")
+        try:
+            await self.update_functions(name, details)
+            await self.update_progress_summarize(1)
+            logger.info(f"Finished summarizing/embedding cpp function: {name}")
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_function_prep calling update_functions: {e}")
+            raise FileProcessingError(f"Error in summarize_cpp_function_prep calling update_functions: {e}")
+
         return function_info
 
+
+
+
     async def store_all_cpp(self, projectID):
-        async with self.lock_classes:
+        try:
+            queue = asyncio.Queue()
+
+            # Create a task to process the queue
+            process_task = asyncio.create_task(self.process_cpp_storage_queue(queue, projectID))
+
+#            tasks = []
+
+            async with self.lock_classes:
+                for class_name, class_info in self.classes.items():
+                    name = class_info.get('name', 'anonymous')
+                    class_info['name'] = name
+                    info_copy = copy.deepcopy(class_info)
+                    await queue.put(('Class', name, info_copy))
+
             async with self.lock_methods:
-                async with self.lock_functions:
-                    total_count = len(self.classes) + len(self.methods) + len(self.functions)
+                for method_name, method_info in self.methods.items():
+                    name = method_info.get('name', 'anonymous')
+                    method_info['name'] = name
+                    info_copy = copy.deepcopy(method_info)
+                    await queue.put(('Method', name, info_copy))
+
+            async with self.lock_functions:
+                for function_name, function_info in self.functions.items():
+                    name = function_info.get('name', 'anonymous')
+                    function_info['name'] = name
+                    info_copy = copy.deepcopy(function_info)
+                    await queue.put(('Function', name, info_copy))
+
+        except Exception as e:
+            logger.error(f"Error in store_all_cpp: {e}")
+            raise FileProcessingError(f"Error in store_all_cpp: {e}")
+
+        try:
+#            logger.info("Gathering storage tasks...")
+#            await asyncio.gather(*tasks)
+#            logger.info("Finished gathering storage tasks.")
+
+            # Signal that all items have been added to the queue
+            await queue.put(None)
+
+            # Wait for all items to be processed
+            await process_task
+
+        except Exception as e:
+            logger.error(f"Error while gathering storage tasks: {e}")
+            raise FileProcessingError(f"Error while gathering storage tasks: {e}")
+
+
+
+    async def process_cpp_storage_queue(self, queue, projectID):
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            item_type, name, info = item
+            if item_type == 'Class':
+                await self.store_summary_cpp_class(name, info, projectID)
+            elif item_type == 'Method':
+                await self.store_summary_cpp_method(name, info, projectID)
+            elif item_type == 'Function':
+                await self.store_summary_cpp_function(name, info, projectID)
+            await self.update_progress_store(1)
+            queue.task_done()
         
-        # Set the progress bar here for storing.
-        await self.start_progress_store(total_count)
+    """
+    ## TODO RESUME
+    2024-07-13 07:48:59,056 - ERROR - Error forming query for CPP class Blindsecp: 'name'                                                     | 0/118 [00:00<?, ?data/s]
+    {   'description': 'Class Blindsecp in scope  defined in '
+                       '/Users/au/src/blindsecp/Blindsecp.hpp',
+        'file_path': '/Users/au/src/blindsecp/Blindsecp.hpp',
+        'implementation_description': '',
+        'implementation_embedding': [   0.0942307785153389,
+        'implementation_summary': 'This class is for people who would like to '
+        'interface_description': 'Public interface: public method createInstance '
+        'interface_embedding': [   -0.20329229533672333,
+        'interface_summary': 'This class describes how to create a public '
+        'name': 'Blindsecp',
+        'raw_code': '#pragma once\n'
+        'raw_comment': '',
+        'scope': '',
+        'short_name': 'Blindsecp',
+        'type': 'Class'}
 
-        tasks = []
-
-        async with self.lock_classes:
-            for class_name, class_info in self.classes.items():
-                tasks.append(self.store_summary_cpp_class(class_name, class_info, projectID))
-
-        async with self.lock_methods:
-            for method_name, method_info in self.methods.items():
-                tasks.append(self.store_summary_cpp_method(method_name, method_info, projectID))
-
-        async with self.lock_functions:
-            for function_name, function_info in self.functions.items():
-                tasks.append(self.store_summary_cpp_function(function_name, function_info, projectID))
-
-        await asyncio.gather(*tasks)
-
+    """
 
     async def store_summary_cpp_class(self, name, info, projectID):
-        query = """
-            MERGE (n:{type} {name: $name, projectID: $projectID})
-            ON CREATE SET n.scope = $scope,
-                          n.short_name = $short_name,
-                          n.interface_summary = $interface_summary,
-                          n.implementation_summary = $implementation_summary,
-                          n.interface_embedding = $interface_embedding,
-                          n.implementation_embedding = $implementation_embedding,
-                          n.file_path = $file_path,
-                          n.raw_code = $raw_code
-            ON MATCH SET
-                n.interface_summary = CASE WHEN size($interface_summary) > size(n.interface_summary) THEN $interface_summary ELSE n.interface_summary END,
-                n.interface_embedding = CASE WHEN size($interface_summary) > size(n.interface_summary) THEN $interface_embedding ELSE n.interface_embedding END,
-                n.implementation_summary = CASE WHEN size($implementation_summary) > size(n.implementation_summary) THEN $implementation_summary ELSE n.implementation_summary END,
-                n.implementation_embedding = CASE WHEN size($implementation_summary) > size(n.implementation_embedding) THEN $implementation_embedding ELSE n.implementation_embedding END,
-                n.raw_code = CASE WHEN size($raw_code) > 0 THEN $raw_code ELSE n.raw_code END
-            RETURN elementId(n)
-        """.format(type=info['type'])
-        params = {
-            'name': name,
-            'projectID': projectID,
-            'scope': info['scope'],
-            'short_name': info['short_name'],
-            'interface_summary': info.get('interface_summary', ''),
-            'implementation_summary': info.get('implementation_summary', ''),
-            'interface_embedding': info.get('interface_embedding', ''),
-            'implementation_embedding': info.get('implementation_embedding', ''),
-            'file_path': info.get('file_path', ''),
-            'raw_code': info.get('raw_code', '')
-        }
+        try:
+#            logger.error(f"In store_summary_cpp_class.\ninfo contents:\n{pprint.pformat(info, indent=4)}")
 
-        async with self.rate_limiter_db:
-            await self.run_query_and_get_element_id(session, query, **params)
-        await self.update_progress_store(1)
+            type_name = info.get('type', 'Class')
+            if not type_name or not type_name.strip():
+                type_name = 'Class'
+
+            scope = info.get('scope', '')
+            short_name = info.get('short_name', '')
+            interface_summary = info.get('interface_summary', '')
+            implementation_summary = info.get('implementation_summary', '')
+            interface_embedding = info.get('interface_embedding', [])
+            implementation_embedding = info.get('implementation_embedding', [])
+            file_path = info.get('file_path', '')
+            raw_code = info.get('raw_code', '')
+
+#            logger.info(f"store_summary_cpp_class name: {name}")
+#            logger.info(f"store_summary_cpp_class projectID: {projectID}")
+#            logger.info(f"store_summary_cpp_class scope: {scope}")
+#            logger.info(f"store_summary_cpp_class short_name: {short_name}")
+#            logger.info(f"store_summary_cpp_class interface_summary:\n{interface_summary}")
+#            logger.info(f"store_summary_cpp_class implementation_summary:\n{implementation_summary}")
+#            logger.info(f"store_summary_cpp_class file_path: {file_path}")
+#            logger.info(f"store_summary_cpp_class raw_code: {raw_code}")
+
+            query = """
+                MERGE (n:{type} {{name: $name, projectID: $projectID}})
+                ON CREATE SET n.scope = $scope,
+                              n.short_name = $short_name,
+                              n.interface_summary = $interface_summary,
+                              n.implementation_summary = $implementation_summary,
+                              n.interface_embedding = $interface_embedding,
+                              n.implementation_embedding = $implementation_embedding,
+                              n.file_path = $file_path,
+                              n.raw_code = $raw_code
+                ON MATCH SET
+                    n.interface_summary = CASE WHEN size($interface_summary) > size(n.interface_summary) THEN $interface_summary ELSE n.interface_summary END,
+                    n.interface_embedding = CASE WHEN size($interface_summary) > size(n.interface_summary) THEN $interface_embedding ELSE n.interface_embedding END,
+                    n.implementation_summary = CASE WHEN size($implementation_summary) > size(n.implementation_summary) THEN $implementation_summary ELSE n.implementation_summary END,
+                    n.implementation_embedding = CASE WHEN size($implementation_summary) > size(n.implementation_embedding) THEN $implementation_embedding ELSE n.implementation_embedding END,
+                    n.raw_code = CASE WHEN size($raw_code) > 0 THEN $raw_code ELSE n.raw_code END
+                RETURN elementId(n)
+            """.format(type=type_name)
+            params = {
+                'name': name if name else 'anonymous',
+                'projectID': projectID if projectID else 'Unknown',
+                'scope': scope,
+                'short_name': short_name,
+                'interface_summary': interface_summary,
+                'implementation_summary': implementation_summary,
+                'interface_embedding': interface_embedding,
+                'implementation_embedding': implementation_embedding,
+                'file_path': file_path,
+                'raw_code': raw_code
+            }
+#            logger.debug(f"Storing cpp class with query:\n\n{query}\n\n")
+        except Exception as e:
+            logger.error(f"Error forming query for CPP class {name}: {e}")
+            raise FileProcessingError(f"Error forming query for CPP class {name}: {e}")
+#            logger.error(f"Error forming query for CPP class {name}: {e}\n{pprint.pformat(info, indent=4)}")
+#            raise FileProcessingError(f"Error forming query for CPP class {name}: {e}\n{pprint.pformat(info, indent=4)}")
+
+        try:
+            async with self.rate_limiter_db:
+                async with self.get_session() as session:
+#                    logger.info(f"Storing CPP class {name}...")
+                    await self.run_query_and_get_element_id(session, query, **params)
+                    logger.info(f"Finished storing CPP class: {name}")
+        except Exception as e:
+            logger.error(f"Error storing summary for CPP class {name}: {e}")
+            raise FileProcessingError(f"Error storing summary for CPP class {name}: {e}")
+
 
 
     async def store_summary_cpp_method(self, name, info, projectID):
-        query = """
-            MERGE (n:{type} {name: $name, projectID: $projectID})
-            ON CREATE SET n.scope = $scope,
-                          n.short_name = $short_name,
-                          n.summary = $summary,
-                          n.embedding = $embedding,
-                          n.file_path = $file_path,
-                          n.raw_code = $raw_code
-            ON MATCH SET
-                n.summary = CASE WHEN size($summary) > size(n.summary) THEN $summary ELSE n.summary END,
-                n.embedding = CASE WHEN size($summary) > size(n.summary) THEN $embedding ELSE n.embedding END
-            RETURN elementId(n)
-        """.format(type=info['type'])
-        params = {
-            'name': name,
-            'projectID': projectID,
-            'scope': info['scope'],
-            'short_name': info['short_name'],
-            'summary': info.get('summary', ''),
-            'embedding': info.get('embedding', ''),
-            'file_path': info.get('file_path', ''),
-            'raw_code': info.get('raw_code', '')
-        }
-        
-        async with self.rate_limiter_db:
-            element_id = await self.run_query_and_get_element_id(session, query, **params)
+        try:
+#            logger.error(f"In store_summary_cpp_method.\ninfo contents:\n{pprint.pformat(info, indent=4)}")
             
-        # Here we create the relationship (edge) between the class and its method.
-        if element_id:
-            await session.run(
-                "MATCH (c) WHERE (name(c) = $scope AND c:Class AND c.projectID = $projectID) "
-                "OR (name(c) = $scope AND c:Struct AND c.projectID = $projectID) "
-                "MATCH (f:Method) WHERE elementId(f) = $element_id AND f.projectID = $projectID "
-                "MERGE (c)-[:HAS_METHOD]->(f) "
-                "MERGE (f)-[:BELONGS_TO]->(c)",
-                {"name": name, "scope": info['scope'], "element_id": element_id, "projectID": projectID}
-            )
+            type_name = info.get('type', 'Method')
+            if not type_name or not type_name.strip():
+                type_name = 'Method'
 
-        await self.update_progress_store(1)
+            scope = info.get('scope', '')
+            short_name = info.get('short_name', '')
+            summary = info.get('summary', '')
+            embedding = info.get('embedding', [])
+            file_path = info.get('file_path', '')
+            raw_code = info.get('raw_code', '')
+
+            query = """
+                MERGE (n:{type} {{name: $name, projectID: $projectID}})
+                ON CREATE SET n.scope = $scope,
+                              n.short_name = $short_name,
+                              n.summary = $summary,
+                              n.embedding = $embedding,
+                              n.file_path = $file_path,
+                              n.raw_code = $raw_code
+                ON MATCH SET
+                    n.summary = CASE WHEN size($summary) > size(n.summary) THEN $summary ELSE n.summary END,
+                    n.embedding = CASE WHEN size($summary) > size(n.summary) THEN $embedding ELSE n.embedding END
+                RETURN elementId(n)
+            """.format(type=type_name)
+            params = {
+                'name': name if name is not None else 'Unknown',
+                'projectID': projectID if projectID is not None else 'Unknown',
+                'scope': scope,
+                'short_name': short_name,
+                'summary': summary,
+                'embedding': embedding,
+                'file_path': file_path,
+                'raw_code': raw_code
+            }
+        except Exception as e:
+            logger.error(f"Error forming query for CPP method {name}: {e}\n{pprint.pformat(info, indent=4)}")
+            raise FileProcessingError(f"Error forming query for CPP method {name}: {e}\n{pprint.pformat(info, indent=4)}")
+
+        try:
+            async with self.rate_limiter_db:
+                async with self.get_session() as session:
+                    element_id = await self.run_query_and_get_element_id(session, query, **params)
+
+                    # Here we create the relationship (edge) between the class and its method.
+                    if element_id:
+                        await (await session.run(
+                            "MATCH (c) "
+                            "WHERE (c.name = $scope AND c:Class AND c.projectID = $projectID) "
+                            "OR (c.name = $scope AND c:Struct AND c.projectID = $projectID) "
+                            "MATCH (f:Method) WHERE elementId(f) = $element_id AND f.projectID = $projectID "
+                            "MERGE (c)-[:HAS_METHOD]->(f) "
+                            "MERGE (f)-[:BELONGS_TO]->(c)",
+                            {"name": name, "scope": scope, "element_id": element_id, "projectID": projectID}
+                        )).consume()
+                       
+                        logger.info(f"Finished storing CPP method: {name}")
+
+#                    logger.info(f"Finished creating CPP method: '{name}' Relationships to class {scope}")
+
+        except Exception as e:
+            logger.error(f"Error storing summary for CPP method {name}: {e}")
+            raise FileProcessingError(f"Error storing summary for CPP method {name}: {e}")
+
 
 
     async def store_summary_cpp_function(self, name, info, projectID):
-        query = """
-            MERGE (n:{type} {name: $name, projectID: $projectID})
-            ON CREATE SET n.scope = $scope,
-                          n.short_name = $short_name,
-                          n.summary = $summary,
-                          n.embedding = $embedding,
-                          n.file_path = $file_path,
-                          n.raw_code = $raw_code
-            ON MATCH SET
-                n.summary = CASE WHEN size($summary) > size(n.summary) THEN $summary ELSE n.summary END,
-                n.embedding = CASE WHEN size($summary) > size(n.summary) THEN $embedding ELSE n.embedding END
-            RETURN elementId(n)
-        """.format(type=info['type'])
-        params = {
-            'name': name,
-            'projectID': projectID,
-            'scope': info['scope'],
-            'short_name': info['short_name'],
-            'summary': info.get('summary', ''),
-            'embedding': info.get('embedding', ''),
-            'file_path': info.get('file_path', ''),
-            'raw_code': info.get('raw_code', '')
-        }
+        try:
+#            logger.error(f"In store_summary_cpp_function.\ninfo contents:\n{pprint.pformat(info, indent=4)}")
 
-        async with self.rate_limiter_db:
-            await self.run_query_and_get_element_id(session, query, **params)
-        await self.update_progress_store(1)
+            type_name = info.get('type', 'Function')
+            if not type_name or not type_name.strip():
+                type_name = 'Function'
+
+            scope = info.get('scope', '')
+            short_name = info.get('short_name', '')
+            summary = info.get('summary', '')
+            embedding = info.get('embedding', [])
+            file_path = info.get('file_path', '')
+            raw_code = info.get('raw_code', '')
+
+            query = """
+                MERGE (n:{type} {{name: $name, projectID: $projectID}})
+                ON CREATE SET n.scope = $scope,
+                              n.short_name = $short_name,
+                              n.summary = $summary,
+                              n.embedding = $embedding,
+                              n.file_path = $file_path,
+                              n.raw_code = $raw_code
+                ON MATCH SET
+                    n.summary = CASE WHEN size($summary) > size(n.summary) THEN $summary ELSE n.summary END,
+                    n.embedding = CASE WHEN size($summary) > size(n.summary) THEN $embedding ELSE n.embedding END
+                RETURN elementId(n)
+            """.format(type=type_name)
+            params = {
+                'name': name if name is not None else 'anonymous',
+                'projectID': projectID if projectID is not None else 'Unknown',
+                'scope': scope,
+                'short_name': short_name,
+                'summary': summary,
+                'embedding': embedding,
+                'file_path': file_path,
+                'raw_code': raw_code
+            }
+        except Exception as e:
+            logger.error(f"Error forming query for CPP function {name}: {e}\n{pprint.pformat(info, indent=4)}")
+            raise FileProcessingError(f"Error forming query for CPP function {name}: {e}\n{pprint.pformat(info, indent=4)}")
+
+        try:
+            async with self.rate_limiter_db:
+                async with self.get_session() as session:
+                    await self.run_query_and_get_element_id(session, query, **params)
+                    logger.info(f"Finished storing CPP function: {name}")
+
+        except Exception as e:
+            logger.error(f"Error storing summary for CPP function {name}: {e}")
+            raise FileProcessingError(f"Error storing summary for CPP function {name}: {e}")
 
 
     def get_full_scope(self, node):
@@ -1427,23 +1736,24 @@ class NNeo4JImporter(NBaseImporter):
             functions = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
             classes = [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
 
-            async with self.get_session() as session:
-                for cls in classes:
-                    class_summary = await self.summarize_python_class(cls)
-                    embedding = await self.make_embedding(class_summary)
-                    async with self.rate_limiter_db:
+            for cls in classes:
+                class_summary = await self.summarize_python_class(cls)
+                embedding = await self.make_embedding(class_summary)
+                        
+                async with self.rate_limiter_db:
+                    async with self.get_session() as session:
                         class_id = await self.run_query_and_get_element_id(session,
                             "CREATE (n:Class {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
                             name=cls.name, summary=class_summary, embedding=embedding, projectID=projectID
                         )
 
-                    for func in cls.body:
-                        if isinstance(func, ast.FunctionDef):
-                            function_summary = await self.summarize_python_function(func)
-                            
-                            embedding = await self.make_embedding(function_summary)
-                            
-                            async with self.rate_limiter_db:
+                for func in cls.body:
+                    if isinstance(func, ast.FunctionDef):
+                        function_summary = await self.summarize_python_function(func)
+                        embedding = await self.make_embedding(function_summary)
+                        
+                        async with self.rate_limiter_db:
+                            async with self.get_session() as session:
                                 function_id = await self.run_query_and_get_element_id(session,
                                     "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
                                     name=func.name, summary=function_summary, embedding=embedding, projectID=projectID
@@ -1455,10 +1765,12 @@ class NNeo4JImporter(NBaseImporter):
                                     class_id=class_id, function_id=function_id, projectID=projectID
                                 )).consume()
 
-                for func in functions:
-                    function_summary = await self.summarize_python_function(func)
-                    embedding = await self.make_embedding(function_summary)
-                    async with self.rate_limiter_db:
+            for func in functions:
+                function_summary = await self.summarize_python_function(func)
+                embedding = await self.make_embedding(function_summary)
+                
+                async with self.rate_limiter_db:
+                    async with self.get_session() as session:
                         await (await session.run(
                             "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID})",
                             name=func.name, summary=function_summary, embedding=embedding, projectID=projectID
@@ -1513,21 +1825,24 @@ class NNeo4JImporter(NBaseImporter):
             functions = [item for item in tree.items if isinstance(item, syn.ItemFn)]
             impls = [item for item in tree.items if isinstance(item, syn.ItemImpl)]
 
-            async with self.get_session() as session:
-                for impl in impls:
-                    impl_summary = await self.summarize_rust_impl(impl)
-                    embedding = await self.make_embedding(impl_summary)
-                    async with self.rate_limiter_db:
+            for impl in impls:
+                impl_summary = await self.summarize_rust_impl(impl)
+                embedding = await self.make_embedding(impl_summary)
+                
+                async with self.rate_limiter_db:
+                    async with self.get_session() as session:
                         impl_id = await self.run_query_and_get_element_id(session,
                             "CREATE (n:Impl {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
                             name=impl.trait_.path.segments[0].ident, summary=impl_summary, embedding=embedding, projectID=projectID
                         )
 
-                    for item in impl.items:
-                        if isinstance(item, syn.ImplItemMethod):
-                            function_summary = await self.summarize_rust_function(item)
-                            embedding = await self.make_embedding(function_summary)
-                            async with self.rate_limiter_db:
+                for item in impl.items:
+                    if isinstance(item, syn.ImplItemMethod):
+                        function_summary = await self.summarize_rust_function(item)
+                        embedding = await self.make_embedding(function_summary)
+                        
+                        async with self.rate_limiter_db:
+                            async with self.get_session() as session:
                                 function_id = await self.run_query_and_get_element_id(session,
                                     "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
                                     name=item.sig.ident, summary=function_summary, embedding=embedding, projectID=projectID
@@ -1539,10 +1854,12 @@ class NNeo4JImporter(NBaseImporter):
                                     impl_id=impl_id, function_id=function_id, projectID=projectID
                                 )).consume()
 
-                for func in functions:
-                    function_summary = await self.summarize_rust_function(func)
-                    embedding = await self.make_embedding(function_summary)
-                    async with self.rate_limiter_db:
+            for func in functions:
+                function_summary = await self.summarize_rust_function(func)
+                embedding = await self.make_embedding(function_summary)
+                
+                async with self.rate_limiter_db:
+                    async with self.get_session() as session:
                         await (await session.run(
                             "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID})",
                             name=func.sig.ident, summary=function_summary, embedding=embedding, projectID=projectID
@@ -1647,26 +1964,26 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Error parsing JavaScript file {inputPath}: {e}")
             raise FileProcessingError(f"Error parsing JavaScript file {inputPath}: {e}")
 
-        async with self.get_session() as session:
             try:
                 async with self.rate_limiter_db:
-                    file_id = await self.run_query_and_get_element_id(session,
-                        "CREATE (n:JavaScriptFile {name: $name, path: $path, projectID: $projectID}) RETURN elementId(n)",
-                        name=inputName, path=inputPath, projectID=projectID
-                    )
+                    async with self.get_session() as session:
+                        file_id = await self.run_query_and_get_element_id(session,
+                            "CREATE (n:JavaScriptFile {name: $name, path: $path, projectID: $projectID}) RETURN elementId(n)",
+                            name=inputName, path=inputPath, projectID=projectID
+                        )
 
                 for node in ast.body:
                     if isinstance(node, nodes.FunctionDeclaration):
-                        await self.process_js_function(session, node, file_id, projectID)
+                        await self.process_js_function(node, file_id, projectID)
                     elif isinstance(node, nodes.ClassDeclaration):
-                        await self.process_js_class(session, node, file_id, projectID)
+                        await self.process_js_class(node, file_id, projectID)
                     elif isinstance(node, nodes.VariableDeclaration):
-                        await self.process_js_variable(session, node, file_id, projectID)
+                        await self.process_js_variable(node, file_id, projectID)
             except Exception as e:
                 logger.error(f"Error ingesting JavaScript file {inputPath}: {e}")
                 raise DatabaseError(f"Error ingesting JavaScript file {inputPath}: {e}")
 
-    async def process_js_function(self, session, func_node, file_id: int, projectID: str) -> None:
+    async def process_js_function(self, func_node, file_id: int, projectID: str) -> None:
         func_name = func_node.id.name if func_node.id else 'anonymous'
         func_summary = await self.summarize_js_function(func_node)
         
@@ -1674,21 +1991,22 @@ class NNeo4JImporter(NBaseImporter):
 
         try:
             async with self.rate_limiter_db:
-                func_db_id = await self.run_query_and_get_element_id(session,
-                    "CREATE (n:JavaScriptFunction {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
-                    name=func_name, summary=func_summary, embedding=embedding, projectID=projectID
-                )
+                async with self.get_session() as session:
+                    func_db_id = await self.run_query_and_get_element_id(session,
+                        "CREATE (n:JavaScriptFunction {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
+                        name=func_name, summary=func_summary, embedding=embedding, projectID=projectID
+                    )
 
-                await (await session.run(
-                    "MATCH (f:JavaScriptFile {elementId: $file_id, projectID: $projectID}), (func:JavaScriptFunction {elementId: $func_id, projectID: $projectID}) "
-                    "CREATE (f)-[:CONTAINS]->(func)",
-                    file_id=file_id, func_id=func_db_id, projectID=projectID
-                )).consume()
+                    await (await session.run(
+                        "MATCH (f:JavaScriptFile {elementId: $file_id, projectID: $projectID}), (func:JavaScriptFunction {elementId: $func_id, projectID: $projectID}) "
+                        "CREATE (f)-[:CONTAINS]->(func)",
+                        file_id=file_id, func_id=func_db_id, projectID=projectID
+                    )).consume()
         except Exception as e:
             logger.error(f"Error processing JavaScript function {func_name}: {e}")
             raise DatabaseError(f"Error processing JavaScript function {func_name}: {e}")
 
-    async def process_js_class(self, session, class_node, file_id: int, projectID: str) -> None:
+    async def process_js_class(self, class_node, file_id: int, projectID: str) -> None:
         class_name = class_node.id.name
         class_summary = await self.summarize_js_class(class_node)
         
@@ -1696,25 +2014,26 @@ class NNeo4JImporter(NBaseImporter):
 
         try:
             async with self.rate_limiter_db:
-                class_db_id = await self.run_query_and_get_element_id(session,
-                    "CREATE (n:JavaScriptClass {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
-                    name=class_name, summary=class_summary, embedding=embedding, projectID=projectID
-                )
+                async with self.get_session() as session:
+                    class_db_id = await self.run_query_and_get_element_id(session,
+                        "CREATE (n:JavaScriptClass {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
+                        name=class_name, summary=class_summary, embedding=embedding, projectID=projectID
+                    )
 
-                await (await session.run(
-                    "MATCH (f:JavaScriptFile {elementId: $file_id, projectID: $projectID}), (c:JavaScriptClass {elementId: $class_id, projectID: $projectID}) "
-                    "CREATE (f)-[:CONTAINS]->(c)",
-                    file_id=file_id, class_id=class_db_id, projectID=projectID
-                )).consume()
+                    await (await session.run(
+                        "MATCH (f:JavaScriptFile {elementId: $file_id, projectID: $projectID}), (c:JavaScriptClass {elementId: $class_id, projectID: $projectID}) "
+                        "CREATE (f)-[:CONTAINS]->(c)",
+                        file_id=file_id, class_id=class_db_id, projectID=projectID
+                    )).consume()
 
             for method in class_node.body.body:
                 if isinstance(method, nodes.MethodDefinition):
-                    await self.process_js_method(session, method, class_db_id, projectID)
+                    await self.process_js_method(method, class_db_id, projectID)
         except Exception as e:
             logger.error(f"Error processing JavaScript class {class_name}: {e}")
             raise DatabaseError(f"Error processing JavaScript class {class_name}: {e}")
 
-    async def process_js_variable(self, session, var_node, file_id: int, projectID: str) -> None:
+    async def process_js_variable(self, var_node, file_id: int, projectID: str) -> None:
         for declaration in var_node.declarations:
             var_name = declaration.id.name
             var_type = var_node.kind  # 'var', 'let', or 'const'
@@ -1724,26 +2043,26 @@ class NNeo4JImporter(NBaseImporter):
 
             try:
                 async with self.rate_limiter_db:
-                    var_db_id = await self.run_query_and_get_element_id(session,
-                        "CREATE (n:JavaScriptVariable {name: $name, type: $type, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
-                        name=var_name, type=var_type, summary=var_summary, embedding=embedding, projectID=projectID
-                    )
+                    async with self.get_session() as session:
+                        var_db_id = await self.run_query_and_get_element_id(session,
+                            "CREATE (n:JavaScriptVariable {name: $name, type: $type, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
+                            name=var_name, type=var_type, summary=var_summary, embedding=embedding, projectID=projectID
+                        )
 
-                    await (await session.run(
-                        "MATCH (f:JavaScriptFile {elementId: $file_id, projectID: $projectID}), (v:JavaScriptVariable {elementId: $var_id, projectID: $projectID}) "
-                        "CREATE (f)-[:CONTAINS]->(v)",
-                        file_id=file_id, var_id=var_db_id, projectID=projectID
-                    )).consume()
+                        await (await session.run(
+                            "MATCH (f:JavaScriptFile {elementId: $file_id, projectID: $projectID}), (v:JavaScriptVariable {elementId: $var_id, projectID: $projectID}) "
+                            "CREATE (f)-[:CONTAINS]->(v)",
+                            file_id=file_id, var_id=var_db_id, projectID=projectID
+                        )).consume()
             except Exception as e:
                 logger.error(f"Error processing JavaScript variable {var_name}: {e}")
                 raise DatabaseError(f"Error processing JavaScript variable {var_name}: {e}")
 
-    async def process_js_method(self, session, method_node, class_id: int, projectID: str) -> None:
+    async def process_js_method(self, method_node, class_id: int, projectID: str) -> None:
         """
         Process a JavaScript method node and create nodes in the database.
 
         Args:
-            session: The Neo4j session.
             method_node: The method node.
             class_id: The class ID.
             projectID: The project ID.
@@ -1755,16 +2074,17 @@ class NNeo4JImporter(NBaseImporter):
 
         try:
             async with self.rate_limiter_db:
-                method_db_id = await self.run_query_and_get_element_id(session,
-                    "CREATE (n:JavaScriptMethod {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
-                    name=method_name, summary=method_summary, embedding=embedding, projectID=projectID
-                )
+                async with self.get_session() as session:
+                    method_db_id = await self.run_query_and_get_element_id(session,
+                        "CREATE (n:JavaScriptMethod {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
+                        name=method_name, summary=method_summary, embedding=embedding, projectID=projectID
+                    )
 
-                await (await session.run(
-                    "MATCH (c:JavaScriptClass {elementId: $class_id, projectID: $projectID}), (m:JavaScriptMethod {elementId: $method_id, projectID: $projectID}) "
-                    "CREATE (c)-[:HAS_METHOD]->(m)",
-                    class_id=class_id, method_id=method_db_id, projectID=projectID
-                )).consume()
+                    await (await session.run(
+                        "MATCH (c:JavaScriptClass {elementId: $class_id, projectID: $projectID}), (m:JavaScriptMethod {elementId: $method_id, projectID: $projectID}) "
+                        "CREATE (c)-[:HAS_METHOD]->(m)",
+                        class_id=class_id, method_id=method_db_id, projectID=projectID
+                    )).consume()
         except Exception as e:
             logger.error(f"Error processing JavaScript method {method_name}: {e}")
             raise DatabaseError(f"Error processing JavaScript method {method_name}: {e}")
@@ -1781,14 +2101,6 @@ class NNeo4JImporter(NBaseImporter):
         except Exception as e:
             logger.error(f"Error running query: {query}")
             raise DatabaseError(f"Error running query: {e}")
-            
-#    async def run_query_and_get_element_id(self, session, query: str, parameters: dict) -> str:
-#        result = await session.run(query, parameters)
-#        record = await result.single()
-#        if record:
-#            return record['elementId(n)']
-#        else:
-#            raise FileProcessingError("No elementId returned from query")
 
 
     async def IngestPdf(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
@@ -1796,69 +2108,103 @@ class NNeo4JImporter(NBaseImporter):
             reader = PdfReader(inputPath)
             num_pages = len(reader.pages)
 
-            async with self.get_session() as session:
-                async with self.rate_limiter_db:
+            async with self.rate_limiter_db:
+                async with self.get_session() as session:
                     pdf_id = await self.run_query_and_get_element_id(session,
                         "CREATE (n:PDF {name: $name, pages: $pages, projectID: $projectID}) RETURN elementId(n)",
                         name=inputName, pages=num_pages, projectID=projectID
                     )
 
-                for i in range(num_pages):
-                    page = reader.pages[i]
-                    text = page.extract_text()
+            for i in range(num_pages):
+                page = reader.pages[i]
+                text = page.extract_text()
 
-                    medium_chunks = self.chunk_text(text, MEDIUM_CHUNK_SIZE)
-                    for j, medium_chunk in enumerate(medium_chunks):
-                        async with self.rate_limiter_db:
+                medium_chunks = self.chunk_text(text, MEDIUM_CHUNK_SIZE)
+                for j, medium_chunk in enumerate(medium_chunks):
+                    async with self.rate_limiter_db:
+                        async with self.get_session() as session:
                             medium_chunk_id = await self.run_query_and_get_element_id(session,
                                 "CREATE (n:MediumChunk {content: $content, type: 'medium_chunk', page: $page, projectID: $projectID}) RETURN elementId(n)",
                                 content=medium_chunk, page=i + 1, projectID=projectID
                             )
 
-                            await (await session.run(
-                                "MATCH (p:PDF {elementId: $pdf_id, projectID: $projectID}) MATCH (c:MediumChunk {elementId: $chunk_id, projectID: $projectID}) CREATE (p)-[:HAS_CHUNK]->(c), (c)-[:PART_OF]->(p)",
-                                {"pdf_id": pdf_id, "chunk_id": medium_chunk_id, "projectID": projectID}
-                            )).consume()
+                            if medium_chunk_id:
+                                await (await session.run(
+                                    "MATCH (p:PDF) WHERE (elementId(p) = $pdf_id AND p.projectID = $projectID) "
+                                    "MATCH (m:MediumChunk) WHERE (elementId(m) = $medium_chunk_id AND m.projectID = $projectID) "
+                                    "MERGE (p)-[:HAS_CHUNK]->(m) "
+                                    "MERGE (m)-[:BELONGS_TO]->(p)",
+                                    {"pdf_id": pdf_id, "medium_chunk_id": medium_chunk_id, "projectID": projectID}
+                                )).consume()
 
-                        small_chunks = self.chunk_text(medium_chunk, SMALL_CHUNK_SIZE)
-                        for k, small_chunk in enumerate(small_chunks):
-                            async with self.rate_limiter_db:
+                    small_chunks = self.chunk_text(medium_chunk, SMALL_CHUNK_SIZE)
+                    for k, small_chunk in enumerate(small_chunks):
+                        async with self.rate_limiter_db:
+                            async with self.get_session() as session:
                                 small_chunk_id = await self.run_query_and_get_element_id(session,
                                     "CREATE (n:SmallChunk {content: $content, type: 'small_chunk', page: $page, projectID: $projectID}) RETURN elementId(n)",
                                     content=small_chunk, page=i + 1, projectID=projectID
                                 )
 
-                                await (await session.run(
-                                    "MATCH (mc:MediumChunk {elementId: $medium_chunk_id, projectID: $projectID}) "
-                                    "MATCH (sc:SmallChunk {elementId: $small_chunk_id, projectID: $projectID}) "
-                                    "CREATE (mc)-[:HAS_CHUNK]->(sc), (sc)-[:PART_OF]->(mc)",
-                                    {"medium_chunk_id": medium_chunk_id, "small_chunk_id": small_chunk_id, "projectID": projectID}
-                                )).consume()
+                                if small_chunk_id:
+                                    await (await session.run(
+                                        "MATCH (m:MediumChunk) WHERE (elementId(m) = $medium_chunk_id AND m.projectID = $projectID) "
+                                        "MATCH (s:SmallChunk) WHERE (elementId(s) = $small_chunk_id AND s.projectID = $projectID) "
+                                        "MERGE (m)-[:HAS_CHUNK]->(s) "
+                                        "MERGE (s)-[:BELONGS_TO]->(m)",
+                                        {"small_chunk_id": small_chunk_id, "medium_chunk_id": medium_chunk_id, "projectID": projectID}
+                                    )).consume()
 
-                            embedding = await self.make_embedding(small_chunk)
-                                
-                            async with self.rate_limiter_db:
+                        embedding = await self.make_embedding(small_chunk)
+                            
+                        async with self.rate_limiter_db:
+                            async with self.get_session() as session:
                                 embedding_id = await self.run_query_and_get_element_id(session,
                                     "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', projectID: $projectID}) RETURN elementId(n)",
                                     embedding=embedding, projectID=projectID
                                 )
 
-                                await (await session.run(
-                                    "MATCH (sc:SmallChunk {elementId: $small_chunk_id, projectID: $projectID}) "
-                                    "MATCH (e:Embedding {elementId: $embedding_id, projectID: $projectID}) "
-                                    "CREATE (sc)-[:HAS_EMBEDDING]->(e)",
-                                    {"small_chunk_id": small_chunk_id, "embedding_id": embedding_id, "projectID": projectID}
-                                )).consume()
+                                if embedding_id:
+                                    await (await session.run(
+                                        "MATCH (p:PDF) WHERE (elementId(p) = $pdf_id AND p.projectID = $projectID) "
+                                        "MATCH (m:MediumChunk) WHERE (elementId(m) = $medium_chunk_id AND m.projectID = $projectID) "
+                                        "MATCH (s:SmallChunk) WHERE (elementId(s) = $small_chunk_id AND s.projectID = $projectID) "
+                                        "MATCH (e:Embedding) WHERE (elementId(e) = $embedding_id AND e.projectID = $projectID) "
+                                        "MERGE (s)-[:HAS_EMBEDDING]->(e) "
+                                        "MERGE (e)-[:IS_EMBEDDING_OF]->(s) "
+                                        "MERGE (e)-[:HAS_PARENT_CHUNK]->(m) "
+                                        "MERGE (e)-[:HAS_PARENT_DOC]->(p) "
+                                        "",
+                                        {"pdf_id": pdf_id, "medium_chunk_id": medium_chunk_id, "small_chunk_id": small_chunk_id, "embedding_id": embedding_id, "projectID": projectID}
+                                    )).consume()
 
         except Exception as e:
             logger.error(f"Error ingesting PDF file {inputPath}: {e}")
             raise FileProcessingError(f"Error ingesting PDF file {inputPath}: {e}")
-        
-        finally:
-            await self.update_progress_scan(1)
-            await self.update_progress_summarize(1)
-            await self.update_progress_store(1)
+
+    async def getFileAndCppCount(self) -> tuple[int, int]:
+        try:
+            async with self.lock_classes:
+                len_classes = len(self.classes)
+            async with self.lock_methods:
+                len_methods = len(self.methods)
+            async with self.lock_functions:
+                len_functions = len(self.functions)
+            # We increment the methods twice each, once for the method itself and once for it as a function.
+            total_cpp_count = len_classes + len_methods + len_functions
             
+            # Set the progress bar here for summarization and storing.
+            # We set the total value to all files + all cpp classes + all cpp methods * 2 + all cpp functions
+            # Therefore we must increment each one after every file PLUS every Cpp class, every method, and every function.
+            file_count = await self.get_file_paths_length()
+            
+            return file_count, total_cpp_count
+            
+        except Exception as e:
+            logger.error(f"Error getting lengths of local members: {e}")
+            raise FileProcessingError(f"Error getting lengths of local members: {e}")
+    # -------------------------------------------------------------------
+
 
 class NIngest:
     """
@@ -1878,8 +2224,17 @@ class NIngest:
         
         self.progress_updater_task_scan = None
         self.progress_updater_task_summarize = None
-        self.progress_updater_task__store = None
+        self.progress_updater_task_store = None
         
+        self.started_ingestion = False
+        self.summarized_cpp_started = False
+        self.summarized_cpp_finished = False
+        self.stored_cpp_started = False
+        self.stored_cpp_finished = False
+        self.start_ingest_semaphore = asyncio.Semaphore(1)
+        self.summarize_semaphore = asyncio.Semaphore(1)
+        self.store_semaphore = asyncio.Semaphore(1)
+
         self.progress_lock_scan = asyncio.Lock()
         self.progress_lock_summarize = asyncio.Lock()
         self.progress_lock_store = asyncio.Lock()
@@ -1888,9 +2243,6 @@ class NIngest:
         self.importer_.set_progress_callback_scan(self.update_progress_scan)
         self.importer_.set_progress_callback_summarize(self.update_progress_summarize)
         self.importer_.set_progress_callback_store(self.update_progress_store)
-
-        self.importer_.set_progress_callback_summarize_start(self.start_progress_summarize)
-        self.importer_.set_progress_callback_store_start(self.start_progress_store)
 
         self.total_files = 0
 
@@ -1912,87 +2264,152 @@ class NIngest:
         await self.progress_queue_scan.put(increment)
 
     async def progress_updater_scan(self):
-        while True:
-            increment = await self.progress_queue_scan.get()
-            async with self.progress_lock_scan:
-                self.progress_bar_scan.update(increment)
-            self.progress_queue_scan.task_done()
+        try:
+            while True:
+                async with self.progress_lock_scan:
+                    increment = await self.progress_queue_scan.get()
+                    self.progress_bar_scan.update(increment)
+                    self.progress_queue_scan.task_done()
+        except Exception as e:
+            logger.error(f"Error in progress_updater_scan: {e}")
 
     async def update_progress_summarize(self, increment=1):
         await self.progress_queue_summarize.put(increment)
 
     async def progress_updater_summarize(self):
-        while True:
-            increment = await self.progress_queue_summarize.get()
-            async with self.progress_lock_summarize:
-                self.progress_bar_summarize.update(increment)
-            self.progress_queue_sumnmarize.task_done()
+        try:
+            while True:
+                async with self.progress_lock_summarize:
+                    increment = await self.progress_queue_summarize.get()
+                    self.progress_bar_summarize.update(increment)
+                    self.progress_queue_summarize.task_done()
+        except Exception as e:
+            logger.error(f"Error in progress_updater_summarize: {e}")
 
     async def update_progress_store(self, increment=1):
         await self.progress_queue_store.put(increment)
 
     async def progress_updater_store(self):
-        while True:
-            increment = await self.progress_queue_store.get()
+        try:
+            while True:
+                async with self.progress_lock_store:
+                    increment = await self.progress_queue_store.get()
+                    self.progress_bar_store.update(increment)
+                    self.progress_queue_store.task_done()
+        except Exception as e:
+            logger.error(f"Error in progress_updater_store: {e}")
+
+    async def update_total_progress_scan(self, new_total):
+        try:
+            async with self.progress_lock_scan:
+                if self.progress_bar_scan is not None:
+                    self.progress_bar_scan.total = new_total
+                    self.progress_bar_scan.refresh()
+        except Exception as e:
+            logger.error(f"Error in update_total_progress_scan: {e}")
+
+    async def update_total_progress_summarize(self, new_total):
+        try:
+            async with self.progress_lock_summarize:
+                if self.progress_bar_summarize is not None:
+                    self.progress_bar_summarize.total = new_total
+                    self.progress_bar_summarize.refresh()
+        except Exception as e:
+            logger.error(f"Error in update_total_progress_summarize: {e}")
+
+    async def update_total_progress_store(self, new_total):
+        try:
             async with self.progress_lock_store:
-                self.progress_bar_store.update(increment)
-            self.progress_queue_store.task_done()
+                if self.progress_bar_store is not None:
+                    self.progress_bar_store.total = new_total
+                    self.progress_bar_store.refresh()
+        except Exception as e:
+            logger.error(f"Error in update_total_progress_store: {e}")
+
+    async def start_progress_scan(self, total):
+        try:
+            async with self.progress_lock_scan:
+                if self.progress_bar_scan is None:
+                    self.progress_bar_scan = tqdm(total=total, desc="Scanning / Ingesting", unit="files")
+                    self.progress_updater_task_scan = asyncio.create_task(self.progress_updater_scan())
+        except Exception as e:
+            logger.error(f"Error in start_progress_scan: {e}")
 
     async def start_progress_summarize(self, total):
-        if self.progress_bar_summarize is None:
+        try:
             async with self.progress_lock_summarize:
-                self.progress_bar_summarize = tqdm(total=total, desc="Summarizing", unit="data")
-                self.progress_updater_task_summarize = asyncio.create_task(self.progress_updater_summarize())
+                if self.progress_bar_summarize is None:
+                    self.progress_bar_summarize = tqdm(total=total, desc="Summarizing / Embedding", unit="data")
+                    self.progress_updater_task_summarize = asyncio.create_task(self.progress_updater_summarize())
+        except Exception as e:
+            logger.error(f"Error in start_progress_summarize: {e}")
 
     async def start_progress_store(self, total):
-        if self.progress_bar_store is None:
+        try:
             async with self.progress_lock_store:
-                self.progress_bar_store = tqdm(total=total, desc="Storing", unit="data")
-                self.progress_updater_task_store = asyncio.create_task(self.progress_updater_store())
+                if self.progress_bar_store is None:
+                    self.progress_bar_store = tqdm(total=total, desc="Storing", unit="data")
+                    self.progress_updater_task_store = asyncio.create_task(self.progress_updater_store())
+        except Exception as e:
+            logger.error(f"Error in start_progress_store: {e}")
+
 
 
     async def start_ingestion(self, inputPath: str) -> int:
-        if not self.validate_input_path(inputPath):
-            return -1
-
-        self.gitignore_patterns = self.load_gitignore_patterns(inputPath)
-
-        if not os.path.exists(self.currentOutputPath):
-            os.makedirs(self.currentOutputPath, exist_ok=True)
-            open(os.path.join(self.currentOutputPath, '.ngest_index'), 'a').close()
-            logger.info(f"Created new project directory at {self.currentOutputPath}")
-
-        self.total_files = await self.count_files(inputPath)
-        async with self.progress_lock_scan:
-            self.progress_bar_scan = tqdm(total=self.total_files, desc="Scanning", unit="file")
-        self.progress_updater_task_scan = asyncio.create_task(self.progress_updater_scan())
-
-        result = 0
-        try:
-            result = await self.Ingest(inputPath, self.currentOutputPath)
-        except Exception as e:
-            result = -1
-            logger.error(f"Error during ingestion in start_ingestion: {e}")
-        finally:
+        async with self.start_ingest_semaphore:
+            if self.started_ingestion == True:
+                return 0
+            else:
+                started_ingestion = True
+        
+            if not self.validate_input_path(inputPath):
+                return -1
+            
             try:
-                await self.progress_queue_scan.join()
-                async with self.progress_lock_scan:
-                    if self.progress_bar_scan:
-                        self.progress_bar_scan.close()
-                        
-                await self.progress_queue_summarize.join()
-                async with self.progress_lock_summarize:
-                    if self.progress_bar_summarize:
-                        self.progress_bar_summarize.close()
-                        
-                await self.progress_queue_store.join()
-                async with self.progress_lock_store:
-                    if self.progress_bar_store:
-                        self.progress_bar_store.close()
+                self.gitignore_patterns = self.load_gitignore_patterns(inputPath)
 
+                if not os.path.exists(self.currentOutputPath):
+                    os.makedirs(self.currentOutputPath, exist_ok=True)
+                    open(os.path.join(self.currentOutputPath, '.ngest_index'), 'a').close()
+                    logger.info(f"Created new project directory at {self.currentOutputPath}")
+
+                self.total_files = await self.count_files(inputPath)
+                result = 0
+
+                await self.start_progress_scan(self.total_files)
+                await self.start_progress_summarize(self.total_files)
+                await self.start_progress_store(self.total_files)
+
+                result = await self.Ingest(inputPath, self.currentOutputPath)
+                
             except Exception as e:
-                logger.error(f"Error during cleanup: {e}")
-            return result
+                result = -1
+                logger.error(f"Error during ingestion in start_ingestion: {e}")
+            finally:
+                try:
+                    # Cancel all progress updater tasks
+                    if self.progress_updater_task_scan:
+                        self.progress_updater_task_scan.cancel()
+                    if self.progress_updater_task_summarize:
+                        self.progress_updater_task_summarize.cancel()
+                    if self.progress_updater_task_store:
+                        self.progress_updater_task_store.cancel()
+
+                    async with self.progress_lock_scan:
+                        if self.progress_bar_scan:
+                            self.progress_bar_scan.close()
+                            
+                    async with self.progress_lock_summarize:
+                        if self.progress_bar_summarize:
+                            self.progress_bar_summarize.close()
+                            
+                    async with self.progress_lock_store:
+                        if self.progress_bar_store:
+                            self.progress_bar_store.close()
+
+                except Exception as e:
+                    logger.error(f"Error during cleanup: {e}")
+                return result
 
 
     async def count_files(self, path: str) -> int:
@@ -2027,15 +2444,16 @@ class NIngest:
         """
         async with self.importer_.get_session() as session:
             try:
-                await session.run(
+                await (await session.run(
                     "MATCH (n) WHERE n.projectID = $projectID "
                     "DETACH DELETE n",
                     projectID=self.projectID
-                )
+                )).consume()
                 logger.info(f"Cleaned up partial ingestion for project {self.projectID}")
             except Exception as e:
                 logger.error(f"Error during cleanup for project {self.projectID}: {e}")
 
+    # This is where the root input directory is passed. Everyhing scanned / ingested happens from here on in. Starting here.
     async def Ingest(self, inputPath: str, currentOutputPath: str) -> int:
         """
         Ingest files from the input path into the output path.
@@ -2047,7 +2465,10 @@ class NIngest:
         Returns:
             int: The result of the ingestion process.
         """
+#        async with self.ingest_semaphore:
         try:
+            # Phase 1: Scanning / Ingestion
+            # Currently all non-CPP files are also summarized / stored here.
             if not os.path.exists(inputPath):
                 logger.error(f"Invalid path: {inputPath}")
                 return -1
@@ -2057,7 +2478,7 @@ class NIngest:
 
             with open(index_file_path, 'a') as index_file:
                 index_file.write(f"{inputType},{inputPath}\n")
-            logger.info(f"Scanning: {inputPath}")
+#            logger.info(f"Scanning: {inputPath}")
 
             inputLocation, inputName = os.path.split(inputPath)
             tasks = []
@@ -2068,34 +2489,78 @@ class NIngest:
                 if not self.should_ignore_file(inputPath):
                     tasks.append(self.IngestFile(inputPath=inputPath, inputLocation=inputLocation, inputName=inputName, currentOutputPath=currentOutputPath, projectID=self.projectID))
 
+#            logger.info("Gathering scanning tasks...")
             # Wait for all ingestion tasks to complete
             await asyncio.gather(*tasks)
-            # -------------------------------------------------------------------
-            # Phase 2: Summarizing and Embedding
-            logger.info("Starting summarization and batching of CPP files.")
-            try:
-                await self.importer_.summarize_all_cpp(self.projectID)
-            except Exception as e:
-                logger.error(f"Error during CPP summarization in Ingest: {e}")
-                await self.cleanup_partial_ingestion(self.projectID)
-                return -1
-            logger.info("Summarization complete.")
-            # -------------------------------------------------------------------
-            # Phase 3: Batching into the Database
-            try:
-                await self.importer_.store_all_cpp(self.projectID)
-            except Exception as e:
-                logger.error(f"Error during CPP storing in Ingest: {e}")
-                await self.cleanup_partial_ingestion(self.projectID)
-                return -1
-            logger.info("Batching to DB of CPP files is complete.")
-            # -------------------------------------------------------------------
-            return 0
-        
         except Exception as e:
             logger.error(f"Error during ingestion in Ingest: {e}")
             await self.cleanup_partial_ingestion(self.projectID)
             return -1
+        # -------------------------------------------------------------------
+        # Phase 2: Summarizing and Embedding CPP files
+        if self.summarized_cpp_started == False:
+            self.summarized_cpp_started = True
+#                logger.info("Finished gathering scanning tasks.")
+            # -------------------------------------------------------------------
+            async with self.summarize_semaphore:
+#            try:
+#                file_count, total_cpp_count = await self.importer_.getFileAndCppCount()
+#                total_progress = file_count + total_cpp_count
+#            except Exception as e:
+#                logger.error(f"Error getting file and cpp count: {e}")
+#                raise FileProcessingError(f"Error getting file and cpp count: {e}")
+#
+#            try:
+#                await self.update_total_progress_scan(file_count)
+#                await self.update_total_progress_summarize(total_progress)
+#                await self.update_total_progress_store(total_progress)
+#            except Exception as e:
+#                logger.error(f"Error updating summarization and storing progress bars: {e}")
+#                raise FileProcessingError(f"Error updating summarization and storing progress bars: {e}")
+            # -------------------------------------------------------------------
+#                logger.info("Starting summarization of CPP files...")
+                try:
+                    await self.importer_.summarize_all_cpp(self.projectID)
+                    self.summarized_cpp_finished = True
+                except Exception as e:
+                    logger.error(f"Error during CPP summarization in Ingest: {e}")
+                    await self.cleanup_partial_ingestion(self.projectID)
+                    return -1
+    #                logger.info("CPP summarization complete. Next, storing to database...")
+        # -------------------------------------------------------------------
+        # Phase 3: Batching into the Database
+        if self.stored_cpp_finished is not True:
+            if self.summarized_cpp_finished == True and self.stored_cpp_started == False:
+                self.stored_cpp_started = True
+#                logger.info("Starting DB importation of CPP files.")
+                async with self.store_semaphore:
+
+#                try:
+#                    file_count, total_cpp_count = await self.importer_.getFileAndCppCount()
+#                    total_progress = file_count + total_cpp_count
+#                except Exception as e:
+#                    logger.error(f"Error getting file and cpp count: {e}")
+#                    raise FileProcessingError(f"Error getting file and cpp count: {e}")
+
+#                try:
+#                    await self.update_total_progress_scan(file_count)
+#                    await self.update_total_progress_summarize(total_progress)
+#                    await self.update_total_progress_store(total_progress)
+#                except Exception as e:
+#                    logger.error(f"Error updating summarization and storing progress bars: {e}")
+#                    raise FileProcessingError(f"Error updating summarization and storing progress bars: {e}")
+
+                    try:
+                        await self.importer_.store_all_cpp(self.projectID)
+                        self.stored_cpp_finished = True
+    #                        logger.info("Batching to DB of CPP files is complete.")
+                        return 0
+                    except Exception as e:
+                        logger.error(f"Error during CPP storing in Ingest: {e}")
+                        await self.cleanup_partial_ingestion(self.projectID)
+                        return -1
+        # -------------------------------------------------------------------
+        return 0
             
 #    async def Ingest(self, inputPath: str, currentOutputPath: str) -> int:
 #        """
@@ -2260,11 +2725,11 @@ class NIngest:
         """
         try:
             async with self.importer_.get_session() as session:
-                result = await session.run(
+                result = await (await session.run(
                     "MATCH (n) WHERE n.projectID = $projectID "
                     "RETURN n",
                     projectID=projectID
-                )
+                )).consume()
                 
                 nodes = await result.data()
                 
@@ -2312,6 +2777,10 @@ async def read_file_in_chunks(file_path: str, chunk_size: int = 1024) -> AsyncGe
         return
 
 class ProjectManager:
+
+    def __init__(self):
+        self.ingest_semaphore = asyncio.Semaphore(1)
+
     """
     Provides a high-level interface for managing projects, including creating, updating, deleting, and exporting projects.
     """
@@ -2325,13 +2794,16 @@ class ProjectManager:
         Returns:
             str: The project ID.
         """
-        project_id = str(uuid.uuid4())
-        ingest_instance = NIngest(projectID=project_id)
-        result = await ingest_instance.start_ingestion(input_path)
-        if result == 0:
-            return project_id
-        else:
-            raise Exception("Failed to create project")
+        async with self.ingest_semaphore:
+            project_id = str(uuid.uuid4())
+            ingest_instance = NIngest(projectID=project_id)
+            result = await ingest_instance.start_ingestion(input_path)
+            if result == 0:
+#                await ingest_instance.importer_.closeDB()
+                return project_id
+
+            else:
+                raise Exception("Failed to create project")
 
     async def update_project(self, project_id: str, input_path: str) -> int:
         """
@@ -2344,8 +2816,9 @@ class ProjectManager:
         Returns:
             int: The result of the update process.
         """
-        ingest_instance = NIngest(projectID=project_id)
-        return await ingest_instance.update_project(project_id, input_path)
+        async with self.ingest_semaphore:
+            ingest_instance = NIngest(projectID=project_id)
+            return await ingest_instance.update_project(project_id, input_path)
 
     async def delete_project(self, project_id: str) -> int:
         """
@@ -2357,8 +2830,9 @@ class ProjectManager:
         Returns:
             int: The result of the deletion process.
         """
-        ingest_instance = NIngest(projectID=project_id)
-        return await ingest_instance.delete_project(project_id)
+        async with self.ingest_semaphore:
+            ingest_instance = NIngest(projectID=project_id)
+            return await ingest_instance.delete_project(project_id)
 
     async def export_project(self, project_id: str, export_path: str) -> int:
         """
@@ -2371,8 +2845,9 @@ class ProjectManager:
         Returns:
             int: The result of the export process.
         """
-        ingest_instance = NIngest(projectID=project_id)
-        return await ingest_instance.export_project(project_id, export_path)
+        async with self.ingest_semaphore:
+            ingest_instance = NIngest(projectID=project_id)
+            return await ingest_instance.export_project(project_id, export_path)
 
 async def main():
     """
