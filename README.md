@@ -14,3 +14,6 @@ I had to add this in the imports:
 
 This project isn't done yet so don't bother using it yet.
 When it's ready there will also be a Retriever script.
+
+Status: we have minimal CPP ingestion now working, as well as 2-layer ingestion for PDFs.
+
