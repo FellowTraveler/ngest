@@ -574,12 +574,12 @@ class NNeo4JImporter(NBaseImporter):
                 async with self.rate_limiter_db:
                     async with self.get_session() as session:
                         document_id = await self.run_query_and_get_element_id(session,
-                            "CREATE (n:Document {name: $localPath, short_name pages: $pages, projectID: $projectID}) RETURN elementId(n)",
-                            localPath=localPath, pages=num_pages, projectID=projectID
+                            "CREATE (n:Document {name: $localPath, projectID: $projectID}) RETURN elementId(n)",
+                            localPath=localPath, projectID=projectID
                         )
 
-#                            "CREATE (n:PDF {name: $name, pages: $pages, projectID: $projectID}) RETURN elementId(n)",
-#                            "CREATE (n:Document:PDF {name: $name, pages: $pages, projectID: $projectID}) RETURN elementId(n)"
+#                            "CREATE (n:PDF {name: $name, projectID: $projectID}) RETURN elementId(n)",
+#                            "CREATE (n:Document:PDF {name: $name, projectID: $projectID}) RETURN elementId(n)"
                             
                 
                 await ingest_method(inputPath, inputLocation, inputName, currentOutputPath, projectID)
