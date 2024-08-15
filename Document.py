@@ -3,9 +3,6 @@ from neo4j import GraphDatabase
 from neo4j.exceptions import Neo4jError
 
 class Document(File):
-    uri = "bolt://localhost:7689"
-    user = "neo4j"
-    password = "mynewpassword"
 
     def __init__(self, filename, full_path, size_in_bytes, project_id, created_date=None, modified_date=None, extension=None, content_type=None):
         super().__init__(filename, full_path, size_in_bytes, project_id, created_date, modified_date, extension)
@@ -40,7 +37,10 @@ class Document(File):
 
 
     @staticmethod
-    async def retrieve_from_database(session, element_id):
+    async def retrieve_from_database(session, project_id, full_path):
+        element_id = await File.get_element_id_by_project_and_path(session, project_id, full_path)
+        if not element_id:
+            return None
         query = """
         MATCH (d:Document) WHERE elementId(d) = $element_id
         RETURN d

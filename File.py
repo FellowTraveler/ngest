@@ -10,9 +10,6 @@ class File:
         self.created_date = created_date or datetime.now().isoformat()
         self.modified_date = modified_date or datetime.now().isoformat()
         self.extension = extension or self.get_extension(filename)
-        self.uri = "bolt://localhost:7689"
-        self.user = "neo4j"
-        self.password = "mynewpassword"
 
     @staticmethod
     def get_extension(filename):
@@ -37,7 +34,10 @@ class File:
 
 
     @staticmethod
-    async def retrieve_from_database(session, element_id):
+    async def retrieve_from_database(session, project_id, full_path):
+        element_id = await File.get_element_id_by_project_and_path(session, project_id, full_path)
+        if not element_id:
+            return None
         query = """
         MATCH (f:File) WHERE elementId(f) = $element_id
         RETURN f.filename AS filename, f.full_path AS full_path, f.size_in_bytes AS size_in_bytes,
