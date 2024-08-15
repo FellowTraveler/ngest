@@ -101,14 +101,3 @@ class Document(File):
         RETURN d
         """
         return self.execute_cypher_query(query, self.element_id)
-    @staticmethod
-    def get_element_id_by_project_and_path(session, project_id, full_path):
-        query = """
-        MATCH (d:Document) WHERE d.project_id = $project_id AND d.full_path = $full_path
-        RETURN elementId(d) AS element_id
-        """
-        result = session.run(query, project_id=project_id, full_path=full_path)
-        record = result.single()
-        if record:
-            return record["element_id"]
-        return None
