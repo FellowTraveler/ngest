@@ -137,32 +137,54 @@ class NBaseImporter(ABC):
     async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, projectID: str) -> None:
         pass
 
-    def ascertain_file_type(self, filename: str) -> str:
+    def ascertain_file_type(self, inputPath: str) -> dict:
         try:
             mime = magic.Magic(mime=True)
-            file_type = mime.from_file(filename)
-        except Exception as e:
-            logger.error(f"Error determining file type for {filename}: {e}")
-            return 'unknown'
-        
-        if file_type.startswith('text'):
-            ext = os.path.splitext(filename)[1].lower()
-            if ext in ['.cpp', '.hpp', '.h', '.c']:
-                return 'cpp'
-            elif ext == '.py':
-                return 'python'
-            elif ext == '.rs':
-                return 'rust'
-            elif ext == '.js':
-                return 'javascript'
+            file_type = mime.from_file(inputPath)
+            _, ext = os.path.splitext(inputPath)
+            ext = ext.lower() if ext else ''
+
+            # Get file stats
+            file_stats = os.stat(inputPath)
+            size_in_bytes = file_stats.st_size
+            created_date = datetime.datetime.fromtimestamp(file_stats.st_birthtime).isoformat() if hasattr(file_stats, 'st_birthtime') else None
+            modified_date = datetime.datetime.fromtimestamp(file_stats.st_mtime).isoformat()
+
+            # Determine file type based on MIME type and extension
+            if file_type.startswith('text'):
+                if ext in ['.cpp', '.hpp', '.h', '.c']:
+                    type_name = 'cpp'
+                elif ext == '.py':
+                    type_name = 'python'
+                elif ext == '.rs':
+                    type_name = 'rust'
+                elif ext == '.js':
+                    type_name = 'javascript'
+                else:
+                    type_name = 'text'
+            elif file_type.startswith('image'):
+                type_name = 'image'
+            elif file_type == 'application/pdf':
+                type_name = 'pdf'
             else:
-                return 'text'
-        elif file_type.startswith('image'):
-            return 'image'
-        elif file_type == 'application/pdf':
-            return 'pdf'
-        else:
-            return 'unknown'
+                type_name = 'unknown'
+
+            return {
+                'type': type_name,
+                'extension': ext,
+                'size_in_bytes': size_in_bytes,
+                'created_date': created_date,
+                'modified_date': modified_date
+            }
+        except Exception as e:
+            logger.error(f"Error determining file type for {inputPath}: {e}")
+            return {
+                'type': 'unknown',
+                'extension': '',
+                'size_in_bytes': 0,
+                'created_date': None,
+                'modified_date': None
+            }
 
     @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=4, max=10))
     async def create_graph_nodes(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
