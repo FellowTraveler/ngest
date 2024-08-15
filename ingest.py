@@ -599,12 +599,12 @@ class NNeo4JImporter(NBaseImporter):
                         document = Document(
                             filename=inputName,
                             full_path=localPath,
-                            size_in_bytes=0,  # Assuming size_in_bytes is not available, set to 0 or fetch if possible
+                            size_in_bytes=file_type['size_in_bytes'],
                             project_id=projectID,
-                            created_date=None,
-                            modified_date=None,
-                            extension=None,
-                            content_type=None
+                            created_date=file_type['created_date'],
+                            modified_date=file_type['modified_date'],
+                            extension=file_type['extension'],
+                            content_type=file_type['type']
                         )
                         query, element_id = await document.generate_cypher_query(session)
                         document_id = await self.run_query_and_get_element_id(session, query, element_id=element_id)
