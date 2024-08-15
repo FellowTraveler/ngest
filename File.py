@@ -37,24 +37,18 @@ class File:
 
 
     @staticmethod
-    def retrieve_from_database(element_id):
-        uri = "bolt://localhost:7689"
-        user = "neo4j"
-        password = "mynewpassword"
-        
-        with GraphDatabase.driver(uri, auth=(user, password)) as driver:
-            with driver.session() as session:
-                query = """
-                MATCH (f:File) WHERE elementId(f) = $element_id
-                RETURN f.filename AS filename, f.full_path AS full_path, f.size_in_bytes AS size_in_bytes,
-                       f.created_date AS created_date, f.modified_date AS modified_date, f.extension AS extension
-                """
-                result = session.run(query, element_id=element_id)
-                record = result.single()
-                if record:
-                    return File(record["filename"], record["full_path"], record["size_in_bytes"],
-                                record["created_date"], record["modified_date"], record["extension"])
-                return None
+    async def retrieve_from_database(session, element_id):
+        query = """
+        MATCH (f:File) WHERE elementId(f) = $element_id
+        RETURN f.filename AS filename, f.full_path AS full_path, f.size_in_bytes AS size_in_bytes,
+               f.project_id AS project_id, f.created_date AS created_date, f.modified_date AS modified_date, f.extension AS extension
+        """
+        result = await session.run(query, element_id=element_id)
+        record = await result.single()
+        if record:
+            return File(record["filename"], record["full_path"], record["size_in_bytes"],
+                        record["project_id"], record["created_date"], record["modified_date"], record["extension"])
+        return None
     @staticmethod
     async def get_element_id_by_project_and_path(session, project_id, full_path):
         query = """

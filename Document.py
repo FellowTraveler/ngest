@@ -40,40 +40,20 @@ class Document(File):
 
 
     @staticmethod
-    async def retrieve_from_database(element_id):
-        try:
-            async with GraphDatabase.driver(Document.uri, auth=(Document.user, Document.password)) as driver:
-                async with driver.session() as session:
-                    query = """
-                    MATCH (d:Document) WHERE elementId(d) = $element_id
-                    RETURN d
-                    """
-                    result = await session.run(query, element_id=element_id)
-                    record = await result.single()
-                    if record:
-                        node = record["d"]
-                        return Document(
-                            node["filename"], node["full_path"], node["size_in_bytes"],
-                            node["created_date"], node["modified_date"], node["extension"],
-                            node["content_type"]
-                        )
-                    return None
-        except Neo4jError as e:
-            print(f"An error occurred: {e}")
-            return None
-
-    async def add_label(self, session, label):
-        query = f"""
+    async def retrieve_from_database(session, element_id):
+        query = """
         MATCH (d:Document) WHERE elementId(d) = $element_id
-        SET d:{label}
         RETURN d
         """
-        return await self.execute_cypher_query(session, query, self.element_id)
+        result = await session.run(query, element_id=element_id)
+        record = await result.single()
+        if record:
+            node = record["d"]
+            return Document(
+                node["filename"], node["full_path"], node["size_in_bytes"],
+                node["project_id"], node["created_date"], node["modified_date"], node["extension"],
+                node["content_type"]
+            )
+        return None
 
-    async def remove_label(self, session, label):
-        query = f"""
-        MATCH (d:Document) WHERE elementId(d) = $element_id
-        REMOVE d:{label}
-        RETURN d
-        """
-        return await self.execute_cypher_query(session, query, self.element_id)
+
