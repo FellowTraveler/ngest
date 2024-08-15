@@ -7,10 +7,9 @@ class Document(File):
     user = "neo4j"
     password = "mynewpassword"
 
-    def __init__(self, filename, full_path, size_in_bytes, created_date=None, modified_date=None, extension=None, content_type=None, source_id=None):
+    def __init__(self, filename, full_path, size_in_bytes, created_date=None, modified_date=None, extension=None, content_type=None):
         super().__init__(filename, full_path, size_in_bytes, created_date, modified_date, extension)
         self.content_type = content_type
-        self.source_id = source_id
 
     def generate_cypher_query(self, element_id=None):
         properties = {
@@ -20,8 +19,7 @@ class Document(File):
             "created_date": self.created_date,
             "modified_date": self.modified_date,
             "extension": self.extension,
-            "content_type": self.content_type,
-            "source_id": self.source_id
+            "content_type": self.content_type
         }
         if element_id:
             query = f"""
@@ -50,8 +48,7 @@ class Document(File):
                             "created_date": self.created_date,
                             "modified_date": self.modified_date,
                             "extension": self.extension,
-                            "content_type": self.content_type,
-                            "source_id": self.source_id
+                            "content_type": self.content_type
                         }
                     }
                     if element_id is not None:
@@ -81,7 +78,7 @@ class Document(File):
                         return Document(
                             node["filename"], node["full_path"], node["size_in_bytes"],
                             node["created_date"], node["modified_date"], node["extension"],
-                            node["content_type"], node["source_id"]
+                            node["content_type"]
                         )
                     return None
         except Neo4jError as e:
