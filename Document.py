@@ -11,7 +11,8 @@ class Document(File):
         super().__init__(filename, full_path, size_in_bytes, project_id, created_date, modified_date, extension)
         self.content_type = content_type
 
-    def generate_cypher_query(self, element_id=None):
+    async def generate_cypher_query(self, session):
+        element_id = await File.get_element_id_by_project_and_path(session, self.project_id, self.full_path)
         properties = {
             "filename": self.filename,
             "full_path": self.full_path,
@@ -35,45 +36,20 @@ class Document(File):
             SET d = $properties
             RETURN d
             """
-        return query
+        return query, element_id
 
-    def execute_cypher_query(self, query, element_id=None):
-        try:
-            with GraphDatabase.driver(self.uri, auth=(self.user, self.password)) as driver:
-                with driver.session() as session:
-                    params = {
-                        "properties": {
-                            "filename": self.filename,
-                            "full_path": self.full_path,
-                            "size_in_bytes": self.size_in_bytes,
-                            "created_date": self.created_date,
-                            "modified_date": self.modified_date,
-                            "extension": self.extension,
-                            "content_type": self.content_type
-                        }
-                    }
-                    if element_id is not None:
-                        params["element_id"] = element_id
-                    result = session.run(query, **params)
-                    record = result.single()
-                    if record:
-                        return str(record["d"].element_id), True
-                    return None, False
-        except Neo4jError as e:
-            print(f"An error occurred: {e}")
-            return None, False
 
     @staticmethod
-    def retrieve_from_database(element_id):
+    async def retrieve_from_database(element_id):
         try:
-            with GraphDatabase.driver(Document.uri, auth=(Document.user, Document.password)) as driver:
-                with driver.session() as session:
+            async with GraphDatabase.driver(Document.uri, auth=(Document.user, Document.password)) as driver:
+                async with driver.session() as session:
                     query = """
                     MATCH (d:Document) WHERE elementId(d) = $element_id
                     RETURN d
                     """
-                    result = session.run(query, element_id=element_id)
-                    record = result.single()
+                    result = await session.run(query, element_id=element_id)
+                    record = await result.single()
                     if record:
                         node = record["d"]
                         return Document(
@@ -86,18 +62,18 @@ class Document(File):
             print(f"An error occurred: {e}")
             return None
 
-    def add_label(self, label):
+    async def add_label(self, session, label):
         query = f"""
         MATCH (d:Document) WHERE elementId(d) = $element_id
         SET d:{label}
         RETURN d
         """
-        return self.execute_cypher_query(query, self.element_id)
+        return await self.execute_cypher_query(session, query, self.element_id)
 
-    def remove_label(self, label):
+    async def remove_label(self, session, label):
         query = f"""
         MATCH (d:Document) WHERE elementId(d) = $element_id
         REMOVE d:{label}
         RETURN d
         """
-        return self.execute_cypher_query(query, self.element_id)
+        return await self.execute_cypher_query(session, query, self.element_id)

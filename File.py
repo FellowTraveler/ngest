@@ -18,7 +18,8 @@ class File:
     def get_extension(filename):
         return filename.split('.')[-1] if '.' in filename else ''
 
-    def generate_cypher_query(self, element_id=None):
+    async def generate_cypher_query(self, session):
+        element_id = await self.get_element_id_by_project_and_path(session, self.project_id, self.full_path)
         if element_id:
             query = f"""
             MATCH (f:File) WHERE elementId(f) = $element_id
@@ -32,27 +33,8 @@ class File:
                             project_id: $project_id, created_date: $created_date, modified_date: $modified_date, extension: $extension})
             RETURN f
             """
-        return query
+        return query, element_id
 
-    def execute_cypher_query(self, query, element_id=None):
-        with GraphDatabase.driver(self.uri, auth=(self.user, self.password)) as driver:
-            with driver.session() as session:
-                params = {
-                    "filename": self.filename,
-                    "full_path": self.full_path,
-                    "size_in_bytes": self.size_in_bytes,
-                    "project_id": self.project_id,
-                    "created_date": self.created_date,
-                    "modified_date": self.modified_date,
-                    "extension": self.extension
-                }
-                if element_id is not None:
-                    params["element_id"] = element_id
-                result = session.run(query, **params)
-                record = result.single()
-                if record:
-                    return str(record["f"].element_id), True
-                return None, False
 
     @staticmethod
     def retrieve_from_database(element_id):
@@ -74,13 +56,13 @@ class File:
                                 record["created_date"], record["modified_date"], record["extension"])
                 return None
     @staticmethod
-    def get_element_id_by_project_and_path(session, project_id, full_path):
+    async def get_element_id_by_project_and_path(session, project_id, full_path):
         query = """
         MATCH (f:File) WHERE f.project_id = $project_id AND f.full_path = $full_path
         RETURN elementId(f) AS element_id
         """
-        result = session.run(query, project_id=project_id, full_path=full_path)
-        record = result.single()
+        result = await session.run(query, project_id=project_id, full_path=full_path)
+        record = await result.single()
         if record:
             return record["element_id"]
         return None
