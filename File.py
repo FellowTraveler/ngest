@@ -2,10 +2,11 @@ from neo4j import GraphDatabase
 from datetime import datetime
 
 class File:
-    def __init__(self, filename, full_path, size_in_bytes, created_date=None, modified_date=None, extension=None):
+    def __init__(self, filename, full_path, size_in_bytes, project_id, created_date=None, modified_date=None, extension=None):
         self.filename = filename
         self.full_path = full_path
         self.size_in_bytes = size_in_bytes
+        self.project_id = project_id
         self.created_date = created_date or datetime.now().isoformat()
         self.modified_date = modified_date or datetime.now().isoformat()
         self.extension = extension or self.get_extension(filename)
@@ -22,13 +23,13 @@ class File:
             query = f"""
             MATCH (f:File) WHERE elementId(f) = $element_id
             SET f.filename = $filename, f.full_path = $full_path, f.size_in_bytes = $size_in_bytes,
-                f.created_date = $created_date, f.modified_date = $modified_date, f.extension = $extension
+                f.project_id = $project_id, f.created_date = $created_date, f.modified_date = $modified_date, f.extension = $extension
             RETURN f
             """
         else:
             query = """
             CREATE (f:File {filename: $filename, full_path: $full_path, size_in_bytes: $size_in_bytes,
-                            created_date: $created_date, modified_date: $modified_date, extension: $extension})
+                            project_id: $project_id, created_date: $created_date, modified_date: $modified_date, extension: $extension})
             RETURN f
             """
         return query
@@ -40,6 +41,7 @@ class File:
                     "filename": self.filename,
                     "full_path": self.full_path,
                     "size_in_bytes": self.size_in_bytes,
+                    "project_id": self.project_id,
                     "created_date": self.created_date,
                     "modified_date": self.modified_date,
                     "extension": self.extension
@@ -71,3 +73,14 @@ class File:
                     return File(record["filename"], record["full_path"], record["size_in_bytes"],
                                 record["created_date"], record["modified_date"], record["extension"])
                 return None
+    @staticmethod
+    def get_element_id_by_project_and_path(session, project_id, full_path):
+        query = """
+        MATCH (f:File) WHERE f.project_id = $project_id AND f.full_path = $full_path
+        RETURN elementId(f) AS element_id
+        """
+        result = session.run(query, project_id=project_id, full_path=full_path)
+        record = result.single()
+        if record:
+            return record["element_id"]
+        return None

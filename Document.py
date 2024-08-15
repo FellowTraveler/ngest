@@ -7,8 +7,8 @@ class Document(File):
     user = "neo4j"
     password = "mynewpassword"
 
-    def __init__(self, filename, full_path, size_in_bytes, created_date=None, modified_date=None, extension=None, content_type=None):
-        super().__init__(filename, full_path, size_in_bytes, created_date, modified_date, extension)
+    def __init__(self, filename, full_path, size_in_bytes, project_id, created_date=None, modified_date=None, extension=None, content_type=None):
+        super().__init__(filename, full_path, size_in_bytes, project_id, created_date, modified_date, extension)
         self.content_type = content_type
 
     def generate_cypher_query(self, element_id=None):
@@ -16,6 +16,7 @@ class Document(File):
             "filename": self.filename,
             "full_path": self.full_path,
             "size_in_bytes": self.size_in_bytes,
+            "project_id": self.project_id,
             "created_date": self.created_date,
             "modified_date": self.modified_date,
             "extension": self.extension,
@@ -100,3 +101,14 @@ class Document(File):
         RETURN d
         """
         return self.execute_cypher_query(query, self.element_id)
+    @staticmethod
+    def get_element_id_by_project_and_path(session, project_id, full_path):
+        query = """
+        MATCH (d:Document) WHERE d.project_id = $project_id AND d.full_path = $full_path
+        RETURN elementId(d) AS element_id
+        """
+        result = session.run(query, project_id=project_id, full_path=full_path)
+        record = result.single()
+        if record:
+            return record["element_id"]
+        return None
