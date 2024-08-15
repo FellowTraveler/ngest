@@ -573,10 +573,19 @@ class NNeo4JImporter(NBaseImporter):
 #                
                 async with self.rate_limiter_db:
                     async with self.get_session() as session:
-                        document_id = await self.run_query_and_get_element_id(session,
-                            "CREATE (n:Document {name: $localPath, projectID: $projectID}) RETURN elementId(n)",
-                            localPath=localPath, projectID=projectID
+                        from Document import Document
+                        document = Document(
+                            filename=inputName,
+                            full_path=localPath,
+                            size_in_bytes=0,  # Assuming size_in_bytes is not available, set to 0 or fetch if possible
+                            project_id=projectID,
+                            created_date=None,
+                            modified_date=None,
+                            extension=None,
+                            content_type=None
                         )
+                        query, element_id = await document.generate_cypher_query(session)
+                        document_id = await self.run_query_and_get_element_id(session, query, element_id=element_id)
 
 #                            "CREATE (n:PDF {name: $name, projectID: $projectID}) RETURN elementId(n)",
 #                            "CREATE (n:Document:PDF {name: $name, projectID: $projectID}) RETURN elementId(n)"
