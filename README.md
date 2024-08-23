@@ -10,6 +10,10 @@ I had to add this in the imports:
     import clang.cindex
 ```
 
+To ingest a project folder:
+
+```python ingest.py --input_path /path/to/folder create```
+
 ### Note
 
 This project isn't done yet so don't bother using it yet.

@@ -517,7 +517,7 @@ class NNeo4JImporter(NBaseImporter):
 #       logger.info(f"Starting scanning for file: {inputPath}")
         try:
             file_type = self.ascertain_file_type(inputPath)
-            ingest_method = getattr(self, f"Ingest{file_type.capitalize()}", None)
+            ingest_method = getattr(self, f"Ingest{file_type['type'].capitalize()}", None)
             if ingest_method:
                 
                 await self.add_file_path(inputPath)

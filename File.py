@@ -19,19 +19,30 @@ class File:
         element_id = await self.get_element_id_by_project_and_path(session, self.project_id, self.full_path)
         if element_id:
             query = f"""
-            MATCH (f:File) WHERE elementId(f) = $element_id
-            SET f.filename = $filename, f.full_path = $full_path, f.size_in_bytes = $size_in_bytes,
-                f.project_id = $project_id, f.created_date = $created_date, f.modified_date = $modified_date, f.extension = $extension
-            RETURN f
+            MATCH (n:File) WHERE elementId(n) = '{element_id}'
+            SET n.filename = '{self.filename}',
+                n.full_path = '{self.full_path}',
+                n.size_in_bytes = {self.size_in_bytes},
+                n.project_id = '{self.project_id}',
+                n.created_date = '{self.created_date}',
+                n.modified_date = '{self.modified_date}',
+                n.extension = '{self.extension}'
+            RETURN elementId(n)
             """
         else:
-            query = """
-            CREATE (f:File {filename: $filename, full_path: $full_path, size_in_bytes: $size_in_bytes,
-                            project_id: $project_id, created_date: $created_date, modified_date: $modified_date, extension: $extension})
-            RETURN f
+            query = f"""
+            CREATE (n:File {{
+                filename: '{self.filename}',
+                full_path: '{self.full_path}',
+                size_in_bytes: {self.size_in_bytes},
+                project_id: '{self.project_id}',
+                created_date: '{self.created_date}',
+                modified_date: '{self.modified_date}',
+                extension: '{self.extension}'
+            }})
+            RETURN elementId(n)
             """
         return query, element_id
-
 
     @staticmethod
     async def retrieve_from_database(session, project_id, full_path):
@@ -39,9 +50,9 @@ class File:
         if not element_id:
             return None
         query = """
-        MATCH (f:File) WHERE elementId(f) = $element_id
-        RETURN f.filename AS filename, f.full_path AS full_path, f.size_in_bytes AS size_in_bytes,
-               f.project_id AS project_id, f.created_date AS created_date, f.modified_date AS modified_date, f.extension AS extension
+        MATCH (n:File) WHERE elementId(n) = $element_id
+        RETURN n.filename AS filename, n.full_path AS full_path, n.size_in_bytes AS size_in_bytes,
+               n.project_id AS project_id, n.created_date AS created_date, n.modified_date AS modified_date, n.extension AS extension
         """
         result = await session.run(query, element_id=element_id)
         record = await result.single()
@@ -52,8 +63,8 @@ class File:
     @staticmethod
     async def get_element_id_by_project_and_path(session, project_id, full_path):
         query = """
-        MATCH (f:File) WHERE f.project_id = $project_id AND f.full_path = $full_path
-        RETURN elementId(f) AS element_id
+        MATCH (n:File) WHERE n.project_id = $project_id AND n.full_path = $full_path
+        RETURN elementId(n) AS element_id
         """
         result = await session.run(query, project_id=project_id, full_path=full_path)
         record = await result.single()
