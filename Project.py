@@ -25,45 +25,8 @@ class Project:
             """
         return query
 
-
     @staticmethod
     async def retrieve_from_database(session, element_id):
-    
-    @staticmethod
-    async def get_project_id_by_folder_name(session, folder_name):
-        query = """
-        MATCH (p:Project) WHERE p.folder_name = $folder_name
-        RETURN p.project_id AS project_id
-        """
-        result = await session.run(query, folder_name=folder_name)
-        record = await result.single()
-        if record:
-            return record["project_id"]
-        return None
-    
-    @staticmethod
-    async def get_project_id_by_folder_name(session, folder_name):
-        query = """
-        MATCH (p:Project) WHERE p.folder_name = $folder_name
-        RETURN p.project_id AS project_id
-        """
-        result = await session.run(query, folder_name=folder_name)
-        record = await result.single()
-        if record:
-            return record["project_id"]
-        return None
-    
-    @staticmethod
-    async def get_project_id_by_folder_name(session, folder_name):
-        query = """
-        MATCH (p:Project) WHERE p.folder_name = $folder_name
-        RETURN p.project_id AS project_id
-        """
-        result = await session.run(query, folder_name=folder_name)
-        record = await result.single()
-        if record:
-            return record["project_id"]
-        return None
         uri = "bolt://localhost:7689"
         user = "neo4j"
         password = "mynewpassword"
@@ -79,3 +42,15 @@ class Project:
                 if record:
                     return Project(record["project_id"], record["folder_name"], record["description"], record["status"], record["created_date"], record["modified_date"])
                 return None
+
+    @staticmethod
+    async def get_project_id_by_folder_name(session, folder_name):
+        query = """
+        MATCH (p:Project) WHERE p.folder_name = $folder_name
+        RETURN p.project_id AS project_id
+        """
+        result = await session.run(query, folder_name=folder_name)
+        record = await result.single()
+        if record:
+            return record["project_id"]
+        return None

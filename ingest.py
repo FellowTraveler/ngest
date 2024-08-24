@@ -2953,7 +2953,27 @@ class ProjectManager:
     """
     Provides a high-level interface for managing projects, including creating, updating, deleting, and exporting projects.
     """
-    async def create_project(self, input_path: str) -> str:
+    async def create_or_update_project(self, input_path: str) -> str:
+        async with self.ingest_semaphore:
+            folder_name = os.path.basename(os.path.normpath(input_path))
+            project = Project()
+            async with project.driver.session() as session:
+                project_id = await project.get_project_id_by_folder_name(session, folder_name)
+                if project_id:
+                    ingest_instance = NIngest(project_id=project_id)
+                    result = await ingest_instance.update_project(project_id, input_path)
+                    if result == 0:
+                        return project_id
+                    else:
+                        raise Exception("Failed to update project")
+                else:
+                    project_id = str(uuid.uuid4())
+                    ingest_instance = NIngest(project_id=project_id)
+                    result = await ingest_instance.start_ingestion(input_path)
+                    if result == 0:
+                        return project_id
+                    else:
+                        raise Exception("Failed to create project")
         """
         Create a new project.
 
