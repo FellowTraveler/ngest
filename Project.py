@@ -27,21 +27,15 @@ class Project:
 
     @staticmethod
     async def retrieve_from_database(session, element_id):
-        uri = "bolt://localhost:7689"
-        user = "neo4j"
-        password = "mynewpassword"
-        
-        with GraphDatabase.driver(uri, auth=(user, password)) as driver:
-            with driver.session() as session:
-                query = """
-                MATCH (p:Project) WHERE elementId(p) = $element_id
-                RETURN p.project_id AS project_id, p.folder_name AS folder_name, p.description AS description, p.status AS status, p.created_date AS created_date, p.modified_date AS modified_date
-                """
-                result = session.run(query, element_id=element_id)
-                record = result.single()
-                if record:
-                    return Project(record["project_id"], record["folder_name"], record["description"], record["status"], record["created_date"], record["modified_date"])
-                return None
+        query = """
+        MATCH (p:Project) WHERE elementId(p) = $element_id
+        RETURN p.project_id AS project_id, p.folder_name AS folder_name, p.description AS description, p.status AS status, p.created_date AS created_date, p.modified_date AS modified_date
+        """
+        result = await session.run(query, element_id=element_id)
+        record = await result.single()
+        if record:
+            return Project(record["project_id"], record["folder_name"], record["description"], record["status"], record["created_date"], record["modified_date"])
+        return None
 
     @staticmethod
     async def get_project_id_by_folder_name(session, folder_name):
