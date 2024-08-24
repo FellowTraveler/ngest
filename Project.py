@@ -11,30 +11,41 @@ class Project:
         self.description = description
         self.status = status
 
-    def generate_cypher_query(self, element_id=None):
+    async def generate_cypher_query(self, session, element_id=None):
         if element_id:
             query = f"""
-            MATCH (p:Project) WHERE elementId(p) = $element_id
-            SET p.folder_name = $folder_name, p.description = $description, p.status = $status, p.created_date = $created_date, p.modified_date = $modified_date
-            RETURN p
+            MATCH (p:Project) WHERE elementId(p) = '{element_id}'
+            SET p.folder_name = '{self.folder_name}', p.description = '{self.description}', p.status = '{self.status}', p.created_date = '{self.created_date}', p.modified_date = '{self.modified_date}'
+            RETURN elementId(p)
             """
         else:
-            query = """
-            CREATE (p:Project {project_id: $project_id, folder_name: $folder_name, description: $description, status: $status, created_date: $created_date, modified_date: $modified_date})
-            RETURN p
+            query = f"""
+            CREATE (p:Project {{
+                project_id: '{self.project_id}',
+                folder_name: '{self.folder_name}',
+                description: '{self.description}',
+                status: '{self.status}',
+                created_date: '{self.created_date}',
+                modified_date: '{self.modified_date}'
+            }})
+            RETURN elementId(p)
             """
-        return query
+        return query, element_id
 
     @staticmethod
     async def retrieve_from_database(session, element_id):
         query = """
         MATCH (p:Project) WHERE elementId(p) = $element_id
-        RETURN p.project_id AS project_id, p.folder_name AS folder_name, p.description AS description, p.status AS status, p.created_date AS created_date, p.modified_date AS modified_date
+        RETURN p
         """
         result = await session.run(query, element_id=element_id)
         record = await result.single()
         if record:
-            return Project(record["project_id"], record["folder_name"], record["description"], record["status"], record["created_date"], record["modified_date"])
+            node = record["p"]
+            return Project(
+                node["project_id"], node["folder_name"], node["description"],
+                node["status"], node["created_date"], node["modified_date"]
+            )
         return None
 
     @staticmethod
