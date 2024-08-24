@@ -135,7 +135,7 @@ class NBaseImporter(ABC):
     and handle file chunking and graph node creation.
     """
     @abstractmethod
-    async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, projectID: str) -> None:
+    async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, project_id: str) -> None:
         pass
 
     def ascertain_file_type(self, inputPath: str) -> dict:
@@ -188,7 +188,7 @@ class NBaseImporter(ABC):
             }
 
     @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=4, max=10))
-    async def create_graph_nodes(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
+    async def create_graph_nodes(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, project_id: str) -> None:
         """
         Create graph nodes in the Neo4j database for a given file.
 
@@ -197,20 +197,20 @@ class NBaseImporter(ABC):
             inputLocation (str): The location of the input file.
             inputName (str): The name of the input file.
             currentOutputPath (str): The current output path.
-            projectID (str): The project ID.
+            project_id (str): The project ID.
         """
         logger.info(f"Creating graph nodes for {inputPath}")
         # Implement the actual graph node creation logic here
 
-    async def chunk_and_create_nodes(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
+    async def chunk_and_create_nodes(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, project_id: str) -> None:
         try:
             chunks = [chunk async for chunk in read_file_in_chunks(inputPath, MEDIUM_CHUNK_SIZE)]
             previous_chunk_id = None
 
             for i, chunk in enumerate(chunks):
-                chunk_id = await self.handle_chunk_creation(chunk, inputPath, i, projectID)
+                chunk_id = await self.handle_chunk_creation(chunk, inputPath, i, project_id)
                 if previous_chunk_id:
-                    await self.create_chunk_relationship(previous_chunk_id, chunk_id, projectID)
+                    await self.create_chunk_relationship(previous_chunk_id, chunk_id, project_id)
                 previous_chunk_id = chunk_id
         except Exception as e:
             logger.error(f"Error processing file {inputPath}: {e}")
@@ -223,7 +223,7 @@ class NBaseImporter(ABC):
 
 
 #    @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=15, max=30))
-    async def create_chunk_node(self, chunk: str, inputPath: str, index: int, projectID: str) -> Optional[str]:
+    async def create_chunk_node(self, chunk: str, inputPath: str, index: int, project_id: str) -> Optional[str]:
         """
         Create a chunk node in the Neo4j database.
 
@@ -231,7 +231,7 @@ class NBaseImporter(ABC):
             chunk (str): The text chunk.
             inputPath (str): The path to the input file.
             index (int): The index of the chunk.
-            projectID (str): The project ID.
+            project_id (str): The project ID.
 
         Returns:
             Optional[str]: The chunk ID, or None if creation failed.
@@ -255,8 +255,8 @@ class NBaseImporter(ABC):
             async with self.rate_limiter_db:
                 async with self.get_session() as session:
                     node_id = await self.run_query_and_get_element_id(session,
-                        "CREATE (n:Chunk {elementId: $id, content: $content, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
-                        id=chunk_id, content=chunk, embedding=embedding, projectID=projectID
+                        "CREATE (n:Chunk {elementId: $id, content: $content, embedding: $embedding, project_id: $project_id}) RETURN elementId(n)",
+                        id=chunk_id, content=chunk, embedding=embedding, project_id=project_id
                     )
                     if node_id:
                         logger.info(f"Created chunk node {chunk_id} with embedding")
@@ -270,21 +270,21 @@ class NBaseImporter(ABC):
 
 
     @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=4, max=10))
-    async def create_chunk_relationship(self, chunk_id1: str, chunk_id2: str, projectID: str) -> None:
+    async def create_chunk_relationship(self, chunk_id1: str, chunk_id2: str, project_id: str) -> None:
         """
         Create a relationship between two chunks in the Neo4j database.
 
         Args:
             chunk_id1 (str): The ID of the first chunk.
             chunk_id2 (str): The ID of the second chunk.
-            projectID (str): The project ID.
+            project_id (str): The project ID.
         """
         try:
             async with self.rate_limiter_db:
                 async with self.get_session() as session:
                     result = await (await session.run(
-                        "MATCH (c1:Chunk {elementId: $id1, projectID: $projectID}), (c2:Chunk {elementId: $id2, projectID: $projectID}) CREATE (c1)-[:NEXT]->(c2)",
-                        id1=chunk_id1, id2=chunk_id2, projectID=projectID
+                        "MATCH (c1:Chunk {elementId: $id1, project_id: $project_id}), (c2:Chunk {elementId: $id2, project_id: $project_id}) CREATE (c1)-[:NEXT]->(c2)",
+                        id1=chunk_id1, id2=chunk_id2, project_id=project_id
                     )).consume()
                     if result:
                         logger.info(f"Created relationship between {chunk_id1} and {chunk_id2}")
@@ -295,7 +295,7 @@ class NBaseImporter(ABC):
             raise DatabaseError(f"Error creating chunk relationship: {e}")
 
 
-    async def handle_chunk_creation(self, chunk, inputPath, index, projectID):
+    async def handle_chunk_creation(self, chunk, inputPath, index, project_id):
         """
         Handle the creation of a chunk node.
 
@@ -303,13 +303,13 @@ class NBaseImporter(ABC):
             chunk: The text chunk.
             inputPath: The path to the input file.
             index: The index of the chunk.
-            projectID: The project ID.
+            project_id: The project ID.
 
         Returns:
             The chunk ID.
         """
         try:
-            chunk_id = await self.create_chunk_node(chunk, inputPath, index, projectID)
+            chunk_id = await self.create_chunk_node(chunk, inputPath, index, project_id)
             return chunk_id
         except Exception as e:
             logger.error(f"Error creating chunk node for chunk {index} in file {inputPath}: {e}")
@@ -319,7 +319,7 @@ class NFilesystemImporter(NBaseImporter):
     """
     A file importer that simply copies files to the output directory.
     """
-    async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, projectID: str) -> None:
+    async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a file by copying it to the output directory.
 
@@ -328,7 +328,7 @@ class NFilesystemImporter(NBaseImporter):
             inputLocation (str): The location of the input file.
             inputName (str): The name of the input file.
             currentOutputPath (str): The current output path.
-            projectID (str): The project ID.
+            project_id (str): The project ID.
         """
         if os.path.getsize(inputPath) > MAX_FILE_SIZE:
             logger.info(f"File {inputPath} skipped due to size.")
@@ -484,7 +484,7 @@ class NNeo4JImporter(NBaseImporter):
 #            raise
 
 
-    async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, projectID: str) -> None:
+    async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a file by determining its type and using the appropriate ingestion method.
 
@@ -494,14 +494,14 @@ class NNeo4JImporter(NBaseImporter):
         inputName:          sec2-v2.pdf
         topLevelOutputPath: /Users/au/.ngest/projects/02688845-0e74-4c5f-9b50-af4772dca5e3
         currentOutputPath:  /Users/au/.ngest/projects/02688845-0e74-4c5f-9b50-af4772dca5e3/blindsecp
-        projectID:          02688845-0e74-4c5f-9b50-af4772dca5e3
+        project_id:          02688845-0e74-4c5f-9b50-af4772dca5e3
 
         Args:
             inputPath (str): The path to the input file.
             inputLocation (str): The location of the input file.
             inputName (str): The name of the input file.
             currentOutputPath (str): The current output path.
-            projectID (str): The project ID.
+            project_id (str): The project ID.
         """
         def strip_top_level(inputPath, topLevelInputPath):
             # Ensure both paths are absolute and normalized
@@ -531,9 +531,9 @@ class NNeo4JImporter(NBaseImporter):
 #             1. projectsFolder:          "/Users/au/.ngest/projects"
 #                                                                  "/"
 #            PROJECT:  "blindsecp"
-#                projectID:                                         "02688845-0e74-4c5f-9b50-af4772dca5e3"
+#                project_id:                                         "02688845-0e74-4c5f-9b50-af4772dca5e3"
 #                topLevelOutputPath:      "/Users/au/.ngest/projects/02688845-0e74-4c5f-9b50-af4772dca5e3"
-#                topLevelOutputPath:           $projectsFolder     "/"           $projectID
+#                topLevelOutputPath:           $projectsFolder     "/"           $project_id
 #                projectsFolder:          "/Users/au/.ngest/projects"
 #                topLevelOutputPath:      "/Users/au/.ngest/projects/02688845-0e74-4c5f-9b50-af4772dca5e3"
 #             1. projectName: "blindsecp"                                                                "blindsecp"
@@ -543,18 +543,18 @@ class NNeo4JImporter(NBaseImporter):
 #                topLevelOutputPath:      "/Users/au/.ngest/projects/02688845-0e74-4c5f-9b50-af4772dca5e3"
 #                currentOutputPath:       "/Users/au/.ngest/projects/02688845-0e74-4c5f-9b50-af4772dca5e3/blindsecp"
 #                topLevelOutputPath:      "/Users/au/.ngest/projects/02688845-0e74-4c5f-9b50-af4772dca5e3"
-#                topLevelOutputPath:           $projectsFolder     "/"           $projectID
+#                topLevelOutputPath:           $projectsFolder     "/"           $project_id
 #                projectName:                                                                            "blindsecp"
-#                currentOutputPath:            $projectsFolder     "/"           $projectID             "/" $project_root
-#             3. projectID:                                         "02688845-0e74-4c5f-9b50-af4772dca5e3"
-#                topLevelOutputPath:           $projectsFolder     "/"           $projectID
+#                currentOutputPath:            $projectsFolder     "/"           $project_id             "/" $project_root
+#             3. project_id:                                         "02688845-0e74-4c5f-9b50-af4772dca5e3"
+#                topLevelOutputPath:           $projectsFolder     "/"           $project_id
 #                projectName:                                                                            "blindsecp"
 #             4. currentOutputPath:       "/Users/au/.ngest/projects/02688845-0e74-4c5f-9b50-af4772dca5e3/blindsecp"
-#                currentOutputPath:            $projectsFolder     "/"           $projectID             "/" $project_root
+#                currentOutputPath:            $projectsFolder     "/"           $project_id             "/" $project_root
 #             5. topLevelOutputPath:      "/Users/au/.ngest/projects/02688845-0e74-4c5f-9b50-af4772dca5e3"
-#                topLevelOutputPath:           $projectsFolder     "/"           $projectID
-#                currentOutputPath:            $projectsFolder     "/"           $projectID             "/blindsecp"
-#                currentOutputPath:            $projectsFolder     "/"           $projectID             "/" $project_root
+#                topLevelOutputPath:           $projectsFolder     "/"           $project_id
+#                currentOutputPath:            $projectsFolder     "/"           $project_id             "/blindsecp"
+#                currentOutputPath:            $projectsFolder     "/"           $project_id             "/" $project_root
 #                currentOutputPath:       "/Users/au/.ngest/projects/02688845-0e74-4c5f-9b50-af4772dca5e3/blindsecp"
 #             6. projectSummary:     "..."
 #             7. project_summary_embedding: [...]
@@ -580,7 +580,7 @@ class NNeo4JImporter(NBaseImporter):
 #                File extension:  "pdf"                                                                                    "pdf"
 #                topLevelOutputPath:     "/Users/au/.ngest/projects/02688845-0e74-4c5f-9b50-af4772dca5e3"
 #                currentOutputPath:      "/Users/au/.ngest/projects/02688845-0e74-4c5f-9b50-af4772dca5e3/blindsecp"
-#                projectID:                                        "02688845-0e74-4c5f-9b50-af4772dca5e3"
+#                project_id:                                        "02688845-0e74-4c5f-9b50-af4772dca5e3"
 #
 #                DOCUMENT
 #                Name: "blindsecp/sec2-v2.pdf"
@@ -601,7 +601,7 @@ class NNeo4JImporter(NBaseImporter):
                             filename=inputName,
                             full_path=localPath,
                             size_in_bytes=file_type['size_in_bytes'],
-                            project_id=projectID,
+                            project_id=project_id,
                             created_date=file_type['created_date'],
                             modified_date=file_type['modified_date'],
                             extension=file_type['extension'],
@@ -610,11 +610,11 @@ class NNeo4JImporter(NBaseImporter):
                         query, element_id = await document.generate_cypher_query(session)
                         document_id = await self.run_query_and_get_element_id(session, query, element_id=element_id)
 
-#                            "CREATE (n:PDF {name: $name, projectID: $projectID}) RETURN elementId(n)",
-#                            "CREATE (n:Document:PDF {name: $name, projectID: $projectID}) RETURN elementId(n)"
+#                            "CREATE (n:PDF {name: $name, project_id: $project_id}) RETURN elementId(n)",
+#                            "CREATE (n:Document:PDF {name: $name, project_id: $project_id}) RETURN elementId(n)"
                             
                 
-                await ingest_method(inputPath, inputLocation, inputName, currentOutputPath, projectID)
+                await ingest_method(inputPath, inputLocation, inputName, currentOutputPath, project_id)
             else:
                 logger.warning(f"No ingest method for file type: {file_type}")
         except Exception as e:
@@ -657,7 +657,7 @@ class NNeo4JImporter(NBaseImporter):
                 logger.error(f"Error summarizing text: {e}")
                 return ""
         
-    async def process_chunks(self, text, parent_node_id, parent_node_type, chunk_size, chunk_type, projectID):
+    async def process_chunks(self, text, parent_node_id, parent_node_type, chunk_size, chunk_type, project_id):
         """
         Process text chunks and create corresponding nodes in the Neo4j database.
 
@@ -667,13 +667,13 @@ class NNeo4JImporter(NBaseImporter):
             parent_node_type: The type of the parent node.
             chunk_size: The size of each chunk.
             chunk_type: The type of the chunk.
-            projectID: The project ID.
+            project_id: The project ID.
         """
         chunks = self.chunk_text(text, chunk_size)
         for i, chunk in enumerate(chunks):
-            await self.create_chunk_with_embedding(chunk, parent_node_id, parent_node_type, chunk_type, projectID)
+            await self.create_chunk_with_embedding(chunk, parent_node_id, parent_node_type, chunk_type, project_id)
 
-    async def create_chunk_with_embedding(self, chunk, parent_node_id, parent_node_type, chunk_type, projectID):
+    async def create_chunk_with_embedding(self, chunk, parent_node_id, parent_node_type, chunk_type, project_id):
         """
         Create a chunk node with embedding in the Neo4j database.
 
@@ -682,20 +682,20 @@ class NNeo4JImporter(NBaseImporter):
             parent_node_id: The ID of the parent node.
             parent_node_type: The type of the parent node.
             chunk_type: The type of the chunk.
-            projectID: The project ID.
+            project_id: The project ID.
         """
         try:
             async with self.rate_limiter_db:
                 async with self.get_session() as session:
                     chunk_id = await self.run_query_and_get_element_id(session,
-                        f"CREATE (n:{chunk_type} {{content: $content, type: $chunk_type, projectID: $projectID}}) RETURN elementId(n)",
-                        content=chunk, chunk_type=chunk_type, projectID=projectID
+                        f"CREATE (n:{chunk_type} {{content: $content, type: $chunk_type, project_id: $project_id}}) RETURN elementId(n)",
+                        content=chunk, chunk_type=chunk_type, project_id=project_id
                     )
                     await (await session.run(
-                        f"MATCH (p:{parent_node_type} {{elementId: $parent_node_id, projectID: $projectID}}) "
-                        f"MATCH (c:{chunk_type} {{elementId: $chunk_id, projectID: $projectID}}) "
+                        f"MATCH (p:{parent_node_type} {{elementId: $parent_node_id, project_id: $project_id}}) "
+                        f"MATCH (c:{chunk_type} {{elementId: $chunk_id, project_id: $project_id}}) "
                         f"CREATE (p)-[:HAS_CHUNK]->(c), (c)-[:PART_OF]->(p)",
-                        parent_node_id=parent_node_id, chunk_id=chunk_id, projectID=projectID
+                        parent_node_id=parent_node_id, chunk_id=chunk_id, project_id=project_id
                     )).consume()
         except Exception as e:
             logger.error(f"Error creating chunk during db query.")
@@ -713,14 +713,14 @@ class NNeo4JImporter(NBaseImporter):
             async with self.rate_limiter_db:
                 async with self.get_session() as session:
                     embedding_id = await self.run_query_and_get_element_id(session,
-                        "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', projectID: $projectID}) RETURN elementId(n)",
-                        embedding=embedding, projectID=projectID
+                        "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', project_id: $project_id}) RETURN elementId(n)",
+                        embedding=embedding, project_id=project_id
                     )
                     await (await session.run(
-                        f"MATCH (c:{chunk_type} {{elementId: $chunk_id, projectID: $projectID}}) "
-                        f"MATCH (e:Embedding {{elementId: $embedding_id, projectID: $projectID}}) "
+                        f"MATCH (c:{chunk_type} {{elementId: $chunk_id, project_id: $project_id}}) "
+                        f"MATCH (e:Embedding {{elementId: $embedding_id, project_id: $project_id}}) "
                         f"CREATE (c)-[:HAS_EMBEDDING]->(e)",
-                        chunk_id=chunk_id, embedding_id=embedding_id, projectID=projectID
+                        chunk_id=chunk_id, embedding_id=embedding_id, project_id=project_id
                     )).consume()
         except Exception as e:
             logger.error(f"Error storing chunk with embedding: {e}")
@@ -741,8 +741,8 @@ class NNeo4JImporter(NBaseImporter):
                 async with self.rate_limiter_db:
                     async with self.get_session() as session:
                         parent_doc_id = await self.run_query_and_get_element_id(session,
-                            "CREATE (n:Document {name: $name, type: 'text', projectID: $projectID}) RETURN elementId(n)",
-                            name=input_name, projectID=project_id
+                            "CREATE (n:Document {name: $name, type: 'text', project_id: $project_id}) RETURN elementId(n)",
+                            name=input_name, project_id=project_id
                         )
 
                 # This method likely contains multiple database operations,
@@ -822,17 +822,17 @@ class NNeo4JImporter(NBaseImporter):
             async with self.rate_limiter_db:
                 async with self.get_session() as session:
                     image_id = await self.run_query_and_get_element_id(session,
-                        "CREATE (n:Image {name: $name, type: 'image', projectID: $projectID}) RETURN elementId(n)",
-                        name=input_name, projectID=project_id
+                        "CREATE (n:Image {name: $name, type: 'image', project_id: $project_id}) RETURN elementId(n)",
+                        name=input_name, project_id=project_id
                     )
                     features_id = await self.run_query_and_get_element_id(session,
-                        "CREATE (n:ImageFeatures {features: $features, type: 'image_features', projectID: $projectID}) RETURN elementId(n)",
-                        features=features, projectID=project_id
+                        "CREATE (n:ImageFeatures {features: $features, type: 'image_features', project_id: $project_id}) RETURN elementId(n)",
+                        features=features, project_id=project_id
                     )
                     await (await session.run(
-                        "MATCH (i:Image), (f:ImageFeatures) WHERE elementId(i) = $image_id AND elementId(f) = $features_id AND i.projectID = $projectID AND f.projectID = $projectID "
+                        "MATCH (i:Image), (f:ImageFeatures) WHERE elementId(i) = $image_id AND elementId(f) = $features_id AND i.project_id = $project_id AND f.project_id = $project_id "
                         "CREATE (i)-[:HAS_FEATURES]->(f)",
-                        image_id=image_id, features_id=features_id, projectID=project_id).consume()
+                        image_id=image_id, features_id=features_id, project_id=project_id).consume()
                     )
         except Exception as e:
             logger.error(f"Error storing image features: {e}")
@@ -1016,19 +1016,19 @@ class NNeo4JImporter(NBaseImporter):
 
         return retval
 #
-#    async def IngestCpp(self, inputPath, inputLocation, inputName, currentOutputPath, projectID):
+#    async def IngestCpp(self, inputPath, inputLocation, inputName, currentOutputPath, project_id):
 #        try:
 #            async with self.get_session() as session:
 #                logger.info(f"Parsing file: {inputPath}")
 #                index = clang.cindex.Index.create()
 #                translation_unit = index.parse(inputPath)
 #                logger.info(f"File parsed successfully: {inputPath}")
-#                await self.process_nodes(session, translation_unit.cursor, inputLocation, projectID)
+#                await self.process_nodes(session, translation_unit.cursor, inputLocation, project_id)
 #        except Exception as e:
 #            logger.error(f"Error ingesting C++ file {inputPath}: {e}")
 #            raise FileProcessingError(f"Error ingesting C++ file {inputPath}: {e}")
 #
-#    async def process_nodes(self, session, node, project_path, projectID):
+#    async def process_nodes(self, session, node, project_path, project_id):
 #        for child in node.get_children():
 #            file_name = child.location.file.name if child.location.file else ''
 #            if project_path in file_name:
@@ -1049,7 +1049,7 @@ class NNeo4JImporter(NBaseImporter):
 #                    async with self.rate_limiter:
 #                        class_id = await self.run_query_and_get_element_id(session,
 #                            f"""
-#                            MERGE (n:{type_name} {{name: $name, projectID: $projectID}})
+#                            MERGE (n:{type_name} {{name: $name, project_id: $project_id}})
 #                            ON CREATE SET n.scope = $scope,
 #                                           n.short_name = $short_name,
 #                                           n.interface_summary = $interface_summary,
@@ -1064,7 +1064,7 @@ class NNeo4JImporter(NBaseImporter):
 #                            RETURN elementId(n)
 #                            """,
 #                            name=fully_qualified_name,
-#                            projectID=projectID,
+#                            project_id=project_id,
 #                            scope=class_scope,
 #                            short_name=cls.spelling,
 #                            interface_summary=interface_summary,
@@ -1084,7 +1084,7 @@ class NNeo4JImporter(NBaseImporter):
 #                            async with self.rate_limiter:
 #                                function_id = await self.run_query_and_get_element_id(session,
 #                                    """
-#                                    MERGE (n:Method {name: $name, projectID: $projectID})
+#                                    MERGE (n:Method {name: $name, project_id: $project_id})
 #                                    ON CREATE SET n.scope = $scope,
 #                                                  n.short_name = $short_name,
 #                                                  n.summary = $summary,
@@ -1099,19 +1099,19 @@ class NNeo4JImporter(NBaseImporter):
 #                                    name=full_func_name,
 #                                    summary=function_summary,
 #                                    embedding=function_embedding,
-#                                    projectID=projectID
+#                                    project_id=project_id
 #                                )
 #
 #                                await session.run(
-#                                    "MATCH (c) WHERE (elementId(c) = $class_id AND c:Class AND c.projectID = $projectID) "
-#                                    "OR (elementId(c) = $struct_id AND c:Struct AND c.projectID = $projectID) "
-#                                    "MATCH (f:Method) WHERE elementId(f) = $function_id AND f.projectID = $projectID "
+#                                    "MATCH (c) WHERE (elementId(c) = $class_id AND c:Class AND c.project_id = $project_id) "
+#                                    "OR (elementId(c) = $struct_id AND c:Struct AND c.project_id = $project_id) "
+#                                    "MATCH (f:Method) WHERE elementId(f) = $function_id AND f.project_id = $project_id "
 #                                    "MERGE (c)-[:HAS_METHOD]->(f) "
 #                                    "MERGE (f)-[:BELONGS_TO]->(c)",
-#                                    {"class_id": class_id, "struct_id": class_id, "function_id": function_id, "projectID": projectID}
+#                                    {"class_id": class_id, "struct_id": class_id, "function_id": function_id, "project_id": project_id}
 #                                )
 #
-#                    await self.process_nodes(session, child, project_path, projectID)
+#                    await self.process_nodes(session, child, project_path, project_id)
 #                    
 #                elif child.kind == clang.cindex.CursorKind.FUNCTION_DECL:
 #                    func = child
@@ -1122,7 +1122,7 @@ class NNeo4JImporter(NBaseImporter):
 #                    async with self.rate_limiter:
 #                        function_id = await self.run_query_and_get_element_id(session,
 #                            """
-#                            MERGE (n:Function {name: $name, projectID: $projectID})
+#                            MERGE (n:Function {name: $name, project_id: $project_id})
 #                            ON CREATE SET n.scope = $scope,
 #                                          n.short_name = $short_name,
 #                                          n.summary = $summary,
@@ -1137,14 +1137,14 @@ class NNeo4JImporter(NBaseImporter):
 #                            name=full_func_name,
 #                            summary=function_summary,
 #                            embedding=function_embedding,
-#                            projectID=projectID
+#                            project_id=project_id
 #                        )
 #                else:
 #                    #logger.warning(f"Something found: {child.spelling} at {file_name}")
 #                    # TODO?
-#                    await self.process_nodes(session, child, project_path, projectID)
+#                    await self.process_nodes(session, child, project_path, project_id)
     
-    async def IngestCpp(self, inputPath, inputLocation, inputName, currentOutputPath, projectID):
+    async def IngestCpp(self, inputPath, inputLocation, inputName, currentOutputPath, project_id):
         try:
 #            logger.info(f"Parsing file: {inputPath}")
             index = clang.cindex.Index.create()
@@ -1159,7 +1159,7 @@ class NNeo4JImporter(NBaseImporter):
                     async with self.lock_header_files:
                         self.header_files[inputPath] = file_contents
             
-            await self.process_nodes(translation_unit.cursor, inputLocation, projectID, inputPath.endswith('.cpp'))
+            await self.process_nodes(translation_unit.cursor, inputLocation, project_id, inputPath.endswith('.cpp'))
                 
         except Exception as e:
             logger.error(f"Error ingesting C++ file {inputPath}: {e}")
@@ -1178,7 +1178,7 @@ class NNeo4JImporter(NBaseImporter):
         async with self.lock_functions:  # Acquire the lock
             self.functions[full_name].update(details)
 
-    async def process_nodes(self, node, project_path, projectID, is_cpp_file):
+    async def process_nodes(self, node, project_path, project_id, is_cpp_file):
         def is_exported(node):
             # Example check for __declspec(dllexport) or visibility attribute
             for token in node.get_tokens():
@@ -1285,7 +1285,7 @@ class NNeo4JImporter(NBaseImporter):
                     }
                     await self.update_classes(fully_qualified_name, details)
                     
-                    await self.process_nodes(child, project_path, projectID, is_cpp_file)
+                    await self.process_nodes(child, project_path, project_id, is_cpp_file)
                     
                 elif child.kind == clang.cindex.CursorKind.CXX_METHOD:
                     type_name = "Method"
@@ -1374,7 +1374,7 @@ class NNeo4JImporter(NBaseImporter):
                         # Cache function information
                         await self.update_functions(fully_qualified_function_name, details)
                 else:
-                    await self.process_nodes(child, project_path, projectID, is_cpp_file)
+                    await self.process_nodes(child, project_path, project_id, is_cpp_file)
 
     def get_raw_code(self, node):
         # Extract raw code from the source node
@@ -1398,7 +1398,7 @@ class NNeo4JImporter(NBaseImporter):
         if self.progress_callback_store:
             await self.progress_callback_store(increment)
 
-    async def summarize_all_cpp(self, projectID):
+    async def summarize_all_cpp(self, project_id):
 #        logger.info("Starting summarization of collected data.")
         
         try:
@@ -1557,12 +1557,12 @@ class NNeo4JImporter(NBaseImporter):
 
 
 
-    async def store_all_cpp(self, projectID):
+    async def store_all_cpp(self, project_id):
         try:
             queue = asyncio.Queue()
 
             # Create a task to process the queue
-            process_task = asyncio.create_task(self.process_cpp_storage_queue(queue, projectID))
+            process_task = asyncio.create_task(self.process_cpp_storage_queue(queue, project_id))
 
 #            tasks = []
 
@@ -1608,18 +1608,18 @@ class NNeo4JImporter(NBaseImporter):
 
 
 
-    async def process_cpp_storage_queue(self, queue, projectID):
+    async def process_cpp_storage_queue(self, queue, project_id):
         while True:
             item = await queue.get()
             if item is None:
                 break
             item_type, name, info = item
             if item_type == 'Class':
-                await self.store_summary_cpp_class(name, info, projectID)
+                await self.store_summary_cpp_class(name, info, project_id)
             elif item_type == 'Method':
-                await self.store_summary_cpp_method(name, info, projectID)
+                await self.store_summary_cpp_method(name, info, project_id)
             elif item_type == 'Function':
-                await self.store_summary_cpp_function(name, info, projectID)
+                await self.store_summary_cpp_function(name, info, project_id)
             await self.update_progress_store(1)
             queue.task_done()
         
@@ -1644,7 +1644,7 @@ class NNeo4JImporter(NBaseImporter):
 
     """
 
-    async def store_summary_cpp_class(self, name, info, projectID):
+    async def store_summary_cpp_class(self, name, info, project_id):
         try:
 #            logger.error(f"In store_summary_cpp_class.\ninfo contents:\n{pprint.pformat(info, indent=4)}")
 
@@ -1662,7 +1662,7 @@ class NNeo4JImporter(NBaseImporter):
             raw_code = info.get('raw_code', '')
 
 #            logger.info(f"store_summary_cpp_class name: {name}")
-#            logger.info(f"store_summary_cpp_class projectID: {projectID}")
+#            logger.info(f"store_summary_cpp_class project_id: {project_id}")
 #            logger.info(f"store_summary_cpp_class scope: {scope}")
 #            logger.info(f"store_summary_cpp_class short_name: {short_name}")
 #            logger.info(f"store_summary_cpp_class interface_summary:\n{interface_summary}")
@@ -1671,7 +1671,7 @@ class NNeo4JImporter(NBaseImporter):
 #            logger.info(f"store_summary_cpp_class raw_code: {raw_code}")
 
             query = """
-                MERGE (n:{type} {{name: $name, projectID: $projectID}})
+                MERGE (n:{type} {{name: $name, project_id: $project_id}})
                 ON CREATE SET n.scope = $scope,
                               n.short_name = $short_name,
                               n.interface_summary = $interface_summary,
@@ -1690,7 +1690,7 @@ class NNeo4JImporter(NBaseImporter):
             """.format(type=type_name)
             params = {
                 'name': name if name else 'anonymous',
-                'projectID': projectID if projectID else 'Unknown',
+                'project_id': project_id if project_id else 'Unknown',
                 'scope': scope,
                 'short_name': short_name,
                 'interface_summary': interface_summary,
@@ -1719,7 +1719,7 @@ class NNeo4JImporter(NBaseImporter):
 
 
 
-    async def store_summary_cpp_method(self, name, info, projectID):
+    async def store_summary_cpp_method(self, name, info, project_id):
         try:
 #            logger.error(f"In store_summary_cpp_method.\ninfo contents:\n{pprint.pformat(info, indent=4)}")
             
@@ -1735,7 +1735,7 @@ class NNeo4JImporter(NBaseImporter):
             raw_code = info.get('raw_code', '')
 
             query = """
-                MERGE (n:{type} {{name: $name, projectID: $projectID}})
+                MERGE (n:{type} {{name: $name, project_id: $project_id}})
                 ON CREATE SET n.scope = $scope,
                               n.short_name = $short_name,
                               n.summary = $summary,
@@ -1749,7 +1749,7 @@ class NNeo4JImporter(NBaseImporter):
             """.format(type=type_name)
             params = {
                 'name': name if name is not None else 'Unknown',
-                'projectID': projectID if projectID is not None else 'Unknown',
+                'project_id': project_id if project_id is not None else 'Unknown',
                 'scope': scope,
                 'short_name': short_name,
                 'summary': summary,
@@ -1770,12 +1770,12 @@ class NNeo4JImporter(NBaseImporter):
                     if element_id:
                         await (await session.run(
                             "MATCH (c) "
-                            "WHERE (c.name = $scope AND c:Class AND c.projectID = $projectID) "
-                            "OR (c.name = $scope AND c:Struct AND c.projectID = $projectID) "
-                            "MATCH (f:Method) WHERE elementId(f) = $element_id AND f.projectID = $projectID "
+                            "WHERE (c.name = $scope AND c:Class AND c.project_id = $project_id) "
+                            "OR (c.name = $scope AND c:Struct AND c.project_id = $project_id) "
+                            "MATCH (f:Method) WHERE elementId(f) = $element_id AND f.project_id = $project_id "
                             "MERGE (c)-[:HAS_METHOD]->(f) "
                             "MERGE (f)-[:BELONGS_TO]->(c)",
-                            {"name": name, "scope": scope, "element_id": element_id, "projectID": projectID}
+                            {"name": name, "scope": scope, "element_id": element_id, "project_id": project_id}
                         )).consume()
                        
                         logger.info(f"Finished storing CPP method: {name}")
@@ -1788,7 +1788,7 @@ class NNeo4JImporter(NBaseImporter):
 
 
 
-    async def store_summary_cpp_function(self, name, info, projectID):
+    async def store_summary_cpp_function(self, name, info, project_id):
         try:
 #            logger.error(f"In store_summary_cpp_function.\ninfo contents:\n{pprint.pformat(info, indent=4)}")
 
@@ -1804,7 +1804,7 @@ class NNeo4JImporter(NBaseImporter):
             raw_code = info.get('raw_code', '')
 
             query = """
-                MERGE (n:{type} {{name: $name, projectID: $projectID}})
+                MERGE (n:{type} {{name: $name, project_id: $project_id}})
                 ON CREATE SET n.scope = $scope,
                               n.short_name = $short_name,
                               n.summary = $summary,
@@ -1818,7 +1818,7 @@ class NNeo4JImporter(NBaseImporter):
             """.format(type=type_name)
             params = {
                 'name': name if name is not None else 'anonymous',
-                'projectID': projectID if projectID is not None else 'Unknown',
+                'project_id': project_id if project_id is not None else 'Unknown',
                 'scope': scope,
                 'short_name': short_name,
                 'summary': summary,
@@ -1850,7 +1850,7 @@ class NNeo4JImporter(NBaseImporter):
         return "::".join(reversed(scopes))
 
     
-    async def IngestPython(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
+    async def IngestPython(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a Python file by parsing it, summarizing classes and functions, and storing them in the database.
 
@@ -1859,7 +1859,7 @@ class NNeo4JImporter(NBaseImporter):
             inputLocation (str): The location of the input file.
             inputName (str): The name of the input file.
             currentOutputPath (str): The current output path.
-            projectID (str): The project ID.
+            project_id (str): The project ID.
         """
         try:
             async with aiofiles.open(inputPath, 'r') as file:
@@ -1876,8 +1876,8 @@ class NNeo4JImporter(NBaseImporter):
                 async with self.rate_limiter_db:
                     async with self.get_session() as session:
                         class_id = await self.run_query_and_get_element_id(session,
-                            "CREATE (n:Class {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
-                            name=cls.name, summary=class_summary, embedding=embedding, projectID=projectID
+                            "CREATE (n:Class {name: $name, summary: $summary, embedding: $embedding, project_id: $project_id}) RETURN elementId(n)",
+                            name=cls.name, summary=class_summary, embedding=embedding, project_id=project_id
                         )
 
                 for func in cls.body:
@@ -1888,14 +1888,14 @@ class NNeo4JImporter(NBaseImporter):
                         async with self.rate_limiter_db:
                             async with self.get_session() as session:
                                 function_id = await self.run_query_and_get_element_id(session,
-                                    "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
-                                    name=func.name, summary=function_summary, embedding=embedding, projectID=projectID
+                                    "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, project_id: $project_id}) RETURN elementId(n)",
+                                    name=func.name, summary=function_summary, embedding=embedding, project_id=project_id
                                 )
                                 await (await session.run(
-                                    "MATCH (c:Class {elementId: $class_id, projectID: $projectID}) "
-                                    "MATCH (f:Function {elementId: $function_id, projectID: $projectID}) "
+                                    "MATCH (c:Class {elementId: $class_id, project_id: $project_id}) "
+                                    "MATCH (f:Function {elementId: $function_id, project_id: $project_id}) "
                                     "CREATE (c)-[:HAS_METHOD]->(f)",
-                                    class_id=class_id, function_id=function_id, projectID=projectID
+                                    class_id=class_id, function_id=function_id, project_id=project_id
                                 )).consume()
 
             for func in functions:
@@ -1905,8 +1905,8 @@ class NNeo4JImporter(NBaseImporter):
                 async with self.rate_limiter_db:
                     async with self.get_session() as session:
                         await (await session.run(
-                            "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID})",
-                            name=func.name, summary=function_summary, embedding=embedding, projectID=projectID
+                            "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, project_id: $project_id})",
+                            name=func.name, summary=function_summary, embedding=embedding, project_id=project_id
                         )).consume()
         except Exception as e:
             logger.error(f"Error ingesting Python file {inputPath}: {e}")
@@ -1940,7 +1940,7 @@ class NNeo4JImporter(NBaseImporter):
         description = f"Function {func.name} with arguments: {', '.join(arg.arg for arg in func.args.args)}. It performs the following tasks: "
         return await self.do_summarize_text(description)
 
-    async def IngestRust(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
+    async def IngestRust(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a Rust file by parsing it, summarizing implementations and functions, and storing them in the database.
 
@@ -1949,7 +1949,7 @@ class NNeo4JImporter(NBaseImporter):
             inputLocation (str): The location of the input file.
             inputName (str): The name of the input file.
             currentOutputPath (str): The current output path.
-            projectID (str): The project ID.
+            project_id (str): The project ID.
         """
         try:
             async with aiofiles.open(inputPath, 'r') as file:
@@ -1965,8 +1965,8 @@ class NNeo4JImporter(NBaseImporter):
                 async with self.rate_limiter_db:
                     async with self.get_session() as session:
                         impl_id = await self.run_query_and_get_element_id(session,
-                            "CREATE (n:Impl {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
-                            name=impl.trait_.path.segments[0].ident, summary=impl_summary, embedding=embedding, projectID=projectID
+                            "CREATE (n:Impl {name: $name, summary: $summary, embedding: $embedding, project_id: $project_id}) RETURN elementId(n)",
+                            name=impl.trait_.path.segments[0].ident, summary=impl_summary, embedding=embedding, project_id=project_id
                         )
 
                 for item in impl.items:
@@ -1977,14 +1977,14 @@ class NNeo4JImporter(NBaseImporter):
                         async with self.rate_limiter_db:
                             async with self.get_session() as session:
                                 function_id = await self.run_query_and_get_element_id(session,
-                                    "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
-                                    name=item.sig.ident, summary=function_summary, embedding=embedding, projectID=projectID
+                                    "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, project_id: $project_id}) RETURN elementId(n)",
+                                    name=item.sig.ident, summary=function_summary, embedding=embedding, project_id=project_id
                                 )
                                 await (await session.run(
-                                    "MATCH (i:Impl {elementId: $impl_id, projectID: $projectID}), "
-                                    "MATCH (f:Function {elementId: $function_id, projectID: $projectID}) "
+                                    "MATCH (i:Impl {elementId: $impl_id, project_id: $project_id}), "
+                                    "MATCH (f:Function {elementId: $function_id, project_id: $project_id}) "
                                     "CREATE (i)-[:HAS_METHOD]->(f)",
-                                    impl_id=impl_id, function_id=function_id, projectID=projectID
+                                    impl_id=impl_id, function_id=function_id, project_id=project_id
                                 )).consume()
 
             for func in functions:
@@ -1994,8 +1994,8 @@ class NNeo4JImporter(NBaseImporter):
                 async with self.rate_limiter_db:
                     async with self.get_session() as session:
                         await (await session.run(
-                            "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID})",
-                            name=func.sig.ident, summary=function_summary, embedding=embedding, projectID=projectID
+                            "CREATE (n:Function {name: $name, summary: $summary, embedding: $embedding, project_id: $project_id})",
+                            name=func.sig.ident, summary=function_summary, embedding=embedding, project_id=project_id
                         )).consume()
         except Exception as e:
             logger.error(f"Error ingesting Rust file {inputPath}: {e}")
@@ -2077,7 +2077,7 @@ class NNeo4JImporter(NBaseImporter):
         description += ", ".join(methods)
         return await self.do_summarize_text(description)
 
-    async def IngestJavascript(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
+    async def IngestJavascript(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a JavaScript file by parsing it, summarizing classes, functions, and variables, and storing them in the database.
 
@@ -2086,7 +2086,7 @@ class NNeo4JImporter(NBaseImporter):
             inputLocation (str): The location of the input file.
             inputName (str): The name of the input file.
             currentOutputPath (str): The current output path.
-            projectID (str): The project ID.
+            project_id (str): The project ID.
         """
         try:
             async with aiofiles.open(inputPath, 'r') as file:
@@ -2101,22 +2101,22 @@ class NNeo4JImporter(NBaseImporter):
                 async with self.rate_limiter_db:
                     async with self.get_session() as session:
                         file_id = await self.run_query_and_get_element_id(session,
-                            "CREATE (n:JavaScriptFile {name: $name, path: $path, projectID: $projectID}) RETURN elementId(n)",
-                            name=inputName, path=inputPath, projectID=projectID
+                            "CREATE (n:JavaScriptFile {name: $name, path: $path, project_id: $project_id}) RETURN elementId(n)",
+                            name=inputName, path=inputPath, project_id=project_id
                         )
 
                 for node in ast.body:
                     if isinstance(node, nodes.FunctionDeclaration):
-                        await self.process_js_function(node, file_id, projectID)
+                        await self.process_js_function(node, file_id, project_id)
                     elif isinstance(node, nodes.ClassDeclaration):
-                        await self.process_js_class(node, file_id, projectID)
+                        await self.process_js_class(node, file_id, project_id)
                     elif isinstance(node, nodes.VariableDeclaration):
-                        await self.process_js_variable(node, file_id, projectID)
+                        await self.process_js_variable(node, file_id, project_id)
             except Exception as e:
                 logger.error(f"Error ingesting JavaScript file {inputPath}: {e}")
                 raise DatabaseError(f"Error ingesting JavaScript file {inputPath}: {e}")
 
-    async def process_js_function(self, func_node, file_id: int, projectID: str) -> None:
+    async def process_js_function(self, func_node, file_id: int, project_id: str) -> None:
         func_name = func_node.id.name if func_node.id else 'anonymous'
         func_summary = await self.summarize_js_function(func_node)
         
@@ -2126,20 +2126,20 @@ class NNeo4JImporter(NBaseImporter):
             async with self.rate_limiter_db:
                 async with self.get_session() as session:
                     func_db_id = await self.run_query_and_get_element_id(session,
-                        "CREATE (n:JavaScriptFunction {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
-                        name=func_name, summary=func_summary, embedding=embedding, projectID=projectID
+                        "CREATE (n:JavaScriptFunction {name: $name, summary: $summary, embedding: $embedding, project_id: $project_id}) RETURN elementId(n)",
+                        name=func_name, summary=func_summary, embedding=embedding, project_id=project_id
                     )
 
                     await (await session.run(
-                        "MATCH (f:JavaScriptFile {elementId: $file_id, projectID: $projectID}), (func:JavaScriptFunction {elementId: $func_id, projectID: $projectID}) "
+                        "MATCH (f:JavaScriptFile {elementId: $file_id, project_id: $project_id}), (func:JavaScriptFunction {elementId: $func_id, project_id: $project_id}) "
                         "CREATE (f)-[:CONTAINS]->(func)",
-                        file_id=file_id, func_id=func_db_id, projectID=projectID
+                        file_id=file_id, func_id=func_db_id, project_id=project_id
                     )).consume()
         except Exception as e:
             logger.error(f"Error processing JavaScript function {func_name}: {e}")
             raise DatabaseError(f"Error processing JavaScript function {func_name}: {e}")
 
-    async def process_js_class(self, class_node, file_id: int, projectID: str) -> None:
+    async def process_js_class(self, class_node, file_id: int, project_id: str) -> None:
         class_name = class_node.id.name
         class_summary = await self.summarize_js_class(class_node)
         
@@ -2149,24 +2149,24 @@ class NNeo4JImporter(NBaseImporter):
             async with self.rate_limiter_db:
                 async with self.get_session() as session:
                     class_db_id = await self.run_query_and_get_element_id(session,
-                        "CREATE (n:JavaScriptClass {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
-                        name=class_name, summary=class_summary, embedding=embedding, projectID=projectID
+                        "CREATE (n:JavaScriptClass {name: $name, summary: $summary, embedding: $embedding, project_id: $project_id}) RETURN elementId(n)",
+                        name=class_name, summary=class_summary, embedding=embedding, project_id=project_id
                     )
 
                     await (await session.run(
-                        "MATCH (f:JavaScriptFile {elementId: $file_id, projectID: $projectID}), (c:JavaScriptClass {elementId: $class_id, projectID: $projectID}) "
+                        "MATCH (f:JavaScriptFile {elementId: $file_id, project_id: $project_id}), (c:JavaScriptClass {elementId: $class_id, project_id: $project_id}) "
                         "CREATE (f)-[:CONTAINS]->(c)",
-                        file_id=file_id, class_id=class_db_id, projectID=projectID
+                        file_id=file_id, class_id=class_db_id, project_id=project_id
                     )).consume()
 
             for method in class_node.body.body:
                 if isinstance(method, nodes.MethodDefinition):
-                    await self.process_js_method(method, class_db_id, projectID)
+                    await self.process_js_method(method, class_db_id, project_id)
         except Exception as e:
             logger.error(f"Error processing JavaScript class {class_name}: {e}")
             raise DatabaseError(f"Error processing JavaScript class {class_name}: {e}")
 
-    async def process_js_variable(self, var_node, file_id: int, projectID: str) -> None:
+    async def process_js_variable(self, var_node, file_id: int, project_id: str) -> None:
         for declaration in var_node.declarations:
             var_name = declaration.id.name
             var_type = var_node.kind  # 'var', 'let', or 'const'
@@ -2178,27 +2178,27 @@ class NNeo4JImporter(NBaseImporter):
                 async with self.rate_limiter_db:
                     async with self.get_session() as session:
                         var_db_id = await self.run_query_and_get_element_id(session,
-                            "CREATE (n:JavaScriptVariable {name: $name, type: $type, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
-                            name=var_name, type=var_type, summary=var_summary, embedding=embedding, projectID=projectID
+                            "CREATE (n:JavaScriptVariable {name: $name, type: $type, summary: $summary, embedding: $embedding, project_id: $project_id}) RETURN elementId(n)",
+                            name=var_name, type=var_type, summary=var_summary, embedding=embedding, project_id=project_id
                         )
 
                         await (await session.run(
-                            "MATCH (f:JavaScriptFile {elementId: $file_id, projectID: $projectID}), (v:JavaScriptVariable {elementId: $var_id, projectID: $projectID}) "
+                            "MATCH (f:JavaScriptFile {elementId: $file_id, project_id: $project_id}), (v:JavaScriptVariable {elementId: $var_id, project_id: $project_id}) "
                             "CREATE (f)-[:CONTAINS]->(v)",
-                            file_id=file_id, var_id=var_db_id, projectID=projectID
+                            file_id=file_id, var_id=var_db_id, project_id=project_id
                         )).consume()
             except Exception as e:
                 logger.error(f"Error processing JavaScript variable {var_name}: {e}")
                 raise DatabaseError(f"Error processing JavaScript variable {var_name}: {e}")
 
-    async def process_js_method(self, method_node, class_id: int, projectID: str) -> None:
+    async def process_js_method(self, method_node, class_id: int, project_id: str) -> None:
         """
         Process a JavaScript method node and create nodes in the database.
 
         Args:
             method_node: The method node.
             class_id: The class ID.
-            projectID: The project ID.
+            project_id: The project ID.
         """
         method_name = method_node.key.name
         method_summary = await self.summarize_js_function(method_node.value)
@@ -2209,14 +2209,14 @@ class NNeo4JImporter(NBaseImporter):
             async with self.rate_limiter_db:
                 async with self.get_session() as session:
                     method_db_id = await self.run_query_and_get_element_id(session,
-                        "CREATE (n:JavaScriptMethod {name: $name, summary: $summary, embedding: $embedding, projectID: $projectID}) RETURN elementId(n)",
-                        name=method_name, summary=method_summary, embedding=embedding, projectID=projectID
+                        "CREATE (n:JavaScriptMethod {name: $name, summary: $summary, embedding: $embedding, project_id: $project_id}) RETURN elementId(n)",
+                        name=method_name, summary=method_summary, embedding=embedding, project_id=project_id
                     )
 
                     await (await session.run(
-                        "MATCH (c:JavaScriptClass {elementId: $class_id, projectID: $projectID}), (m:JavaScriptMethod {elementId: $method_id, projectID: $projectID}) "
+                        "MATCH (c:JavaScriptClass {elementId: $class_id, project_id: $project_id}), (m:JavaScriptMethod {elementId: $method_id, project_id: $project_id}) "
                         "CREATE (c)-[:HAS_METHOD]->(m)",
-                        class_id=class_id, method_id=method_db_id, projectID=projectID
+                        class_id=class_id, method_id=method_db_id, project_id=project_id
                     )).consume()
         except Exception as e:
             logger.error(f"Error processing JavaScript method {method_name}: {e}")
@@ -2238,7 +2238,7 @@ class NNeo4JImporter(NBaseImporter):
 
 
 ## RESUME
-    async def IngestPdf(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, projectID: str) -> None:
+    async def IngestPdf(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, project_id: str) -> None:
         try:
             reader = PdfReader(inputPath)
             num_pages = len(reader.pages)
@@ -2246,8 +2246,8 @@ class NNeo4JImporter(NBaseImporter):
             async with self.rate_limiter_db:
                 async with self.get_session() as session:
                     pdf_id = await self.run_query_and_get_element_id(session,
-                        "CREATE (n:PDF {name: $name, pages: $pages, projectID: $projectID}) RETURN elementId(n)",
-                        name=inputName, pages=num_pages, projectID=projectID
+                        "CREATE (n:PDF {name: $name, pages: $pages, project_id: $project_id}) RETURN elementId(n)",
+                        name=inputName, pages=num_pages, project_id=project_id
                     )
 
             for i in range(num_pages):
@@ -2259,17 +2259,17 @@ class NNeo4JImporter(NBaseImporter):
                     async with self.rate_limiter_db:
                         async with self.get_session() as session:
                             medium_chunk_id = await self.run_query_and_get_element_id(session,
-                                "CREATE (n:MediumChunk {content: $content, type: 'medium_chunk', page: $page, projectID: $projectID}) RETURN elementId(n)",
-                                content=medium_chunk, page=i + 1, projectID=projectID
+                                "CREATE (n:MediumChunk {content: $content, type: 'medium_chunk', page: $page, project_id: $project_id}) RETURN elementId(n)",
+                                content=medium_chunk, page=i + 1, project_id=project_id
                             )
 
                             if medium_chunk_id:
                                 await (await session.run(
-                                    "MATCH (p:PDF) WHERE (elementId(p) = $pdf_id AND p.projectID = $projectID) "
-                                    "MATCH (m:MediumChunk) WHERE (elementId(m) = $medium_chunk_id AND m.projectID = $projectID) "
+                                    "MATCH (p:PDF) WHERE (elementId(p) = $pdf_id AND p.project_id = $project_id) "
+                                    "MATCH (m:MediumChunk) WHERE (elementId(m) = $medium_chunk_id AND m.project_id = $project_id) "
                                     "MERGE (p)-[:HAS_CHUNK]->(m) "
                                     "MERGE (m)-[:BELONGS_TO]->(p)",
-                                    {"pdf_id": pdf_id, "medium_chunk_id": medium_chunk_id, "projectID": projectID}
+                                    {"pdf_id": pdf_id, "medium_chunk_id": medium_chunk_id, "project_id": project_id}
                                 )).consume()
 
                     small_chunks = self.chunk_text(medium_chunk, SMALL_CHUNK_SIZE)
@@ -2277,17 +2277,17 @@ class NNeo4JImporter(NBaseImporter):
                         async with self.rate_limiter_db:
                             async with self.get_session() as session:
                                 small_chunk_id = await self.run_query_and_get_element_id(session,
-                                    "CREATE (n:SmallChunk {content: $content, type: 'small_chunk', page: $page, projectID: $projectID}) RETURN elementId(n)",
-                                    content=small_chunk, page=i + 1, projectID=projectID
+                                    "CREATE (n:SmallChunk {content: $content, type: 'small_chunk', page: $page, project_id: $project_id}) RETURN elementId(n)",
+                                    content=small_chunk, page=i + 1, project_id=project_id
                                 )
 
                                 if small_chunk_id:
                                     await (await session.run(
-                                        "MATCH (m:MediumChunk) WHERE (elementId(m) = $medium_chunk_id AND m.projectID = $projectID) "
-                                        "MATCH (s:SmallChunk) WHERE (elementId(s) = $small_chunk_id AND s.projectID = $projectID) "
+                                        "MATCH (m:MediumChunk) WHERE (elementId(m) = $medium_chunk_id AND m.project_id = $project_id) "
+                                        "MATCH (s:SmallChunk) WHERE (elementId(s) = $small_chunk_id AND s.project_id = $project_id) "
                                         "MERGE (m)-[:HAS_CHUNK]->(s) "
                                         "MERGE (s)-[:BELONGS_TO]->(m)",
-                                        {"small_chunk_id": small_chunk_id, "medium_chunk_id": medium_chunk_id, "projectID": projectID}
+                                        {"small_chunk_id": small_chunk_id, "medium_chunk_id": medium_chunk_id, "project_id": project_id}
                                     )).consume()
 
                         embedding = await self.make_embedding(small_chunk)
@@ -2295,22 +2295,22 @@ class NNeo4JImporter(NBaseImporter):
                         async with self.rate_limiter_db:
                             async with self.get_session() as session:
                                 embedding_id = await self.run_query_and_get_element_id(session,
-                                    "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', projectID: $projectID}) RETURN elementId(n)",
-                                    embedding=embedding, projectID=projectID
+                                    "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', project_id: $project_id}) RETURN elementId(n)",
+                                    embedding=embedding, project_id=project_id
                                 )
 
                                 if embedding_id:
                                     await (await session.run(
-                                        "MATCH (p:PDF) WHERE (elementId(p) = $pdf_id AND p.projectID = $projectID) "
-                                        "MATCH (m:MediumChunk) WHERE (elementId(m) = $medium_chunk_id AND m.projectID = $projectID) "
-                                        "MATCH (s:SmallChunk) WHERE (elementId(s) = $small_chunk_id AND s.projectID = $projectID) "
-                                        "MATCH (e:Embedding) WHERE (elementId(e) = $embedding_id AND e.projectID = $projectID) "
+                                        "MATCH (p:PDF) WHERE (elementId(p) = $pdf_id AND p.project_id = $project_id) "
+                                        "MATCH (m:MediumChunk) WHERE (elementId(m) = $medium_chunk_id AND m.project_id = $project_id) "
+                                        "MATCH (s:SmallChunk) WHERE (elementId(s) = $small_chunk_id AND s.project_id = $project_id) "
+                                        "MATCH (e:Embedding) WHERE (elementId(e) = $embedding_id AND e.project_id = $project_id) "
                                         "MERGE (s)-[:HAS_EMBEDDING]->(e) "
                                         "MERGE (e)-[:IS_EMBEDDING_OF]->(s) "
                                         "MERGE (e)-[:HAS_PARENT_CHUNK]->(m) "
                                         "MERGE (e)-[:HAS_PARENT_DOC]->(p) "
                                         "",
-                                        {"pdf_id": pdf_id, "medium_chunk_id": medium_chunk_id, "small_chunk_id": small_chunk_id, "embedding_id": embedding_id, "projectID": projectID}
+                                        {"pdf_id": pdf_id, "medium_chunk_id": medium_chunk_id, "small_chunk_id": small_chunk_id, "embedding_id": embedding_id, "project_id": project_id}
                                     )).consume()
 
         except Exception as e:
@@ -2345,9 +2345,9 @@ class NIngest:
     """
     Manages the ingestion process, counting files, handling directories, and updating or deleting projects.
     """
-    def __init__(self, projectID: str, importer: NBaseImporter = NNeo4JImporter()):
-        self.projectID = projectID
-        self.currentOutputPath = os.path.expanduser(f"~/.ngest/projects/{self.projectID}")
+    def __init__(self, project_id: str, importer: NBaseImporter = NNeo4JImporter()):
+        self.project_id = project_id
+        self.currentOutputPath = os.path.expanduser(f"~/.ngest/projects/{self.project_id}")
         
         self.progress_bar_scan = None
         self.progress_bar_summarize = None
@@ -2584,23 +2584,23 @@ class NIngest:
                 total += await self.count_files(entry.path)
         return total
     
-    async def cleanup_partial_ingestion(self, projectID: str):
+    async def cleanup_partial_ingestion(self, project_id: str):
         """
         Clean up partial ingestion by removing all nodes and relationships related to the project.
 
         Args:
-            projectID (str): The project ID.
+            project_id (str): The project ID.
         """
         async with self.importer_.get_session() as session:
             try:
                 await (await session.run(
-                    "MATCH (n) WHERE n.projectID = $projectID "
+                    "MATCH (n) WHERE n.project_id = $project_id "
                     "DETACH DELETE n",
-                    projectID=self.projectID
+                    project_id=self.project_id
                 )).consume()
-                logger.info(f"Cleaned up partial ingestion for project {self.projectID}")
+                logger.info(f"Cleaned up partial ingestion for project {self.project_id}")
             except Exception as e:
-                logger.error(f"Error during cleanup for project {self.projectID}: {e}")
+                logger.error(f"Error during cleanup for project {self.project_id}: {e}")
 
 
 ## RESUME
@@ -2653,17 +2653,17 @@ class NIngest:
 ## RESUME need to pass localPath to IngestDirectory
 
             if inputType == 'd':
-                tasks.append(self.IngestDirectory(inputPath=inputPath, inputLocation=inputLocation, inputName=inputName, topLevelInputPath=topLevelInputPath, topLevelOutputPath=topLevelOutputPath, currentOutputPath=currentOutputPath, projectID=self.projectID))
+                tasks.append(self.IngestDirectory(inputPath=inputPath, inputLocation=inputLocation, inputName=inputName, topLevelInputPath=topLevelInputPath, topLevelOutputPath=topLevelOutputPath, currentOutputPath=currentOutputPath, project_id=self.project_id))
             else:
                 if not self.should_ignore_file(inputPath):
-                    tasks.append(self.IngestFile(inputPath=inputPath, inputLocation=inputLocation, inputName=inputName, topLevelInputPath=topLevelInputPath, topLevelOutputPath=topLevelOutputPath, currentOutputPath=currentOutputPath, projectID=self.projectID))
+                    tasks.append(self.IngestFile(inputPath=inputPath, inputLocation=inputLocation, inputName=inputName, topLevelInputPath=topLevelInputPath, topLevelOutputPath=topLevelOutputPath, currentOutputPath=currentOutputPath, project_id=self.project_id))
 
 #            logger.info("Gathering scanning tasks...")
             # Wait for all ingestion tasks to complete
             await asyncio.gather(*tasks)
         except Exception as e:
             logger.error(f"Error during ingestion in Ingest: {e}")
-            await self.cleanup_partial_ingestion(self.projectID)
+            await self.cleanup_partial_ingestion(self.project_id)
             return -1
         # -------------------------------------------------------------------
         # Phase 2: Summarizing and Embedding CPP files
@@ -2689,11 +2689,11 @@ class NIngest:
             # -------------------------------------------------------------------
 #                logger.info("Starting summarization of CPP files...")
                 try:
-                    await self.importer_.summarize_all_cpp(self.projectID)
+                    await self.importer_.summarize_all_cpp(self.project_id)
                     self.summarized_cpp_finished = True
                 except Exception as e:
                     logger.error(f"Error during CPP summarization in Ingest: {e}")
-                    await self.cleanup_partial_ingestion(self.projectID)
+                    await self.cleanup_partial_ingestion(self.project_id)
                     return -1
     #                logger.info("CPP summarization complete. Next, storing to database...")
         # -------------------------------------------------------------------
@@ -2720,13 +2720,13 @@ class NIngest:
 #                    raise FileProcessingError(f"Error updating summarization and storing progress bars: {e}")
 
                     try:
-                        await self.importer_.store_all_cpp(self.projectID)
+                        await self.importer_.store_all_cpp(self.project_id)
                         self.stored_cpp_finished = True
     #                        logger.info("Batching to DB of CPP files is complete.")
                         return 0
                     except Exception as e:
                         logger.error(f"Error during CPP storing in Ingest: {e}")
-                        await self.cleanup_partial_ingestion(self.projectID)
+                        await self.cleanup_partial_ingestion(self.project_id)
                         return -1
         # -------------------------------------------------------------------
         return 0
@@ -2756,22 +2756,22 @@ class NIngest:
 #
 #            inputLocation, inputName = os.path.split(inputPath)
 #            if inputType == 'd':
-#                await self.IngestDirectory(inputPath=inputPath, inputLocation=inputLocation, inputName=inputName, currentOutputPath=currentOutputPath, projectID=self.projectID)
+#                await self.IngestDirectory(inputPath=inputPath, inputLocation=inputLocation, inputName=inputName, currentOutputPath=currentOutputPath, project_id=self.project_id)
 #            else:
 #                if not self.should_ignore_file(inputPath):
-#                    await self.IngestFile(inputPath=inputPath, inputLocation=inputLocation, inputName=inputName, currentOutputPath=currentOutputPath, projectID=self.projectID)
+#                    await self.IngestFile(inputPath=inputPath, inputLocation=inputLocation, inputName=inputName, currentOutputPath=currentOutputPath, project_id=self.project_id)
 ##                    if self.progress_bar:
 ##                        self.progress_bar.update(1)
 #                        
-#            await self.importer_.finalize_ingestion('projectID')
+#            await self.importer_.finalize_ingestion('project_id')
 #            return 0
 #        
 #        except Exception as e:
 #            logger.error(f"Error during ingestion in Ingest: {e}")
-#            await self.cleanup_partial_ingestion(self.projectID)
+#            await self.cleanup_partial_ingestion(self.project_id)
 #            return -1
 
-    async def IngestDirectory(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, projectID: str) -> None:
+    async def IngestDirectory(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a directory by recursively processing its contents.
 
@@ -2780,7 +2780,7 @@ class NIngest:
             inputLocation (str): The location of the input directory.
             inputName (str): The name of the input directory.
             currentOutputPath (str): The current output path.
-            projectID (str): The project ID.
+            project_id (str): The project ID.
         """
         newOutputPath = os.path.join(currentOutputPath, inputName)
         os.makedirs(newOutputPath, exist_ok=True)
@@ -2792,7 +2792,7 @@ class NIngest:
                 tasks.append(self.Ingest(itemPath, topLevelInputPath, topLevelOutputPath, newOutputPath))
         await asyncio.gather(*tasks)
 
-    async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, projectID: str) -> None:
+    async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a single file.
 
@@ -2801,9 +2801,9 @@ class NIngest:
             inputLocation (str): The location of the input file.
             inputName (str): The name of the input file.
             currentOutputPath (str): The current output path.
-            projectID (str): The project ID.
+            project_id (str): The project ID.
         """
-        await self.importer_.IngestFile(inputPath, inputLocation, inputName, topLevelInputPath, topLevelOutputPath, currentOutputPath, projectID)
+        await self.importer_.IngestFile(inputPath, inputLocation, inputName, topLevelInputPath, topLevelOutputPath, currentOutputPath, project_id)
 
     def should_ignore_file(self, file_path: str) -> bool:
         """
@@ -2842,12 +2842,12 @@ class NIngest:
                 patterns = [line.strip() for line in f if line.strip() and not line.startswith('#')]
         return patterns
 
-    async def update_project(self, projectID: str, inputPath: str) -> int:
+    async def update_project(self, project_id: str, inputPath: str) -> int:
         """
         Update a project with new files.
 
         Args:
-            projectID (str): The project ID.
+            project_id (str): The project ID.
             inputPath (str): The path to the new files.
 
         Returns:
@@ -2856,37 +2856,37 @@ class NIngest:
         # Implement project update logic here
         pass
 
-    async def delete_project(self, projectID: str) -> int:
+    async def delete_project(self, project_id: str) -> int:
         """
         Delete a project by removing all related data and files.
 
         Args:
-            projectID (str): The project ID.
+            project_id (str): The project ID.
 
         Returns:
             int: The result of the deletion process.
         """
         try:
             # Delete from database
-            await self.cleanup_partial_ingestion(projectID)
+            await self.cleanup_partial_ingestion(project_id)
             
             # Delete project directory
-            project_path = os.path.expanduser(f"~/.ngest/projects/{projectID}")
+            project_path = os.path.expanduser(f"~/.ngest/projects/{project_id}")
             if os.path.exists(project_path):
                 shutil.rmtree(project_path)
             
-            logger.info(f"Project {projectID} deleted successfully")
+            logger.info(f"Project {project_id} deleted successfully")
             return 0
         except Exception as e:
-            logger.error(f"Error deleting project {projectID}: {e}")
+            logger.error(f"Error deleting project {project_id}: {e}")
             return -1
 
-    async def export_project(self, projectID: str, outputPath: str) -> int:
+    async def export_project(self, project_id: str, outputPath: str) -> int:
         """
         Export a project to a JSON file.
 
         Args:
-            projectID (str): The project ID.
+            project_id (str): The project ID.
             outputPath (str): The path to the output file.
 
         Returns:
@@ -2895,9 +2895,9 @@ class NIngest:
         try:
             async with self.importer_.get_session() as session:
                 result = await (await session.run(
-                    "MATCH (n) WHERE n.projectID = $projectID "
+                    "MATCH (n) WHERE n.project_id = $project_id "
                     "RETURN n",
-                    projectID=projectID
+                    project_id=project_id
                 )).consume()
                 
                 nodes = await result.data()
@@ -2905,10 +2905,10 @@ class NIngest:
                 with open(outputPath, 'w') as f:
                     json.dump(nodes, f)
                 
-            logger.info(f"Project {projectID} exported successfully to {outputPath}")
+            logger.info(f"Project {project_id} exported successfully to {outputPath}")
             return 0
         except Exception as e:
-            logger.error(f"Error exporting project {projectID}: {e}")
+            logger.error(f"Error exporting project {project_id}: {e}")
             return -1
 
 def preprocess_text(text: str) -> str:
@@ -2965,7 +2965,7 @@ class ProjectManager:
         """
         async with self.ingest_semaphore:
             project_id = str(uuid.uuid4())
-            ingest_instance = NIngest(projectID=project_id)
+            ingest_instance = NIngest(project_id=project_id)
             result = await ingest_instance.start_ingestion(input_path)
             if result == 0:
 #                await ingest_instance.importer_.closeDB()
@@ -2976,7 +2976,7 @@ class ProjectManager:
 
     async def update_project(self, project_id: str, input_path: str) -> int:
         """
-        Update an existing project with new files.
+        Update an existing project with new/deleted/updated files.
 
         Args:
             project_id (str): The project ID.
@@ -2986,7 +2986,7 @@ class ProjectManager:
             int: The result of the update process.
         """
         async with self.ingest_semaphore:
-            ingest_instance = NIngest(projectID=project_id)
+            ingest_instance = NIngest(project_id=project_id)
             return await ingest_instance.update_project(project_id, input_path)
 
     async def delete_project(self, project_id: str) -> int:
@@ -3000,7 +3000,7 @@ class ProjectManager:
             int: The result of the deletion process.
         """
         async with self.ingest_semaphore:
-            ingest_instance = NIngest(projectID=project_id)
+            ingest_instance = NIngest(project_id=project_id)
             return await ingest_instance.delete_project(project_id)
 
     async def export_project(self, project_id: str, export_path: str) -> int:
@@ -3015,7 +3015,7 @@ class ProjectManager:
             int: The result of the export process.
         """
         async with self.ingest_semaphore:
-            ingest_instance = NIngest(projectID=project_id)
+            ingest_instance = NIngest(project_id=project_id)
             return await ingest_instance.export_project(project_id, export_path)
 
 async def main():
@@ -3062,7 +3062,7 @@ class TestNIngest(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
         self.project_id = str(uuid.uuid4())
-        self.ningest = NIngest(projectID=self.project_id)
+        self.ningest = NIngest(project_id=self.project_id)
 
     def tearDown(self):
         shutil.rmtree(self.test_dir)
