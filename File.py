@@ -3,6 +3,7 @@
 
 from neo4j import GraphDatabase
 from datetime import datetime
+from neo4j.exceptions import Neo4jError
 
 class File:
     def __init__(self, filename, full_path, size_in_bytes, project_id, created_date=None, modified_date=None, extension=None):
@@ -13,64 +14,58 @@ class File:
         self.created_date = created_date or datetime.now().isoformat()
         self.modified_date = modified_date or datetime.now().isoformat()
         self.extension = extension or self.get_extension(filename)
+        self.id = f"{project_id}/{full_path}"
 
     @staticmethod
     def get_extension(filename):
         return filename.split('.')[-1] if '.' in filename else ''
 
-    async def generate_cypher_query(self, session):
-        element_id = await self.get_element_id_by_project_and_path(session, self.project_id, self.full_path)
-        if element_id:
-            query = f"""
-            MATCH (n:File) WHERE elementId(n) = '{element_id}'
-            SET n.filename = '{self.filename}',
-                n.full_path = '{self.full_path}',
-                n.size_in_bytes = {self.size_in_bytes},
-                n.project_id = '{self.project_id}',
-                n.created_date = '{self.created_date}',
-                n.modified_date = '{self.modified_date}',
-                n.extension = '{self.extension}'
-            RETURN elementId(n)
-            """
-        else:
-            query = f"""
-            CREATE (n:File {{
-                filename: '{self.filename}',
-                full_path: '{self.full_path}',
-                size_in_bytes: {self.size_in_bytes},
-                project_id: '{self.project_id}',
-                created_date: '{self.created_date}',
-                modified_date: '{self.modified_date}',
-                extension: '{self.extension}'
-            }})
-            RETURN elementId(n)
-            """
-        return query, element_id
+    @staticmethod
+    async def create_in_database(session, filename, full_path, size_in_bytes, project_id, created_date=None, modified_date=None, extension=None):
+        file = File(filename, full_path, size_in_bytes, project_id, created_date, modified_date, extension)
+        query = """
+        MERGE (f:File {id: $id})
+        SET f.filename = $filename,
+            f.full_path = $full_path,
+            f.size_in_bytes = $size_in_bytes,
+            f.project_id = $project_id,
+            f.created_date = $created_date,
+            f.modified_date = $modified_date,
+            f.extension = $extension
+        RETURN f
+        """
+        try:
+            result = await session.run(query,
+                id=file.id,
+                filename=file.filename,
+                full_path=file.full_path,
+                size_in_bytes=file.size_in_bytes,
+                project_id=file.project_id,
+                created_date=file.created_date,
+                modified_date=file.modified_date,
+                extension=file.extension
+            )
+            record = await result.single()
+            if record:
+                return file
+            return None
+        except Neo4jError as e:
+            print(f"Error creating file in database: {e}")
+            return None
 
     @staticmethod
     async def retrieve_from_database(session, project_id, full_path):
-        element_id = await File.get_element_id_by_project_and_path(session, project_id, full_path)
-        if not element_id:
-            return None
+        file_id = f"{project_id}/{full_path}"
         query = """
-        MATCH (n:File) WHERE elementId(n) = $element_id
-        RETURN n.filename AS filename, n.full_path AS full_path, n.size_in_bytes AS size_in_bytes,
-               n.project_id AS project_id, n.created_date AS created_date, n.modified_date AS modified_date, n.extension AS extension
+        MATCH (f:File {id: $id})
+        RETURN f
         """
-        result = await session.run(query, element_id=element_id)
+        result = await session.run(query, id=file_id)
         record = await result.single()
         if record:
-            return File(record["filename"], record["full_path"], record["size_in_bytes"],
-                        record["project_id"], record["created_date"], record["modified_date"], record["extension"])
-        return None
-    @staticmethod
-    async def get_element_id_by_project_and_path(session, project_id, full_path):
-        query = """
-        MATCH (n:File) WHERE n.project_id = $project_id AND n.full_path = $full_path
-        RETURN elementId(n) AS element_id
-        """
-        result = await session.run(query, project_id=project_id, full_path=full_path)
-        record = await result.single()
-        if record:
-            return record["element_id"]
+            node = record["f"]
+            return File(
+                node["filename"], node["full_path"], node["size_in_bytes"],
+                node["project_id"], node["created_date"], node["modified_date"], node["extension"]
+            )
         return None

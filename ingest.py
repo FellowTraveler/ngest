@@ -171,6 +171,8 @@ class NBaseImporter(ABC):
                 type_name = 'image'
             elif file_type == 'application/pdf':
                 type_name = 'pdf'
+            elif ext == '.txt':
+                type_name = 'text'
             else:
                 type_name = 'unknown'
 
@@ -416,7 +418,6 @@ class NNeo4JImporter(NBaseImporter):
     def set_progress_callback_store_start(self, callback):
         self.progress_callback_store_start = callback
 
-
     async def add_file_path(self, path: str):
         async with self.file_paths_lock:
             self.file_paths.append(path)
@@ -491,14 +492,6 @@ class NNeo4JImporter(NBaseImporter):
     async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a file by determining its type and using the appropriate ingestion method.
-
-        Completed scanning for:
-        inputPath:          /Users/au/src/blindsecp/sec2-v2.pdf
-        inputLocation:      /Users/au/src/blindsecp
-        inputName:          sec2-v2.pdf
-        topLevelOutputPath: /Users/au/.ngest/projects/02688845-0e74-4c5f-9b50-af4772dca5e3
-        currentOutputPath:  /Users/au/.ngest/projects/02688845-0e74-4c5f-9b50-af4772dca5e3/blindsecp
-        project_id:          02688845-0e74-4c5f-9b50-af4772dca5e3
 
         Args:
             inputPath (str): The path to the input file.
