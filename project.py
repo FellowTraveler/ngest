@@ -43,8 +43,6 @@ class Project:
             print(f"Error creating project in database: {e}")
             return None
 
-    # ... rest of the class remains the same ...
-
     @staticmethod
     async def update_in_database(session, project_id):
         modified_date = datetime.now().isoformat()
