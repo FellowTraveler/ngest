@@ -1,3 +1,6 @@
+# Copyright 2024 Chris Odom
+# MIT License
+
 from neo4j import GraphDatabase
 from datetime import datetime
 

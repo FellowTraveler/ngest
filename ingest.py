@@ -48,6 +48,10 @@ from collections import defaultdict
 import copy
 import pprint
 
+from Project import Project
+from File import File
+from Document import Document
+
 # Load environment variables
 dotenv.load_dotenv()
 
@@ -596,7 +600,6 @@ class NNeo4JImporter(NBaseImporter):
 #                
                 async with self.rate_limiter_db:
                     async with self.get_session() as session:
-                        from Document import Document
                         document = Document(
                             filename=inputName,
                             full_path=localPath,
@@ -2345,9 +2348,8 @@ class NIngest:
     """
     Manages the ingestion process, counting files, handling directories, and updating or deleting projects.
     """
-    def __init__(self, project_id: str, importer: NBaseImporter = NNeo4JImporter()):
+    def __init__(self, project_id: Optional[str] = None, importer: NBaseImporter = NNeo4JImporter()):
         self.project_id = project_id
-        self.currentOutputPath = os.path.expanduser(f"~/.ngest/projects/{self.project_id}")
         
         self.progress_bar_scan = None
         self.progress_bar_summarize = None
@@ -2381,11 +2383,21 @@ class NIngest:
 
         self.total_files = 0
 
-        if not os.path.exists(self.currentOutputPath):
-            os.makedirs(self.currentOutputPath, exist_ok=True)
-            open(os.path.join(self.currentOutputPath, '.ngest_index'), 'a').close()
-            logger.info(f"Created new project directory at {self.currentOutputPath}")
-
+        # NIngest class gets instantiated in the edge case where we're only listing the
+        # existing projects in the DB, and not actually ingesting anything. So why do we
+        # instantiate it? Because all our DB code was originally written in this class, so
+        # it's easier to use it, even though it's ugly to a coder's eyes. Once we have this
+        # script working well enough that we can use it to graph itself, then hopefully soon
+        # we can autocode a refactor for this ugliness. Todo.
+        if project_id is not None:
+            self.currentOutputPath = os.path.expanduser(f"~/.ngest/projects/{self.project_id}")
+            if not os.path.exists(self.currentOutputPath):
+                os.makedirs(self.currentOutputPath, exist_ok=True)
+                open(os.path.join(self.currentOutputPath, '.ngest_index'), 'a').close()
+                logger.info(f"Created new project directory at {self.currentOutputPath}")
+        else:
+            self.currentOutputPath = None
+            
     def validate_input_path(self, input_path: str) -> bool:
         if not os.path.exists(input_path):
             logger.error(f"Input path does not exist: {input_path}")
@@ -2512,8 +2524,13 @@ class NIngest:
             logger.info(f"Starting ingestion from inputPath: {inputPath}")
             # Starting ingestion from inputPath: /Users/au/src/blindsecp
 
-    
             try:
+                async with self.importer_.get_session() as session:
+                    project = await Project.create_in_database(session, self.project_id, project_root, description=f"Project created from {inputPath}")
+                    if not project:
+                        logger.error("Failed to create project in database")
+                        return -1
+
                 self.gitignore_patterns = self.load_gitignore_patterns(inputPath)
 
                 if not os.path.exists(self.currentOutputPath):
@@ -2945,54 +2962,50 @@ async def read_file_in_chunks(file_path: str, chunk_size: int = 1024) -> AsyncGe
         logger.error(f"Error reading file {file_path}: {e}")
         return
 
+"""
+Provides a high-level interface for managing projects, including creating, updating, deleting, and exporting projects.
+"""
 class ProjectManager:
-
     def __init__(self):
         self.ingest_semaphore = asyncio.Semaphore(1)
 
-    """
-    Provides a high-level interface for managing projects, including creating, updating, deleting, and exporting projects.
-    """
-    async def create_or_update_project(self, input_path: str) -> str:
-        async with self.ingest_semaphore:
-            folder_name = os.path.basename(os.path.normpath(input_path))
-            project = Project()
-            async with project.driver.session() as session:
-                project_id = await project.get_project_id_by_folder_name(session, folder_name)
-                if project_id:
-                    ingest_instance = NIngest(project_id=project_id)
-                    result = await ingest_instance.update_project(project_id, input_path)
-                    if result == 0:
-                        return project_id
-                    else:
-                        raise Exception("Failed to update project")
-                else:
-                    project_id = str(uuid.uuid4())
-                    ingest_instance = NIngest(project_id=project_id)
-                    result = await ingest_instance.start_ingestion(input_path)
-                    if result == 0:
-                        return project_id
-                    else:
-                        raise Exception("Failed to create project")
+    async def list_projects(self) -> List[Dict[str, str]]:
         """
-        Create a new project.
-
-        Args:
-            input_path (str): The path to the input files.
+        List all projects in the database.
 
         Returns:
-            str: The project ID.
+            List[Dict[str, str]]: A list of dictionaries containing project information.
         """
+        try:
+            async with self.ingest_semaphore:
+                ingest_instance = NIngest(project_id=None)  # We don't need a specific project ID for listing
+                async with ingest_instance.importer_.get_session() as session:
+                    result = await session.run(
+                        "MATCH (p:Project) RETURN p.project_id AS id, p.name AS name, p.created_at AS created_at"
+                    )
+                    projects = await result.data()
+                return projects
+        except Exception as e:
+            logger.error(f"Error listing projects: {e}")
+            raise
+            
+    async def create_project(self, input_path: str) -> str:
         async with self.ingest_semaphore:
             project_id = str(uuid.uuid4())
             ingest_instance = NIngest(project_id=project_id)
-            result = await ingest_instance.start_ingestion(input_path)
-            if result == 0:
-#                await ingest_instance.importer_.closeDB()
-                return project_id
-
-            else:
-                raise Exception("Failed to create project")
+            
+            try:
+                result = await ingest_instance.start_ingestion(input_path)
+                if result == 0:
+                    logger.info(f"Project created and ingestion started successfully. Project ID: {project_id}")
+                    return project_id
+                else:
+                    raise Exception("Failed to start project ingestion")
+            except Exception as e:
+                logger.error(f"Error creating project or starting ingestion: {e}")
+                # Clean up any partial ingestion
+                await ingest_instance.cleanup_partial_ingestion(project_id)
+                raise
 
     async def update_project(self, project_id: str, input_path: str) -> int:
         """
@@ -3039,11 +3052,8 @@ class ProjectManager:
             return await ingest_instance.export_project(project_id, export_path)
 
 async def main():
-    """
-    Main function to handle command-line arguments and execute the appropriate action.
-    """
-    parser = argparse.ArgumentParser(description='Ingest files into Neo4j database')
-    parser.add_argument('action', choices=['create', 'update', 'delete', 'export'], help='Action to perform')
+    parser = argparse.ArgumentParser(description='Manage projects in Neo4j database')
+    parser.add_argument('action', choices=['create', 'update', 'delete', 'export', 'list'], help='Action to perform')
     parser.add_argument('--input_path', type=str, help='Path to file or directory to ingest')
     parser.add_argument('--project_id', type=str, help='Project ID for update, delete, or export actions')
     parser.add_argument('--export_path', type=str, help='Output path for export action')
@@ -3056,7 +3066,7 @@ async def main():
             if not args.input_path:
                 raise ValueError("input_path is required for create action")
             project_id = await project_manager.create_project(args.input_path)
-            print(f"Project created successfully. Project ID: {project_id}")
+            print(f"Project created and ingestion started successfully. Project ID: {project_id}")
         elif args.action == 'update':
             if not args.project_id or not args.input_path:
                 raise ValueError("Both project_id and input_path are required for update action")
@@ -3072,9 +3082,18 @@ async def main():
                 raise ValueError("Both project_id and export_path are required for export action")
             result = await project_manager.export_project(args.project_id, args.export_path)
             print(f"Project export {'succeeded' if result == 0 else 'failed'}")
+        elif args.action == 'list':
+            projects = await project_manager.list_projects()
+            if projects:
+                print("Projects:")
+                for project in projects:
+                    print(f"ID: {project['id']}, Name: {project['name']}, Created: {project['created_at']}")
+            else:
+                print("No projects found.")
     except Exception as e:
         print(f"An error occurred: {e}")
 
+    
 class TestNIngest(unittest.TestCase):
     """
     Unit tests for the NIngest class.
