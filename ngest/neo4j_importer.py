@@ -1820,6 +1820,11 @@ class NNeo4JImporter(NBaseImporter):
                             )).consume()
 
                 small_chunks = self.chunk_text(medium_chunk, SMALL_CHUNK_SIZE)
+                
+                # Handle edge case: if no small chunks, create one with the entire medium chunk content
+                if not small_chunks:
+                    small_chunks = [medium_chunk]
+
                 for k, small_chunk in enumerate(small_chunks):
                     embedding = await self.make_embedding(small_chunk)
                     
@@ -1840,94 +1845,7 @@ class NNeo4JImporter(NBaseImporter):
                                     "MERGE (s)-[:HAS_PARENT_DOC]->(p)",
                                     {"pdf_id": pdf_id, "medium_chunk_id": medium_chunk_id, "small_chunk_id": small_chunk_id}
                                 )).consume()
-
-
                                 
-#    async def IngestPdf(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
-#        try:
-#            reader = PdfReader(inputPath)
-#            num_pages = len(reader.pages)
-#
-#            # Extract metadata
-#            metadata = reader.metadata
-#            author = metadata.get('/Author', 'Unknown')
-#            title = metadata.get('/Title', inputName)
-#
-#            async with self.rate_limiter_db:
-#                async with self.get_session() as session:
-#                    pdf = await PDF.create_in_database(session=session, project_id=project_id, full_path=localPath, page_count=num_pages, author=author, title=title)
-#                    if pdf:
-#                        pdf_id = pdf.id
-#                    else:
-#                        print("Failed to create PDF")
-#            # TODO: the above if/else needs to call the below code as a separate function.
-#            for i in range(num_pages):
-#                page = reader.pages[i]
-#                text = page.extract_text()
-#
-#                medium_chunks = self.chunk_text(text, MEDIUM_CHUNK_SIZE)
-#                for j, medium_chunk in enumerate(medium_chunks):
-#                    async with self.rate_limiter_db:
-#                        async with self.get_session() as session:
-#                            medium_chunk_id = await self.run_query_and_get_element_id(session,
-#                                "CREATE (n:MediumChunk {content: $content, type: 'medium_chunk', page: $page, project_id: $project_id}) RETURN elementId(n)",
-#                                content=medium_chunk, page=i + 1, project_id=project_id
-#                            )
-#
-#                            if medium_chunk_id:
-#                                await (await session.run(
-#                                    "MATCH (p:PDF) WHERE (elementId(p) = $pdf_id AND p.project_id = $project_id) "
-#                                    "MATCH (m:MediumChunk) WHERE (elementId(m) = $medium_chunk_id AND m.project_id = $project_id) "
-#                                    "MERGE (p)-[:HAS_CHUNK]->(m) "
-#                                    "MERGE (m)-[:BELONGS_TO]->(p)",
-#                                    {"pdf_id": pdf_id, "medium_chunk_id": medium_chunk_id, "project_id": project_id}
-#                                )).consume()
-#
-#                    small_chunks = self.chunk_text(medium_chunk, SMALL_CHUNK_SIZE)
-#                    for k, small_chunk in enumerate(small_chunks):
-#                        async with self.rate_limiter_db:
-#                            async with self.get_session() as session:
-#                                small_chunk_id = await self.run_query_and_get_element_id(session,
-#                                    "CREATE (n:SmallChunk {content: $content, type: 'small_chunk', page: $page, project_id: $project_id}) RETURN elementId(n)",
-#                                    content=small_chunk, page=i + 1, project_id=project_id
-#                                )
-#
-#                                if small_chunk_id:
-#                                    await (await session.run(
-#                                        "MATCH (m:MediumChunk) WHERE (elementId(m) = $medium_chunk_id AND m.project_id = $project_id) "
-#                                        "MATCH (s:SmallChunk) WHERE (elementId(s) = $small_chunk_id AND s.project_id = $project_id) "
-#                                        "MERGE (m)-[:HAS_CHUNK]->(s) "
-#                                        "MERGE (s)-[:BELONGS_TO]->(m)",
-#                                        {"small_chunk_id": small_chunk_id, "medium_chunk_id": medium_chunk_id, "project_id": project_id}
-#                                    )).consume()
-#
-#                        embedding = await self.make_embedding(small_chunk)
-#                            
-#                        async with self.rate_limiter_db:
-#                            async with self.get_session() as session:
-#                                embedding_id = await self.run_query_and_get_element_id(session,
-#                                    "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', project_id: $project_id}) RETURN elementId(n)",
-#                                    embedding=embedding, project_id=project_id
-#                                )
-#
-#                                if embedding_id:
-#                                    await (await session.run(
-#                                        "MATCH (p:PDF) WHERE (elementId(p) = $pdf_id AND p.project_id = $project_id) "
-#                                        "MATCH (m:MediumChunk) WHERE (elementId(m) = $medium_chunk_id AND m.project_id = $project_id) "
-#                                        "MATCH (s:SmallChunk) WHERE (elementId(s) = $small_chunk_id AND s.project_id = $project_id) "
-#                                        "MATCH (e:Embedding) WHERE (elementId(e) = $embedding_id AND e.project_id = $project_id) "
-#                                        "MERGE (s)-[:HAS_EMBEDDING]->(e) "
-#                                        "MERGE (e)-[:IS_EMBEDDING_OF]->(s) "
-#                                        "MERGE (e)-[:HAS_PARENT_CHUNK]->(m) "
-#                                        "MERGE (e)-[:HAS_PARENT_DOC]->(p) "
-#                                        "",
-#                                        {"pdf_id": pdf_id, "medium_chunk_id": medium_chunk_id, "small_chunk_id": small_chunk_id, "embedding_id": embedding_id, "project_id": project_id}
-#                                    )).consume()
-#
-#        except Exception as e:
-#            logger.error(f"Error ingesting PDF file {inputPath}: {e}")
-#            raise FileProcessingError(f"Error ingesting PDF file {inputPath}: {e}")
-
     async def getFileAndCppCount(self) -> tuple[int, int]:
         try:
             async with self.lock_classes:

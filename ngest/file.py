@@ -32,6 +32,10 @@ class File:
             f.created_date = $created_date,
             f.modified_date = $modified_date,
             f.extension = $extension
+        WITH f
+        MERGE (p:Project {id: $project_id})
+        MERGE (p)-[:HAS_FILE]->(f)
+        MERGE (f)-[:BELONGS_TO]->(p)
         RETURN f
         """
         try:
@@ -52,7 +56,7 @@ class File:
         except Neo4jError as e:
             print(f"Error creating file in database: {e}")
             return None
-
+            
     @staticmethod
     async def retrieve_from_database(session, project_id, full_path):
         file_id = f"{project_id}/{full_path}"
