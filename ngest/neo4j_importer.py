@@ -36,6 +36,7 @@ from ngest.base_importer import NBaseImporter
 from ngest.project import Project
 from ngest.file import File
 from ngest.document import Document
+from ngest.pdf import PDF
 
 # Load environment variables
 dotenv.load_dotenv()
@@ -98,7 +99,7 @@ class NNeo4JImporter(NBaseImporter):
         self.neo4j_user = neo4j_user
         self.neo4j_password = neo4j_password
         self.driver = AsyncGraphDatabase.driver(self.neo4j_url, auth=(self.neo4j_user, self.neo4j_password))
-        logger.info(f"Neo4J importer initialized with URL {neo4j_url}")
+        logger.info(f"Neo4J initialized with URL {neo4j_url}")
 
         self.device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
         
@@ -111,8 +112,8 @@ class NNeo4JImporter(NBaseImporter):
         self.summarizer = pipeline("summarization", model="google/pegasus-xsum", device=self.device)
 #        self.summarizer = pipeline("summarization", model="facebook/bart-large-cnn", device=self.device)
 
-        self.image_model = models.densenet121(pretrained=True).to(self.device)
-        self.image_model.eval()
+#        self.image_model = models.densenet121(pretrained=True).to(self.device)
+#        self.image_model.eval()
         
         self.tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
         self.code_model = AutoModel.from_pretrained("microsoft/codebert-base").to(self.device)
@@ -372,7 +373,7 @@ class NNeo4JImporter(NBaseImporter):
                             return -1
                         document_id = document.id
 
-                await ingest_method(inputPath, inputLocation, inputName, currentOutputPath, project_id)
+                await ingest_method(inputPath, inputLocation, inputName, localPath, currentOutputPath, project_id)
             else:
                 logger.warning(f"No ingest method for file type: {file_type['type']}, inputPath: {inputPath}")
         except Exception as e:
@@ -483,7 +484,7 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Error storing chunk with embedding: {e}")
             raise DatabaseError(f"Error storing chunk with embedding: {e}")
 
-    async def IngestText(self, input_path: str, input_location: str, input_name: str, current_output_path: str, project_id: str) -> None:
+    async def IngestText(self, input_path: str, input_location: str, input_name: str, localPath: str, current_output_path: str, project_id: str) -> None:
             try:
                 # File reading operation - doesn't need rate limiting
                 async with aiofiles.open(input_path, 'r') as file:
@@ -534,7 +535,7 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Error extracting image features: {e}")
             raise FileProcessingError(f"Error extracting image features: {e}")
 
-    async def IngestImg(self, input_path: str, input_location: str, input_name: str, current_output_path: str, project_id: str) -> None:
+    async def IngestImg(self, input_path: str, input_location: str, input_name: str, localPath: str, current_output_path: str, project_id: str) -> None:
         """
         Ingest an image file by extracting features and creating nodes in the database.
 
@@ -769,7 +770,7 @@ class NNeo4JImporter(NBaseImporter):
 
         return retval
 
-    async def IngestCpp(self, inputPath, inputLocation, inputName, currentOutputPath, project_id):
+    async def IngestCpp(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str):
         try:
             index = clang.cindex.Index.create()
             translation_unit = index.parse(inputPath)
@@ -1387,7 +1388,7 @@ class NNeo4JImporter(NBaseImporter):
             current = current.semantic_parent
         return "::".join(reversed(scopes))
 
-    async def IngestPython(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, project_id: str) -> None:
+    async def IngestPython(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a Python file by parsing it, summarizing classes and functions, and storing them in the database.
 
@@ -1477,7 +1478,7 @@ class NNeo4JImporter(NBaseImporter):
         description = f"Function {func.name} with arguments: {', '.join(arg.arg for arg in func.args.args)}. It performs the following tasks: "
         return await self.do_summarize_text(description)
 
-    async def IngestRust(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, project_id: str) -> None:
+    async def IngestRust(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a Rust file by parsing it, summarizing implementations and functions, and storing them in the database.
 
@@ -1613,7 +1614,7 @@ class NNeo4JImporter(NBaseImporter):
         description += ", ".join(methods)
         return await self.do_summarize_text(description)
 
-    async def IngestJavascript(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, project_id: str) -> None:
+    async def IngestJavascript(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a JavaScript file by parsing it, summarizing classes, functions, and variables, and storing them in the database.
 
@@ -1771,84 +1772,161 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Error running query: {query}")
             raise DatabaseError(f"Error running query: {e}")
 
-    async def IngestPdf(self, inputPath: str, inputLocation: str, inputName: str, currentOutputPath: str, project_id: str) -> None:
+    async def IngestPdf(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
         try:
             reader = PdfReader(inputPath)
             num_pages = len(reader.pages)
 
+            # Extract metadata
+            metadata = reader.metadata
+            author = metadata.get('/Author', 'Unknown')
+            title = metadata.get('/Title', inputName)
+
             async with self.rate_limiter_db:
                 async with self.get_session() as session:
-                    pdf_id = await self.run_query_and_get_element_id(session,
-                        "CREATE (n:PDF {name: $name, pages: $pages, project_id: $project_id}) RETURN elementId(n)",
-                        name=inputName, pages=num_pages, project_id=project_id
-                    )
-
-            for i in range(num_pages):
-                page = reader.pages[i]
-                text = page.extract_text()
-
-                medium_chunks = self.chunk_text(text, MEDIUM_CHUNK_SIZE)
-                for j, medium_chunk in enumerate(medium_chunks):
-                    async with self.rate_limiter_db:
-                        async with self.get_session() as session:
-                            medium_chunk_id = await self.run_query_and_get_element_id(session,
-                                "CREATE (n:MediumChunk {content: $content, type: 'medium_chunk', page: $page, project_id: $project_id}) RETURN elementId(n)",
-                                content=medium_chunk, page=i + 1, project_id=project_id
-                            )
-
-                            if medium_chunk_id:
-                                await (await session.run(
-                                    "MATCH (p:PDF) WHERE (elementId(p) = $pdf_id AND p.project_id = $project_id) "
-                                    "MATCH (m:MediumChunk) WHERE (elementId(m) = $medium_chunk_id AND m.project_id = $project_id) "
-                                    "MERGE (p)-[:HAS_CHUNK]->(m) "
-                                    "MERGE (m)-[:BELONGS_TO]->(p)",
-                                    {"pdf_id": pdf_id, "medium_chunk_id": medium_chunk_id, "project_id": project_id}
-                                )).consume()
-
-                    small_chunks = self.chunk_text(medium_chunk, SMALL_CHUNK_SIZE)
-                    for k, small_chunk in enumerate(small_chunks):
-                        async with self.rate_limiter_db:
-                            async with self.get_session() as session:
-                                small_chunk_id = await self.run_query_and_get_element_id(session,
-                                    "CREATE (n:SmallChunk {content: $content, type: 'small_chunk', page: $page, project_id: $project_id}) RETURN elementId(n)",
-                                    content=small_chunk, page=i + 1, project_id=project_id
-                                )
-
-                                if small_chunk_id:
-                                    await (await session.run(
-                                        "MATCH (m:MediumChunk) WHERE (elementId(m) = $medium_chunk_id AND m.project_id = $project_id) "
-                                        "MATCH (s:SmallChunk) WHERE (elementId(s) = $small_chunk_id AND s.project_id = $project_id) "
-                                        "MERGE (m)-[:HAS_CHUNK]->(s) "
-                                        "MERGE (s)-[:BELONGS_TO]->(m)",
-                                        {"small_chunk_id": small_chunk_id, "medium_chunk_id": medium_chunk_id, "project_id": project_id}
-                                    )).consume()
-
-                        embedding = await self.make_embedding(small_chunk)
-                            
-                        async with self.rate_limiter_db:
-                            async with self.get_session() as session:
-                                embedding_id = await self.run_query_and_get_element_id(session,
-                                    "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', project_id: $project_id}) RETURN elementId(n)",
-                                    embedding=embedding, project_id=project_id
-                                )
-
-                                if embedding_id:
-                                    await (await session.run(
-                                        "MATCH (p:PDF) WHERE (elementId(p) = $pdf_id AND p.project_id = $project_id) "
-                                        "MATCH (m:MediumChunk) WHERE (elementId(m) = $medium_chunk_id AND m.project_id = $project_id) "
-                                        "MATCH (s:SmallChunk) WHERE (elementId(s) = $small_chunk_id AND s.project_id = $project_id) "
-                                        "MATCH (e:Embedding) WHERE (elementId(e) = $embedding_id AND e.project_id = $project_id) "
-                                        "MERGE (s)-[:HAS_EMBEDDING]->(e) "
-                                        "MERGE (e)-[:IS_EMBEDDING_OF]->(s) "
-                                        "MERGE (e)-[:HAS_PARENT_CHUNK]->(m) "
-                                        "MERGE (e)-[:HAS_PARENT_DOC]->(p) "
-                                        "",
-                                        {"pdf_id": pdf_id, "medium_chunk_id": medium_chunk_id, "small_chunk_id": small_chunk_id, "embedding_id": embedding_id, "project_id": project_id}
-                                    )).consume()
+                    pdf = await PDF.create_in_database(session=session, project_id=project_id, full_path=localPath, page_count=num_pages, author=author, title=title)
+                    if pdf:
+                        pdf_id = pdf.id
+                    else:
+                        print("Failed to create PDF")
+                        return  # Exit the function if PDF creation fails
+            await self.process_pdf_pages(reader, num_pages, pdf_id, project_id)
 
         except Exception as e:
             logger.error(f"Error ingesting PDF file {inputPath}: {e}")
             raise FileProcessingError(f"Error ingesting PDF file {inputPath}: {e}")
+
+    async def process_pdf_pages(self, reader: PdfReader, num_pages: int, pdf_id: str, project_id: str) -> None:
+        for i in range(num_pages):
+            page = reader.pages[i]
+            text = page.extract_text()
+
+            medium_chunks = self.chunk_text(text, MEDIUM_CHUNK_SIZE)
+            for j, medium_chunk in enumerate(medium_chunks):
+                async with self.rate_limiter_db:
+                    async with self.get_session() as session:
+                        medium_chunk_id = await self.run_query_and_get_element_id(session,
+                            "CREATE (n:MediumChunk {content: $content, type: 'medium_chunk', page: $page, pdf_id: $pdf_id, project_id: $project_id}) RETURN elementId(n)",
+                            content=medium_chunk, page=i + 1, pdf_id=pdf_id, project_id=project_id
+                        )
+
+                        if medium_chunk_id:
+                            await (await session.run(
+                                "MATCH (p:File:Document:PDF) WHERE p.id = $pdf_id "
+                                "MATCH (m:MediumChunk) WHERE elementId(m) = $medium_chunk_id "
+                                "MERGE (p)-[:HAS_CHUNK]->(m) "
+                                "MERGE (m)-[:BELONGS_TO]->(p)",
+                                {"pdf_id": pdf_id, "medium_chunk_id": medium_chunk_id}
+                            )).consume()
+
+                small_chunks = self.chunk_text(medium_chunk, SMALL_CHUNK_SIZE)
+                for k, small_chunk in enumerate(small_chunks):
+                    embedding = await self.make_embedding(small_chunk)
+                    
+                    async with self.rate_limiter_db:
+                        async with self.get_session() as session:
+                            small_chunk_id = await self.run_query_and_get_element_id(session,
+                                "CREATE (n:SmallChunk {content: $content, type: 'small_chunk', page: $page, pdf_id: $pdf_id, project_id: $project_id, embedding: $embedding}) RETURN elementId(n)",
+                                content=small_chunk, page=i + 1, pdf_id=pdf_id, project_id=project_id, embedding=embedding
+                            )
+
+                            if small_chunk_id:
+                                await (await session.run(
+                                    "MATCH (p:File:Document:PDF) WHERE p.id = $pdf_id "
+                                    "MATCH (m:MediumChunk) WHERE elementId(m) = $medium_chunk_id "
+                                    "MATCH (s:SmallChunk) WHERE elementId(s) = $small_chunk_id "
+                                    "MERGE (m)-[:HAS_CHUNK]->(s) "
+                                    "MERGE (s)-[:BELONGS_TO]->(m) "
+                                    "MERGE (s)-[:HAS_PARENT_DOC]->(p)",
+                                    {"pdf_id": pdf_id, "medium_chunk_id": medium_chunk_id, "small_chunk_id": small_chunk_id}
+                                )).consume()
+
+
+                                
+#    async def IngestPdf(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
+#        try:
+#            reader = PdfReader(inputPath)
+#            num_pages = len(reader.pages)
+#
+#            # Extract metadata
+#            metadata = reader.metadata
+#            author = metadata.get('/Author', 'Unknown')
+#            title = metadata.get('/Title', inputName)
+#
+#            async with self.rate_limiter_db:
+#                async with self.get_session() as session:
+#                    pdf = await PDF.create_in_database(session=session, project_id=project_id, full_path=localPath, page_count=num_pages, author=author, title=title)
+#                    if pdf:
+#                        pdf_id = pdf.id
+#                    else:
+#                        print("Failed to create PDF")
+#            # TODO: the above if/else needs to call the below code as a separate function.
+#            for i in range(num_pages):
+#                page = reader.pages[i]
+#                text = page.extract_text()
+#
+#                medium_chunks = self.chunk_text(text, MEDIUM_CHUNK_SIZE)
+#                for j, medium_chunk in enumerate(medium_chunks):
+#                    async with self.rate_limiter_db:
+#                        async with self.get_session() as session:
+#                            medium_chunk_id = await self.run_query_and_get_element_id(session,
+#                                "CREATE (n:MediumChunk {content: $content, type: 'medium_chunk', page: $page, project_id: $project_id}) RETURN elementId(n)",
+#                                content=medium_chunk, page=i + 1, project_id=project_id
+#                            )
+#
+#                            if medium_chunk_id:
+#                                await (await session.run(
+#                                    "MATCH (p:PDF) WHERE (elementId(p) = $pdf_id AND p.project_id = $project_id) "
+#                                    "MATCH (m:MediumChunk) WHERE (elementId(m) = $medium_chunk_id AND m.project_id = $project_id) "
+#                                    "MERGE (p)-[:HAS_CHUNK]->(m) "
+#                                    "MERGE (m)-[:BELONGS_TO]->(p)",
+#                                    {"pdf_id": pdf_id, "medium_chunk_id": medium_chunk_id, "project_id": project_id}
+#                                )).consume()
+#
+#                    small_chunks = self.chunk_text(medium_chunk, SMALL_CHUNK_SIZE)
+#                    for k, small_chunk in enumerate(small_chunks):
+#                        async with self.rate_limiter_db:
+#                            async with self.get_session() as session:
+#                                small_chunk_id = await self.run_query_and_get_element_id(session,
+#                                    "CREATE (n:SmallChunk {content: $content, type: 'small_chunk', page: $page, project_id: $project_id}) RETURN elementId(n)",
+#                                    content=small_chunk, page=i + 1, project_id=project_id
+#                                )
+#
+#                                if small_chunk_id:
+#                                    await (await session.run(
+#                                        "MATCH (m:MediumChunk) WHERE (elementId(m) = $medium_chunk_id AND m.project_id = $project_id) "
+#                                        "MATCH (s:SmallChunk) WHERE (elementId(s) = $small_chunk_id AND s.project_id = $project_id) "
+#                                        "MERGE (m)-[:HAS_CHUNK]->(s) "
+#                                        "MERGE (s)-[:BELONGS_TO]->(m)",
+#                                        {"small_chunk_id": small_chunk_id, "medium_chunk_id": medium_chunk_id, "project_id": project_id}
+#                                    )).consume()
+#
+#                        embedding = await self.make_embedding(small_chunk)
+#                            
+#                        async with self.rate_limiter_db:
+#                            async with self.get_session() as session:
+#                                embedding_id = await self.run_query_and_get_element_id(session,
+#                                    "CREATE (n:Embedding {embedding: $embedding, type: 'embedding', project_id: $project_id}) RETURN elementId(n)",
+#                                    embedding=embedding, project_id=project_id
+#                                )
+#
+#                                if embedding_id:
+#                                    await (await session.run(
+#                                        "MATCH (p:PDF) WHERE (elementId(p) = $pdf_id AND p.project_id = $project_id) "
+#                                        "MATCH (m:MediumChunk) WHERE (elementId(m) = $medium_chunk_id AND m.project_id = $project_id) "
+#                                        "MATCH (s:SmallChunk) WHERE (elementId(s) = $small_chunk_id AND s.project_id = $project_id) "
+#                                        "MATCH (e:Embedding) WHERE (elementId(e) = $embedding_id AND e.project_id = $project_id) "
+#                                        "MERGE (s)-[:HAS_EMBEDDING]->(e) "
+#                                        "MERGE (e)-[:IS_EMBEDDING_OF]->(s) "
+#                                        "MERGE (e)-[:HAS_PARENT_CHUNK]->(m) "
+#                                        "MERGE (e)-[:HAS_PARENT_DOC]->(p) "
+#                                        "",
+#                                        {"pdf_id": pdf_id, "medium_chunk_id": medium_chunk_id, "small_chunk_id": small_chunk_id, "embedding_id": embedding_id, "project_id": project_id}
+#                                    )).consume()
+#
+#        except Exception as e:
+#            logger.error(f"Error ingesting PDF file {inputPath}: {e}")
+#            raise FileProcessingError(f"Error ingesting PDF file {inputPath}: {e}")
 
     async def getFileAndCppCount(self) -> tuple[int, int]:
         try:

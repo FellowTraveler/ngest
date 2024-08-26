@@ -104,7 +104,7 @@ async def main():
             if projects:
                 print("Projects:")
                 for project in projects:
-                    print(f"ID: {project['id']}, Name: {project['name']}, Created: {project['created_at']}")
+                    print(f"ID: {project['project_id']}, Name: {project['folder_name']}, Created: {project['created_date']}")
             else:
                 print("No projects found.")
     except Exception as e:

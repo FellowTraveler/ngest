@@ -25,7 +25,7 @@ class ProjectManager:
                 ingest_instance = NIngest(project_id=None)  # We don't need a specific project ID for listing
                 async with ingest_instance.importer_.get_session() as session:
                     result = await session.run(
-                        "MATCH (p:Project) RETURN p.project_id AS id, p.name AS name, p.created_at AS created_at"
+                        "MATCH (p:Project) RETURN p.project_id AS project_id, p.folder_name AS folder_name, p.created_date AS created_date"
                     )
                     projects = await result.data()
                 return projects
@@ -41,7 +41,7 @@ class ProjectManager:
             try:
                 result = await ingest_instance.start_ingestion(input_path)
                 if result == 0:
-                    logger.info(f"Project created and ingestion started successfully. Project ID: {project_id}")
+                    logger.info(f"Project created and ingested. Project ID: {project_id}")
                     return project_id
                 else:
                     raise Exception("Failed to start project ingestion")

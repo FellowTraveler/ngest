@@ -13,6 +13,7 @@ from .project_manager import ProjectManager
 from .file import File
 from .document import Document
 from .project import Project
+from .pdf import PDF
 
-__all__ = ['NIngest', 'ProjectManager', 'File', 'Document', 'Project']
+__all__ = ['NIngest', 'ProjectManager', 'File', 'Document', 'Project', 'PDF']
 
