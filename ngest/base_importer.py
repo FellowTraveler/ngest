@@ -1,3 +1,6 @@
+# Copyright 2024 Chris Odom
+# MIT License
+
 import os
 import datetime
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
@@ -10,9 +13,9 @@ import PIL.Image
 import torchvision.transforms as transforms
 import torchvision.models as models
 from transformers import pipeline, AutoTokenizer, AutoModel, BertModel, BertTokenizer
-from clang.cindex import Config
-Config.set_library_path("/opt/homebrew/opt/llvm/lib")
-import clang.cindex
+#from clang.cindex import Config
+#Config.set_library_path("/opt/homebrew/opt/llvm/lib")
+#import clang.cindex
 import ast
 import syn
 from PyPDF2 import PdfReader

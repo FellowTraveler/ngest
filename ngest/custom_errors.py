@@ -1,3 +1,6 @@
+# Copyright 2024 Chris Odom
+# MIT License
+
 class CustomError(Exception):
     """Base class for custom exceptions"""
     pass

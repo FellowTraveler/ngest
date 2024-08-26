@@ -17,4 +17,5 @@ torch
 tqdm
 torchvision
 transformers
-
+faiss-cpu
+numpy

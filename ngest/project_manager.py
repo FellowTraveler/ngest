@@ -1,8 +1,11 @@
+# Copyright 2024 Chris Odom
+# MIT License
+
 import asyncio
 import logging
 import uuid
 from typing import List, Dict
-from ningest import NIngest
+from ngest.ningest import NIngest
 
 logger = logging.getLogger(__name__)
 

@@ -1,3 +1,6 @@
+# Copyright 2024 Chris Odom
+# MIT License
+
 import os
 import datetime
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
@@ -9,8 +12,9 @@ import configparser
 import dotenv
 from typing import List, Dict
 
-from ningest import NIngest
-from project_manager import ProjectManager
+import ngest  # This import will trigger the Clang setup in __init__.py
+from ngest.ningest import NIngest
+from ngest.project_manager import ProjectManager
 
 # Load environment variables
 dotenv.load_dotenv()
@@ -106,5 +110,8 @@ async def main():
     except Exception as e:
         print(f"An error occurred: {e}")
 
-if __name__ == "__main__":
+def run_main():
     asyncio.run(main())
+    
+if __name__ == "__main__":
+    run_main()

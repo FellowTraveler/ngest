@@ -1,3 +1,6 @@
+# Copyright 2024 Chris Odom
+# MIT License
+
 import os
 import asyncio
 import logging
@@ -7,9 +10,9 @@ from typing import List, Dict, Any
 from neo4j import AsyncGraphDatabase
 from tqdm.asyncio import tqdm
 
-from base_importer import NBaseImporter
-from neo4j_importer import NNeo4JImporter
-from project import Project
+from ngest.base_importer import NBaseImporter
+from ngest.neo4j_importer import NNeo4JImporter
+from ngest.project import Project
 
 logger = logging.getLogger(__name__)
 

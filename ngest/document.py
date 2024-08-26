@@ -1,7 +1,7 @@
 # Copyright 2024 Chris Odom
 # MIT License
 
-from file import File
+from ngest.file import File
 from neo4j import GraphDatabase
 from neo4j.exceptions import Neo4jError
 

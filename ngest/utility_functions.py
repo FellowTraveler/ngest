@@ -1,3 +1,6 @@
+# Copyright 2024 Chris Odom
+# MIT License
+
 import aiofiles
 import logging
 

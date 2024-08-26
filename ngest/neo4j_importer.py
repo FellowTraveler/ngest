@@ -1,3 +1,6 @@
+# Copyright 2024 Chris Odom
+# MIT License
+
 import os
 import datetime
 import logging
@@ -8,8 +11,8 @@ import PIL.Image
 import torchvision.transforms as transforms
 import torchvision.models as models
 from transformers import pipeline, AutoTokenizer, AutoModel, BertModel, BertTokenizer
-from clang.cindex import Config
-Config.set_library_path("/opt/homebrew/opt/llvm/lib")
+#from clang.cindex import Config
+#Config.set_library_path("/opt/homebrew/opt/llvm/lib")
 import clang.cindex
 import ast
 import syn
@@ -29,10 +32,10 @@ from typing import AsyncGenerator
 import torch
 from aiolimiter import AsyncLimiter
 
-from base_importer import NBaseImporter
-from project import Project
-from file import File
-from document import Document
+from ngest.base_importer import NBaseImporter
+from ngest.project import Project
+from ngest.file import File
+from ngest.document import Document
 
 # Load environment variables
 dotenv.load_dotenv()
