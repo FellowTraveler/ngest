@@ -23,21 +23,21 @@ class File:
     @staticmethod
     async def create_in_database(session, filename, full_path, size_in_bytes, project_id, created_date=None, modified_date=None, extension=None):
         file = File(filename, full_path, size_in_bytes, project_id, created_date, modified_date, extension)
-        query = """
-        MERGE (f:File {id: $id})
-        SET f.filename = $filename,
-            f.full_path = $full_path,
-            f.size_in_bytes = $size_in_bytes,
-            f.project_id = $project_id,
-            f.created_date = $created_date,
-            f.modified_date = $modified_date,
-            f.extension = $extension
-        WITH f
-        MERGE (p:Project {id: $project_id})
-        MERGE (p)-[:HAS_FILE]->(f)
-        MERGE (f)-[:BELONGS_TO]->(p)
-        RETURN f
-        """
+        query = query = """
+            MERGE (f:File {id: $id})
+            SET f.filename = $filename,
+                f.full_path = $full_path,
+                f.size_in_bytes = $size_in_bytes,
+                f.project_id = $project_id,
+                f.created_date = $created_date,
+                f.modified_date = $modified_date,
+                f.extension = $extension
+            WITH f
+            MATCH (p:Project {project_id: $project_id})
+            MERGE (p)-[:HAS_FILE]->(f)
+            MERGE (f)-[:BELONGS_TO_PROJECT]->(p)
+            RETURN f
+            """
         try:
             result = await session.run(query,
                 id=file.id,

@@ -100,3 +100,5 @@ When it's ready there will also be a Retriever script.
 
 Status: we have minimal CPP ingestion now working, as well as 2-layer ingestion for PDFs.
 
+P.S. in case you're curious, this can be used to wipe a Neo4J DB.
+Use with caution: ```CALL apoc.schema.assert({},{},true); MATCH (n) DETACH DELETE n;```

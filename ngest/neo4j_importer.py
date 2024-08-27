@@ -119,7 +119,7 @@ class NNeo4JImporter(NBaseImporter):
         self.code_model = AutoModel.from_pretrained("microsoft/codebert-base").to(self.device)
         self.code_model.eval()
 
-        self.rate_limiter_db = AsyncLimiter(50, 1)  # 50 operations per 2 seconds
+        self.rate_limiter_db = AsyncLimiter(50, 1)  # 3 operations per 1 seconds
         self.rate_limiter_summary = AsyncLimiter(2, 1)  # 2 operations per 1 seconds
         self.rate_limiter_embedding = AsyncLimiter(2, 1)  # 2 operations per 1 seconds
 
