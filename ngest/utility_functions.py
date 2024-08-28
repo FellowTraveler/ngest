@@ -25,7 +25,7 @@ async def read_file_in_chunks(file_path: str, chunk_size: int = 1024) -> AsyncGe
                     break
                 yield data
     except Exception as e:
-        logger.error(f"Error reading file {file_path}: {e}")
+        logger.error(f"read_file_in_chunks: Error reading file {file_path}: {e}")
         return
 
 def preprocess_text(text: str) -> str:

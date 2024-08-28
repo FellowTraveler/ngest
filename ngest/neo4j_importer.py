@@ -11,9 +11,6 @@ import PIL.Image
 import torchvision.transforms as transforms
 import torchvision.models as models
 from transformers import pipeline, AutoTokenizer, AutoModel, BertModel, BertTokenizer
-#from clang.cindex import Config
-#Config.set_library_path("/opt/homebrew/opt/llvm/lib")
-import clang.cindex
 import ast
 import syn
 from PyPDF2 import PdfReader
@@ -32,11 +29,15 @@ from typing import AsyncGenerator
 import torch
 from aiolimiter import AsyncLimiter
 
+import ngest
+import clang.cindex
 from ngest.base_importer import NBaseImporter
 from ngest.project import Project
 from ngest.file import File
 from ngest.document import Document
 from ngest.pdf import PDF
+from ngest.cpp_processor import CppProcessor
+from ngest.custom_errors import FileProcessingError
 
 # Load environment variables
 dotenv.load_dotenv()
@@ -95,6 +96,7 @@ class NNeo4JImporter(NBaseImporter):
     A file importer that ingests various file types into a Neo4j database.
     """
     def __init__(self, neo4j_url: str = NEO4J_URL, neo4j_user: str = NEO4J_USER, neo4j_password: str = NEO4J_PASSWORD):
+        self.cpp_processor = CppProcessor(do_summarize_text=self.do_summarize_text)
         self.neo4j_url = neo4j_url
         self.neo4j_user = neo4j_user
         self.neo4j_password = neo4j_password
@@ -127,19 +129,10 @@ class NNeo4JImporter(NBaseImporter):
         self.bert_model = BertModel.from_pretrained('bert-base-uncased').to(self.device)
         self.bert_model.eval()
         
-        self.classes = defaultdict(dict)
-        self.functions = defaultdict(dict)
-        self.methods = defaultdict(dict)
         self.header_files = {}
 
         self.file_paths = []
         self.file_paths_lock = asyncio.Lock()
-
-        self.lock_classes = asyncio.Lock()  # Create a lock instance
-        self.lock_functions = asyncio.Lock()  # Create a lock instance
-        self.lock_methods = asyncio.Lock()  # Create a lock instance
-        self.lock_file_paths = asyncio.Lock()  # Create a lock instance
-        self.lock_header_files = asyncio.Lock()  # Create a lock instance
 
         self.progress_callback_scan = None
         self.progress_callback_summarize = None
@@ -204,7 +197,7 @@ class NNeo4JImporter(NBaseImporter):
                 loop = asyncio.get_running_loop()
 #                logger.info(f"Started generating an embedding.")
                 embedding = await loop.run_in_executor(None, self._generate_embedding, text)
-#                logger.info(f"Finished generating an embedding.")
+#                logger.info(f"Finished generating an embedding: {embedding}")
                 return embedding
             except Exception as e:
                 logger.error(f"Error generating embedding: {e}")
@@ -261,7 +254,7 @@ class NNeo4JImporter(NBaseImporter):
                 return inputPath[len(topLevelInputPath):].lstrip(os.sep)
             else:
                 return inputPath
-                
+
 #       logger.info(f"Starting scanning for file: {inputPath}")
         try:
             localPath = strip_top_level(inputPath, topLevelInputPath)
@@ -387,6 +380,7 @@ class NNeo4JImporter(NBaseImporter):
 
         logger.info(f"Completed scanning for inputPath: {inputPath}, inputLocation: {inputLocation}, inputName: {inputName}, currentOutputPath: {currentOutputPath}")
 
+                
     async def do_summarize_text(self, text, max_length=50, min_length=25) -> str:
         # this only limits the creation of new threads.
         async with self.rate_limiter_summary:
@@ -490,8 +484,8 @@ class NNeo4JImporter(NBaseImporter):
                 async with aiofiles.open(input_path, 'r') as file:
                     file_content = await file.read()
             except Exception as e:
-                logger.error(f"Error reading file {input_path}: {e}")
-                raise FileProcessingError(f"Error reading file {input_path}: {e}")
+                logger.error(f"IngestText: Error reading file {input_path}: {e}")
+                raise FileProcessingError(f"IngestText: Error reading file {input_path}: {e}")
 
             try:
                 # Database operation - needs rate limiting
@@ -610,395 +604,16 @@ class NNeo4JImporter(NBaseImporter):
             outputs = self.code_model(**inputs)
         return outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy().tolist()
 
-    async def summarize_cpp_class_public_interface(self, class_info) -> (str, str, str, str):
-        """
-        Summarize the public interface of a C++ class, including inherited public members from base classes,
-        and indicate whether they are exported.
-
-        Args:
-            class_info: The class node's info.
-
-        Returns:
-            tuple: A tuple containing the class name, fully-qualified name, and the summary.
-        """
-        
-        try:
-            type_name = class_info.get('type', 'Class')
-            full_name = class_info.get('name', 'anonymous')
-            full_scope = class_info.get('scope', '')
-            short_name = class_info.get('short_name', '')
-            raw_code = class_info.get('raw_code', '')
-            file_path = class_info.get('file_path', '')
-            raw_comment = class_info.get('raw_comment', '')
-            description = class_info.get('description', '')
-            interface_description = class_info.get('interface_description', raw_code)
-
-            background = (
-                "Speaking as a senior developer and software architect, describe the purpose and usage of this class in your own words. "
-                "Meditate on the provided description and public interface first, before writing your final summary. "
-                "Then enclose those meditations in opening and closing <thoughts> tags, and then write your final summary."
-            )
-            
-            # Combine background and description with clear separation
-            full_prompt = f"{background}\n\nClass Details:\n{description}. {interface_description}"
-        except Exception as e:
-            logger.error(f"Error in summarize_cpp_class_public_interface accessing dict: {e}")
-            raise DatabaseError(f"Error in summarize_cpp_class_public_interface accessing dict: {e}")
-
-        try:
-            summary = await self.do_summarize_text(full_prompt, 200, 25)
-            return full_name, full_scope, summary, description + ". " + interface_description
-        except Exception as e:
-            logger.error(f"Error in summarize_cpp_class_public_interface: {e}")
-            raise DatabaseError(f"Error in summarize_cpp_class_public_interface: {e}")
-                
-
-    async def summarize_cpp_class_implementation(self, class_info) -> (str, str):
-        """
-        Summarize the implementation details of a C++ class, including private methods, properties, static members,
-        and inherited protected members.
-
-        Args:
-            class_info: The class node's info
-
-        Returns:
-            tuple: A tuple containing the class name, fully-qualified name, and the summary.
-        """
-        
-        try:
-            type_name = class_info.get('type', 'Class')
-            full_name = class_info.get('name', 'anonymous')
-            full_scope = class_info.get('scope', '')
-            short_name = class_info.get('short_name', '')
-            raw_code = class_info.get('raw_code', '')
-            file_path = class_info.get('file_path', '')
-            raw_comment = class_info.get('raw_comment', '')
-            description = class_info.get('description', '')
-            implementation_description = class_info.get('implementation_description', raw_code)
-
-            background = (
-                "Speaking as a senior developer and software architect, describe the implementation and inner workings of this class in your own words. "
-                "Meditate on the provided description below, before writing your final summary. "
-                "Then enclose those meditations in opening and closing <thoughts> tags, and then write your final summary."
-            )
-            
-            # Combine background and description with clear separation
-            full_prompt = f"{background}\n\nClass Details: {description}. {implementation_description}"
-        except Exception as e:
-            logger.error(f"Error in summarize_cpp_class_implementation accessing dict: {e}")
-            raise DatabaseError(f"Error in summarize_cpp_class_implementation accessing dict: {e}")
-
-        try:
-            summary = await self.do_summarize_text(full_prompt, 200, 25)
-            return summary, description + ". " + implementation_description
-
-        except Exception as e:
-            logger.error(f"Error in summarize_cpp_class_implementation: {e}")
-            raise DatabaseError(f"Error in summarize_cpp_class_implementation: {e}")
-
-
-    async def summarize_cpp_class(self, class_info) -> (str, str, str, str):
-        """
-        Summarize a C++ class.
-
-        Args:
-            class_info: The class node's info.
-
-        Returns:
-            str: The summary of the class.
-        """
-        
-        try:
-            class_name, full_scope, interface_summary, interface_description = await self.summarize_cpp_class_public_interface(class_info)
-        except Exception as e:
-            logger.error(f"Error in summarize_cpp_class_public_interface for {class_name}: {e}")
-            raise DatabaseError(f"Error in summarize_cpp_class_public_interface for {class_name}: {e}")
-        try:
-            implementation_summary, implementation_description = await self.summarize_cpp_class_implementation(class_info)
-        except Exception as e:
-            logger.error(f"Error in summarize_cpp_class_implementationfor {class_name}: {e}")
-            raise DatabaseError(f"Error in summarize_cpp_class_implementation for {class_name}: {e}")
-
-        return class_name, full_scope, interface_summary + "\n\n" + interface_description, implementation_summary + "\n\n" + implementation_description
-
-    async def summarize_cpp_function(self, node_info) -> (str, str, str):
-        """
-        Summarize a C++ function.
-
-        Args:
-            node_info: The function or method node's info.
-
-        Returns:
-            str: The summary of the function or method.
-        """
-        
-        type_name = node_info.get('type', 'Function')
-        full_name = node_info.get('name', 'anonymous')
-        full_scope = node_info.get('scope', '')
-        short_name = node_info.get('short_name', '')
-        raw_code = node_info.get('raw_code', '')
-        file_path = node_info.get('file_path', '')
-        raw_comment = node_info.get('raw_comment', '')
-        description = node_info.get('description', '')
-        is_cpp_file = node_info.get('is_cpp_file', False)
-
-        if type_name is None:
-            logger.error(f"Error in summarize_cpp_function - type_name is None")
-            raise DatabaseError(f"Error in summarize_cpp_function: type_name is None")
-
-        # Background for summarization
-        background = (
-            f"Speaking as a senior developer and software architect, describe the implementation and inner workings of this {type_name} in your own words. "
-            "Meditate on the provided description below, before writing your final summary. "
-            "Then enclose those meditations in opening and closing <thoughts> tags, and then write your final summary."
-        )
-        
-        # Combine background and description with clear separation
-        full_prompt = f"{background}\n\n{type_name} Details:\n{description}"
-        
-        try:
-            summary = await self.do_summarize_text(full_prompt)
-        except Exception as e:
-            logger.error(f"Error in summarize_cpp_function calling do_summarize_text: {e}")
-            raise DatabaseError(f"Error in summarize_cpp_function calling do_summarize_text: {e}")
-        
-        try:
-            retval = full_name, full_scope, summary + "\n\n" + description
-        except Exception as e:
-            logger.error(f"Error in summarize_cpp_function appending strings: {e}\nnode_info contents:\n{pprint.pformat(node_info, indent=4)}")
-            raise DatabaseError(f"Error in summarize_cpp_function appending strings: {e}\nnode_info contents:\n{pprint.pformat(node_info, indent=4)}")
-
-        return retval
 
     async def IngestCpp(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str):
         try:
-            index = clang.cindex.Index.create()
-            translation_unit = index.parse(inputPath)
-
-            with open(inputPath, 'r') as file:
-                file_contents = file.read()
-
-            # Save raw code of header files
-            if inputPath.endswith('.hpp') or inputPath.endswith('.h'):
-                    async with self.lock_header_files:
-                        self.header_files[inputPath] = file_contents
-            
-            await self.process_nodes(translation_unit.cursor, inputLocation, project_id, inputPath.endswith('.cpp'))
-                
-        except Exception as e:
+            await self.cpp_processor.process_cpp_file(inputPath, inputLocation, project_id)
+        except FileProcessingError as e:
             logger.error(f"Error ingesting C++ file {inputPath}: {e}")
-            raise FileProcessingError(f"Error ingesting C++ file {inputPath}: {e}")
-
-
-    async def update_classes(self, full_name, details):
-        async with self.lock_classes:  # Acquire the lock
-            self.classes[full_name].update(details)
-
-    async def update_methods(self, full_name, details):
-        async with self.lock_methods:  # Acquire the lock
-            self.methods[full_name].update(details)
-
-    async def update_functions(self, full_name, details):
-        async with self.lock_functions:  # Acquire the lock
-            self.functions[full_name].update(details)
-
-    async def process_nodes(self, node, project_path, project_id, is_cpp_file):
-        def is_exported(node):
-            # Example check for __declspec(dllexport) or visibility attribute
-            for token in node.get_tokens():
-                if token.spelling in ["__declspec(dllexport)", "__attribute__((visibility(\"default\")))"]:
-                    return True
-            return False
-
-        for child in node.get_children():
-            file_name = child.location.file.name if child.location.file else ''
-            if project_path in file_name:
-                if child.kind in (clang.cindex.CursorKind.CLASS_DECL, clang.cindex.CursorKind.STRUCT_DECL):
-                    type_name = "Class" if child.kind == clang.cindex.CursorKind.CLASS_DECL else "Struct"
-                    class_name = child.spelling
-                    full_scope = self.get_full_scope(child)
-                    fully_qualified_name = f"{full_scope}::{class_name}" if full_scope else class_name
-                    interface_description = ""
-                    implementation_description = ""
-
-                    description = f"Class {class_name} in scope {full_scope} defined in {file_name}"
-                    raw_comment = child.raw_comment if child.raw_comment else ''
-                    if raw_comment:
-                        description += f" with documentation: {raw_comment.strip()}"
-
-                    # Base classes
-                    bases = [base for base in child.get_children() if base.kind == clang.cindex.CursorKind.CXX_BASE_SPECIFIER]
-                    if bases:
-                        base_names = [f"{base.spelling} in scope {self.get_full_scope(base.type.get_declaration())}" for base in bases]
-                        description += f". Inherits from: {', '.join(base_names)}"
-                                        
-                    is_node_exported = is_exported(child)
-                    if is_node_exported:
-                        description += ". (EXPORTED)"
-                    
-                    # Public members of the class
-                    members = []
-
-                    def get_public_members(node, inherited=False):
-                        for member in node.get_children():
-                            if member.access_specifier == clang.cindex.AccessSpecifier.PUBLIC:
-                                origin = " (inherited)" if inherited else ""
-                                export_status = "exported" if is_node_exported else "not exported"
-                                if member.kind == clang.cindex.CursorKind.CXX_METHOD:
-                                    members.append(f"public method {member.spelling} in scope {self.get_full_scope(member)} ({export_status}){origin}")
-                                elif member.kind == clang.cindex.CursorKind.FIELD_DECL:
-                                    members.append(f"public attribute {member.spelling} of type {member.type.spelling} in scope {self.get_full_scope(member)} ({export_status}){origin}")
-
-                    # Get public members of the class itself
-                    get_public_members(child, inherited=False)
-                    
-                    # Get public members of base classes
-                    for base in bases:
-                        if base.type and base.type.get_declaration().kind == clang.cindex.CursorKind.CLASS_DECL:
-                            base_class = base.type.get_declaration()
-                            get_public_members(base_class, inherited=True)
-                    
-                    if members:
-                        interface_description = "Public interface: " + ", ".join(members)
-
-                    members = []
-                                        
-                    def get_implementation_members(node, inherited=False):
-                        for member in node.get_children():
-                            origin = " (inherited)" if inherited else ""
-                            if member.access_specifier == clang.cindex.AccessSpecifier.PRIVATE:
-                                if member.kind == clang.cindex.CursorKind.CXX_METHOD:
-                                    members.append(f"private method {member.spelling} in scope {self.get_full_scope(member)}{origin}")
-                                elif member.kind == clang.cindex.CursorKind.FIELD_DECL:
-                                    members.append(f"private attribute {member.spelling} of type {member.type.spelling} in scope {self.get_full_scope(member)}{origin}")
-                                elif member.kind == clang.cindex.CursorKind.VAR_DECL:
-                                    members.append(f"private static {member.spelling} of type {member.type.spelling} in scope {self.get_full_scope(member)}{origin}")
-                            elif member.access_specifier == clang.cindex.AccessSpecifier.PROTECTED and inherited:
-                                if member.kind == clang.cindex.CursorKind.CXX_METHOD:
-                                    members.append(f"protected method {member.spelling} in scope {self.get_full_scope(member)}{origin}")
-                                elif member.kind == clang.cindex.CursorKind.FIELD_DECL:
-                                    members.append(f"protected attribute {member.spelling} of type {member.type.spelling} in scope {self.get_full_scope(member)}{origin}")
-
-                    # Get implementation members of the class itself
-                    get_implementation_members(child, inherited=False)
-                    
-                    # Get protected members of base classes
-                    for base in bases:
-                        if base.type and base.type.get_declaration().kind == clang.cindex.CursorKind.CLASS_DECL:
-                            base_class = base.type.get_declaration()
-                            get_implementation_members(base_class, inherited=True)
-                    
-                    if members:
-                        implementation_description = "Implementation details: " + ", ".join(members)
-
-                    async with self.lock_header_files:
-                        header_code = self.header_files.get(file_name, '')
-                        
-                    # Cache class information
-                    details = {
-                        'type': type_name,
-                        'name': fully_qualified_name,
-                        'scope': full_scope,
-                        'short_name': class_name,
-                        'description' : description,
-                        'interface_description' : interface_description,
-                        'implementation_description' : implementation_description,
-                        'raw_comment': raw_comment,
-                        'file_path': file_name,
-                        'raw_code': header_code
-                    }
-                    await self.update_classes(fully_qualified_name, details)
-                    
-                    await self.process_nodes(child, project_path, project_id, is_cpp_file)
-                    
-                elif child.kind == clang.cindex.CursorKind.CXX_METHOD:
-                    type_name = "Method"
-                    class_name = self.get_full_scope(child)
-                    full_scope = class_name
-                    method_name = child.spelling
-                    fully_qualified_method_name = f"{class_name}::{method_name}" if class_name else method_name
-                    
-                    description = f"Method {method_name} in class {full_scope} defined in {file_name}"
-                    raw_comment = child.raw_comment if child.raw_comment else ''
-                    if raw_comment:
-                        description += f" with documentation: {raw_comment.strip()}"
-
-                    is_node_exported = is_exported(child)
-                    if is_node_exported:
-                        description += ". (EXPORTED)"
-                        
-                    # Parameters and return type
-                    params = [f"{param.type.spelling} {param.spelling}" for param in child.get_arguments()]
-                    return_type = child.result_type.spelling
-                    description += f". Returns {return_type} and takes parameters: {', '.join(params)}"
-
-                    description += "."
-
-                    async with self.lock_methods:
-                        is_new_method = True if fully_qualified_method_name not in self.methods else False
-                        
-                    # Cache method information, prioritize CPP file
-                    if is_cpp_file or is_new_method:
-                        raw_code = self.get_raw_code(child) if is_cpp_file else ''
-                        # Cache method information
-                        details = {
-                            'type': type_name,
-                            'name': fully_qualified_method_name,
-                            'scope': full_scope,
-                            'short_name': method_name,
-                            'return_type': return_type,
-                            'description' : description,
-                            'raw_comment': raw_comment,
-                            'file_path': file_name,
-                            'is_cpp_file': is_cpp_file,
-                            'raw_code': raw_code
-                        }
-                        await self.update_methods(fully_qualified_method_name, details)
-                                                
-                elif child.kind == clang.cindex.CursorKind.FUNCTION_DECL:
-                    type_name = "Function"
-                    function_name = child.spelling
-                    full_scope = self.get_full_scope(child)
-                    fully_qualified_function_name = f"{full_scope}::{function_name}" if full_scope else function_name
-                    
-                    description = f"Function {function_name} in scope {full_scope} defined in {file_name}"
-                    raw_comment = child.raw_comment if child.raw_comment else ''
-                    if raw_comment:
-                        description += f" with documentation: {raw_comment.strip()}"
-
-                    is_node_exported = is_exported(child)
-                    if is_node_exported:
-                        description += ". (EXPORTED)"
-                    
-                    # Parameters and return type
-                    params = [f"{param.type.spelling} {param.spelling}" for param in child.get_arguments()]
-                    return_type = child.result_type.spelling
-                    description += f". Returns {return_type} and takes parameters: {', '.join(params)}"
-                    
-                    description += "."
-
-                    async with self.lock_functions:
-                        is_new_function = True if fully_qualified_function_name not in self.functions else False
-                    
-                    # Store function information, prioritize CPP file
-                    if is_cpp_file or is_new_function:
-                        raw_code = self.get_raw_code(child) if is_cpp_file else ''
-                        details = {
-                            'type': type_name,
-                            'name': fully_qualified_function_name,
-                            'scope': full_scope,
-                            'short_name': function_name,
-                            'description' : description,
-                            'return_type': return_type,
-                            'raw_comment': raw_comment,
-                            'file_path': file_name,
-                            'is_cpp_file': is_cpp_file,
-                            'raw_code': raw_code
-                        }
-                        # Cache function information
-                        await self.update_functions(fully_qualified_function_name, details)
-                else:
-                    await self.process_nodes(child, project_path, project_id, is_cpp_file)
+            raise  # Re-raise the FileProcessingError
+        except Exception as e:
+            logger.error(f"Unexpected error ingesting C++ file {inputPath}: {e}")
+            raise FileProcessingError(f"Unexpected error ingesting C++ file {inputPath}: {e}")
 
     def get_raw_code(self, node):
         # Extract raw code from the source node
@@ -1023,34 +638,18 @@ class NNeo4JImporter(NBaseImporter):
 
     async def summarize_all_cpp(self, project_id):
         try:
-            tasks = []
-            async with self.lock_classes:
-                for class_name, class_info in self.classes.items():
-                    name = class_info.get('name', 'anonymous')
-                    class_info['name'] = name
-                    info_copy = copy.deepcopy(class_info)
-                    tasks.append(self.summarize_cpp_class_prep(name, info_copy))
+            tasks = await self.cpp_processor.prepare_summarization_tasks()
+            
+            summarization_tasks = []
+            for task_type, name, info in tasks:
+                if task_type == 'Class':
+                    summarization_tasks.append(self.summarize_cpp_class_prep(name, info))
+                elif task_type == 'Method':
+                    summarization_tasks.append(self.summarize_cpp_method_prep(name, info))
+                elif task_type == 'Function':
+                    summarization_tasks.append(self.summarize_cpp_function_prep(name, info))
 
-            async with self.lock_methods:
-                for method_name, method_info in self.methods.items():
-                    name = method_info.get('name', 'anonymous')
-                    method_info['name'] = name
-                    info_copy = copy.deepcopy(method_info)
-                    tasks.append(self.summarize_cpp_method_prep(name, info_copy))
-
-            async with self.lock_functions:
-                for function_name, function_info in self.functions.items():
-                    name = function_info.get('name', 'anonymous')
-                    function_info['name'] = name
-                    info_copy = copy.deepcopy(function_info)
-                    tasks.append(self.summarize_cpp_function_prep(name, info_copy))
-
-        except Exception as e:
-            logger.error(f"Error while appending tasks to queue: {e}")
-            raise FileProcessingError(f"Error while appending tasks to queue: {e}")
-
-        try:
-            results = await asyncio.gather(*tasks)
+            results = await asyncio.gather(*summarization_tasks)
         except Exception as e:
             logger.error(f"Error while gathering summarization and embedding tasks: {e}")
             raise FileProcessingError(f"Error while gathering summarization and embedding tasks: {e}")
@@ -1061,7 +660,7 @@ class NNeo4JImporter(NBaseImporter):
                 logger.info(f"Skipping anonymous class")
                 return class_info
                 
-            class_name, class_scope, interface_summary, implementation_summary = await self.summarize_cpp_class(class_info)
+            class_name, class_scope, interface_summary, implementation_summary = await self.cpp_processor.summarize_cpp_class(class_info)
             
         except Exception as e:
             logger.error(f"Error in summarize_cpp_class_prep calling summarize_cpp_class: {e}")
@@ -1085,7 +684,7 @@ class NNeo4JImporter(NBaseImporter):
             'interface_embedding': interface_embedding,
             'implementation_embedding': implementation_embedding
         }
-        await self.update_classes(name, details)
+        await self.cpp_processor.update_classes(name, details)
         await self.update_progress_summarize(1)
         logger.info(f"Finished summarizing/embedding class: {name}")
         return class_info
@@ -1095,7 +694,7 @@ class NNeo4JImporter(NBaseImporter):
             if name is None:
                 logger.info(f"Skipping anonymous method")
                 return method_info
-            function_name, function_scope, function_summary = await self.summarize_cpp_function(method_info)
+            function_name, function_scope, function_summary = await self.cpp_processor.summarize_cpp_function(method_info)
         except Exception as e:
             logger.error(f"Error in summarize_cpp_method_prep: {e}\nmethod_info contents:\n{pprint.pformat(method_info, indent=4)}")
             raise FileProcessingError(f"Error in summarize_cpp_method_prep calling summarize_cpp_function for method {name}: {e}")
@@ -1110,7 +709,7 @@ class NNeo4JImporter(NBaseImporter):
             'summary': function_summary,
             'embedding': embedding
         }
-        await self.update_methods(name, details)
+        await self.cpp_processor.update_methods(name, details)
         await self.update_progress_summarize(1)
         logger.info(f"Finished summarizing/embedding cpp method: {name}")
         return method_info
@@ -1126,7 +725,7 @@ class NNeo4JImporter(NBaseImporter):
             raise FileProcessingError(f"Error in summarize_cpp_function_prep grabbing dict values: {e}")
         
         try:
-            function_name, function_scope, function_summary = await self.summarize_cpp_function(function_info)
+            function_name, function_scope, function_summary = await self.cpp_processor.summarize_cpp_function(function_info)
         except Exception as e:
             logger.error(f"Error in summarize_cpp_function_prep calling summarize_cpp_function: {e}")
             raise FileProcessingError(f"Error in summarize_cpp_function_prep calling summarize_cpp_function: {e}")
@@ -1142,7 +741,7 @@ class NNeo4JImporter(NBaseImporter):
             'embedding': embedding
         }
         try:
-            await self.update_functions(name, details)
+            await self.cpp_processor.update_functions(name, details)
             await self.update_progress_summarize(1)
             logger.info(f"Finished summarizing/embedding cpp function: {name}")
         except Exception as e:
@@ -1153,37 +752,16 @@ class NNeo4JImporter(NBaseImporter):
 
     async def store_all_cpp(self, project_id):
         try:
+            tasks = await self.cpp_processor.prepare_summarization_tasks()
+
             queue = asyncio.Queue()
 
             # Create a task to process the queue
             process_task = asyncio.create_task(self.process_cpp_storage_queue(queue, project_id))
 
-            async with self.lock_classes:
-                for class_name, class_info in self.classes.items():
-                    name = class_info.get('name', 'anonymous')
-                    class_info['name'] = name
-                    info_copy = copy.deepcopy(class_info)
-                    await queue.put(('Class', name, info_copy))
+            for task_type, name, info in tasks:
+                await queue.put((task_type, name, info))
 
-            async with self.lock_methods:
-                for method_name, method_info in self.methods.items():
-                    name = method_info.get('name', 'anonymous')
-                    method_info['name'] = name
-                    info_copy = copy.deepcopy(method_info)
-                    await queue.put(('Method', name, info_copy))
-
-            async with self.lock_functions:
-                for function_name, function_info in self.functions.items():
-                    name = function_info.get('name', 'anonymous')
-                    function_info['name'] = name
-                    info_copy = copy.deepcopy(function_info)
-                    await queue.put(('Function', name, info_copy))
-
-        except Exception as e:
-            logger.error(f"Error in store_all_cpp: {e}")
-            raise FileProcessingError(f"Error in store_all_cpp: {e}")
-
-        try:
             # Signal that all items have been added to the queue
             await queue.put(None)
 
@@ -1191,9 +769,9 @@ class NNeo4JImporter(NBaseImporter):
             await process_task
 
         except Exception as e:
-            logger.error(f"Error while gathering storage tasks: {e}")
-            raise FileProcessingError(f"Error while gathering storage tasks: {e}")
-
+            logger.error(f"Error in store_all_cpp: {e}")
+            raise FileProcessingError(f"Error in store_all_cpp: {e}")
+        
     async def process_cpp_storage_queue(self, queue, project_id):
         while True:
             item = await queue.get()
@@ -1848,22 +1426,9 @@ class NNeo4JImporter(NBaseImporter):
                                 
     async def getFileAndCppCount(self) -> tuple[int, int]:
         try:
-            async with self.lock_classes:
-                len_classes = len(self.classes)
-            async with self.lock_methods:
-                len_methods = len(self.methods)
-            async with self.lock_functions:
-                len_functions = len(self.functions)
-            # We increment the methods twice each, once for the method itself and once for it as a function.
-            total_cpp_count = len_classes + len_methods + len_functions
-            
-            # Set the progress bar here for summarization and storing.
-            # We set the total value to all files + all cpp classes + all cpp methods * 2 + all cpp functions
-            # Therefore we must increment each one after every file PLUS every Cpp class, every method, and every function.
+            total_cpp_count = await self.cpp_processor.get_cpp_count()
             file_count = await self.get_file_paths_length()
-            
             return file_count, total_cpp_count
-            
         except Exception as e:
             logger.error(f"Error getting lengths of local members: {e}")
             raise FileProcessingError(f"Error getting lengths of local members: {e}")
@@ -1872,38 +1437,4 @@ class NNeo4JImporter(NBaseImporter):
         return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
 # End of NNeo4JImporter class
-
-async def read_file_in_chunks(file_path: str, chunk_size: int = 1024) -> AsyncGenerator[str, None]:
-    """
-    Read a file in chunks.
-
-    Args:
-        file_path (str): The path to the file.
-        chunk_size (int): The size of each chunk.
-
-    Yields:
-        str: A chunk of the file.
-    """
-    try:
-        async with aiofiles.open(file_path, 'r') as file:
-            while True:
-                data = await file.read(chunk_size)
-                if not data:
-                    break
-                yield data
-    except Exception as e:
-        logger.error(f"Error reading file {file_path}: {e}")
-        return
-
-def preprocess_text(text: str) -> str:
-    """
-    Preprocess the text by stripping leading and trailing whitespace.
-
-    Args:
-        text (str): The text to preprocess.
-
-    Returns:
-        str: The preprocessed text.
-    """
-    return text.strip()
 
