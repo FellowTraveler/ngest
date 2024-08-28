@@ -1,6 +1,7 @@
 # Copyright 2024 Chris Odom
 # MIT License
 
+import aiohttp
 import os
 import datetime
 import logging
@@ -91,11 +92,15 @@ if hide_info_logs:
 else:
     logging.getLogger().setLevel(logging.INFO)
 
+
 class NNeo4JImporter(NBaseImporter):
     """
     A file importer that ingests various file types into a Neo4j database.
     """
-    def __init__(self, neo4j_url: str = NEO4J_URL, neo4j_user: str = NEO4J_USER, neo4j_password: str = NEO4J_PASSWORD):
+    def __init__(self, neo4j_url: str = NEO4J_URL, neo4j_user: str = NEO4J_USER, neo4j_password: str = NEO4J_PASSWORD, use_api=False, api_url=None, api_key=None):
+        self.use_api = use_api
+        self.api_url = api_url
+        self.api_key = api_key
         self.cpp_processor = CppProcessor(do_summarize_text=self.do_summarize_text)
         self.neo4j_url = neo4j_url
         self.neo4j_user = neo4j_user
@@ -121,9 +126,14 @@ class NNeo4JImporter(NBaseImporter):
         self.code_model = AutoModel.from_pretrained("microsoft/codebert-base").to(self.device)
         self.code_model.eval()
 
-        self.rate_limiter_db = AsyncLimiter(50, 1)  # 3 operations per 1 seconds
-        self.rate_limiter_summary = AsyncLimiter(2, 1)  # 2 operations per 1 seconds
-        self.rate_limiter_embedding = AsyncLimiter(2, 1)  # 2 operations per 1 seconds
+        self.rate_limiter_db = AsyncLimiter(50, 1)  # 3 operations per second
+        
+        if self.use_api:
+            self.rate_limiter_summary = AsyncLimiter(10, 1)  # 10 operations per second for API
+            self.rate_limiter_embedding = AsyncLimiter(10, 1)  # 10 operations per second for API
+        else:
+            self.rate_limiter_summary = AsyncLimiter(2, 1)  # 2 operations per second for local
+            self.rate_limiter_embedding = AsyncLimiter(2, 1)  # 2 operations per second for local
 
         self.bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
         self.bert_model = BertModel.from_pretrained('bert-base-uncased').to(self.device)
@@ -186,10 +196,14 @@ class NNeo4JImporter(NBaseImporter):
                 await session.close()
 
     async def make_embedding(self, text: str) -> List[float]:
-        # this only limits the creation of new threads.
-        async with self.rate_limiter_embedding:
-            return await self.generate_embedding(text)
-
+        try:
+            # this only limits the creation of new threads.
+            async with self.rate_limiter_embedding:
+                return await self.generate_embedding(text)
+        except Exception as e:
+            logger.error(f"Error making embedding: {e}")
+            return []
+            
     @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=15, max=30))
     async def generate_embedding(self, text: str) -> List[float]:
         async with self.semaphore_embedding:  # Ensure only 5 concurrent tasks
@@ -380,14 +394,35 @@ class NNeo4JImporter(NBaseImporter):
 
         logger.info(f"Completed scanning for inputPath: {inputPath}, inputLocation: {inputLocation}, inputName: {inputName}, currentOutputPath: {currentOutputPath}")
 
-                
     async def do_summarize_text(self, text, max_length=50, min_length=25) -> str:
-        # this only limits the creation of new threads.
         async with self.rate_limiter_summary:
-            return await self.summarize_text(text, max_length, min_length)
+            if self.use_api:
+                return await self.api_summarize_text(text, max_length, min_length)
+            else:
+                return await self.local_summarize_text(text, max_length, min_length)
+
+    @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=15, max=30),
+           retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)))
+    async def api_summarize_text(self, text, max_length, min_length):
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.post(
+                    self.api_url,
+                    json={"text": text, "max_length": max_length, "min_length": min_length},
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    timeout=60  # Add a timeout
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data["summary"]
+                    else:
+                        raise Exception(f"API request failed with status {response.status}")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.error(f"API summarization error: {e}")
+                raise  # Re-raise the error to trigger the retry
 
     @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=15, max=30))
-    async def summarize_text(self, text, max_length=50, min_length=25) -> str:
+    async def local_summarize_text(self, text, max_length=50, min_length=25) -> str:
         """
         Summarize the given text using a pre-trained model.
 
@@ -635,91 +670,182 @@ class NNeo4JImporter(NBaseImporter):
     async def update_progress_store(self, increment=1):
         if self.progress_callback_store:
             await self.progress_callback_store(increment)
-
+        
     async def summarize_all_cpp(self, project_id):
         try:
             tasks = await self.cpp_processor.prepare_summarization_tasks()
-            
-            summarization_tasks = []
-            for task_type, name, info in tasks:
-                if task_type == 'Class':
-                    summarization_tasks.append(self.summarize_cpp_class_prep(name, info))
-                elif task_type == 'Method':
-                    summarization_tasks.append(self.summarize_cpp_method_prep(name, info))
-                elif task_type == 'Function':
-                    summarization_tasks.append(self.summarize_cpp_function_prep(name, info))
+            semaphore = asyncio.Semaphore(5)  # Limit to 5 concurrent tasks
+            total_tasks = len(tasks)
+            completed_tasks = 0
 
-            results = await asyncio.gather(*summarization_tasks)
+            async def process_task(task):
+                nonlocal completed_tasks
+                async with semaphore:
+                    task_type, name, info = task
+                    try:
+                        if task_type == 'Class':
+                            await self.summarize_cpp_class_prep(name, info)
+                        elif task_type == 'Method':
+                            await self.summarize_cpp_method_prep(name, info)
+                        elif task_type == 'Function':
+                            await self.summarize_cpp_function_prep(name, info)
+                        completed_tasks += 1
+                        logger.info(f"Completed {completed_tasks}/{total_tasks} summarization tasks")
+                    except Exception as e:
+                        logger.error(f"Error in summarization task for {task_type} {name}: {e}")
+
+            await asyncio.gather(*[process_task(task) for task in tasks])
+
+            if completed_tasks != total_tasks:
+                logger.warning(f"Only {completed_tasks} out of {total_tasks} summarization tasks completed")
+
         except Exception as e:
-            logger.error(f"Error while gathering summarization and embedding tasks: {e}")
-            raise FileProcessingError(f"Error while gathering summarization and embedding tasks: {e}")
+            logger.error(f"Error while gathering summarization tasks: {e}")
+            raise FileProcessingError(f"Error while gathering summarization tasks: {e}")
+        
+#    async def summarize_all_cpp(self, project_id):
+#        try:
+#            tasks = await self.cpp_processor.prepare_summarization_tasks()
+#
+#            summarization_tasks = []
+#            for task_type, name, info in tasks:
+#                if task_type == 'Class':
+#                    summarization_tasks.append(self.summarize_cpp_class_prep(name, info))
+#                elif task_type == 'Method':
+#                    summarization_tasks.append(self.summarize_cpp_method_prep(name, info))
+#                elif task_type == 'Function':
+#                    summarization_tasks.append(self.summarize_cpp_function_prep(name, info))
+#
+#            total_tasks = len(summarization_tasks)
+#            completed_tasks = 0
+#
+#            # Use asyncio.as_completed to process tasks as they finish
+#            for future in asyncio.as_completed(summarization_tasks):
+#                try:
+#                    await future
+#                    completed_tasks += 1
+#                    logger.info(f"Completed {completed_tasks}/{total_tasks} summarization tasks")
+#                except Exception as e:
+#                    logger.error(f"Error in summarization task: {e}")
+#
+#            if completed_tasks != total_tasks:
+#                logger.warning(f"Only {completed_tasks} out of {total_tasks} summarization tasks completed")
+#
+#            # Ensure all tasks are completed
+##            await asyncio.gather(*summarization_tasks)
+#
+#        except Exception as e:
+#            logger.error(f"Error while gathering summarization and embedding tasks: {e}")
+#            raise FileProcessingError(f"Error while gathering summarization and embedding tasks: {e}")
 
+        
     async def summarize_cpp_class_prep(self, name, class_info):
         try:
             if name is None:
                 logger.info(f"Skipping anonymous class")
                 return class_info
-                
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_class_prep grabbing dict values: {e}")
+            raise FileProcessingError(f"Error in summarize_cpp_class_prep grabbing dict values: {e}")
+
+        try:
             class_name, class_scope, interface_summary, implementation_summary = await self.cpp_processor.summarize_cpp_class(class_info)
-            
         except Exception as e:
             logger.error(f"Error in summarize_cpp_class_prep calling summarize_cpp_class: {e}")
+#            await self.cpp_processor.update_classes(name, {})
             raise FileProcessingError(f"Error in summarize_cpp_class_prep calling summarize_cpp_class: {e}")
 
         try:
             interface_embedding = await self.make_embedding(interface_summary)
         except Exception as e:
             logger.error(f"Error in summarize_cpp_class_prep calling make_embedding for interface_summary: {e}")
+#            details = {
+#                'interface_summary': interface_summary,
+#                'implementation_summary': implementation_summary
+#            }
+#            await self.cpp_processor.update_classes(name, details)
+#            await self.cpp_processor.update_classes(name, {})
             raise FileProcessingError(f"Error in summarize_cpp_class_prep calling make_embedding for interface_summary: {e}")
-        
+            
         try:
             implementation_embedding = await self.make_embedding(implementation_summary)
         except Exception as e:
             logger.error(f"Error in summarize_cpp_class_prep calling make_embedding for implementation_summary: {e}")
+#            details = {
+#                'interface_summary': interface_summary,
+#                'implementation_summary': implementation_summary,
+#                'interface_embedding': interface_embedding
+#            }
+#            await self.cpp_processor.update_classes(name, details)
+#            await self.cpp_processor.update_classes(name, {})
             raise FileProcessingError(f"Error in summarize_cpp_class_prep calling make_embedding for implementation_summary: {e}")
         
-        details = {
-            'interface_summary': interface_summary,
-            'implementation_summary': implementation_summary,
-            'interface_embedding': interface_embedding,
-            'implementation_embedding': implementation_embedding
-        }
-        await self.cpp_processor.update_classes(name, details)
-        await self.update_progress_summarize(1)
-        logger.info(f"Finished summarizing/embedding class: {name}")
-        return class_info
+        try:
+            details = {
+                'interface_summary': interface_summary,
+                'implementation_summary': implementation_summary,
+                'interface_embedding': interface_embedding,
+                'implementation_embedding': implementation_embedding
+            }
+            await self.cpp_processor.update_classes(name, details)
+            await self.update_progress_summarize(1)
+            logger.info(f"Finished summarizing/embedding class: {name}")
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_class_prep for class {name}: {e}")
+            # Ensure we still update the class with empty details
+            await self.cpp_processor.update_classes(name, {})
+        finally:
+            return class_info
+            
+            
 
     async def summarize_cpp_method_prep(self, name, method_info):
         try:
             if name is None:
                 logger.info(f"Skipping anonymous method")
                 return method_info
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_method_prep grabbing dict values: {e}")
+            raise FileProcessingError(f"Error in summarize_cpp_method_prep grabbing dict values: {e}")
+
+        try:
             function_name, function_scope, function_summary = await self.cpp_processor.summarize_cpp_function(method_info)
         except Exception as e:
             logger.error(f"Error in summarize_cpp_method_prep: {e}\nmethod_info contents:\n{pprint.pformat(method_info, indent=4)}")
+#            await self.cpp_processor.update_methods(name, {})
             raise FileProcessingError(f"Error in summarize_cpp_method_prep calling summarize_cpp_function for method {name}: {e}")
         
         try:
             embedding = await self.make_embedding(function_summary)
         except Exception as e:
             logger.error(f"Error in summarize_cpp_method_prep calling make_embedding: {e}")
+#            details = {
+#                'summary': function_summary,
+#            }
+#            await self.cpp_processor.update_methods(name, details)
+#            await self.cpp_processor.update_methods(name, {})
             raise FileProcessingError(f"Error in summarize_cpp_method_prep calling make_embedding: {e}")
+        try:
+            details = {
+                'summary': function_summary,
+                'embedding': embedding
+            }
+            await self.cpp_processor.update_methods(name, details)
+            await self.update_progress_summarize(1)
+            logger.info(f"Finished summarizing/embedding cpp method: {name}")
+        except Exception as e:
+            logger.error(f"Error in summarize_cpp_method_prep for method {name}: {e}")
+            # Ensure we still update the method with empty details
+            await self.cpp_processor.update_methods(name, {})
+        finally:
+            return method_info
 
-        details = {
-            'summary': function_summary,
-            'embedding': embedding
-        }
-        await self.cpp_processor.update_methods(name, details)
-        await self.update_progress_summarize(1)
-        logger.info(f"Finished summarizing/embedding cpp method: {name}")
-        return method_info
 
     async def summarize_cpp_function_prep(self, name, function_info):
         try:
             if name is None:
                 logger.info(f"Skipping anonymous function")
                 return function_info
-
         except Exception as e:
             logger.error(f"Error in summarize_cpp_function_prep grabbing dict values: {e}")
             raise FileProcessingError(f"Error in summarize_cpp_function_prep grabbing dict values: {e}")
@@ -728,66 +854,103 @@ class NNeo4JImporter(NBaseImporter):
             function_name, function_scope, function_summary = await self.cpp_processor.summarize_cpp_function(function_info)
         except Exception as e:
             logger.error(f"Error in summarize_cpp_function_prep calling summarize_cpp_function: {e}")
+#            await self.cpp_processor.update_functions(name, {})
             raise FileProcessingError(f"Error in summarize_cpp_function_prep calling summarize_cpp_function: {e}")
 
         try:
             embedding = await self.make_embedding(function_summary)
         except Exception as e:
             logger.error(f"Error in summarize_cpp_function_prep calling make_embedding: {e}")
+#            details = {
+#                'summary': function_summary,
+#            }
+#            await self.cpp_processor.update_functions(name, details)
+#            await self.cpp_processor.update_functions(name, {})
             raise FileProcessingError(f"Error in summarize_cpp_function_prep calling make_embedding: {e}")
         
-        details = {
-            'summary': function_summary,
-            'embedding': embedding
-        }
         try:
+            details = {
+                'summary': function_summary,
+                'embedding': embedding
+            }
             await self.cpp_processor.update_functions(name, details)
             await self.update_progress_summarize(1)
             logger.info(f"Finished summarizing/embedding cpp function: {name}")
         except Exception as e:
             logger.error(f"Error in summarize_cpp_function_prep calling update_functions: {e}")
+            await self.cpp_processor.update_functions(name, {})
             raise FileProcessingError(f"Error in summarize_cpp_function_prep calling update_functions: {e}")
+        finally:
+            return function_info
 
-        return function_info
 
     async def store_all_cpp(self, project_id):
         try:
             tasks = await self.cpp_processor.prepare_summarization_tasks()
 
-            queue = asyncio.Queue()
-
-            # Create a task to process the queue
-            process_task = asyncio.create_task(self.process_cpp_storage_queue(queue, project_id))
-
             for task_type, name, info in tasks:
-                await queue.put((task_type, name, info))
-
-            # Signal that all items have been added to the queue
-            await queue.put(None)
-
-            # Wait for all items to be processed
-            await process_task
+                if task_type == 'Class':
+                    if 'interface_summary' not in info or 'implementation_summary' not in info:
+                        logger.warning(f"Class {name} missing summaries, skipping storage")
+                        continue
+                    await self.store_summary_cpp_class(name, info, project_id)
+                elif task_type == 'Method':
+                    if 'summary' not in info:
+                        logger.warning(f"Method {name} missing summary, skipping storage")
+                        continue
+                    await self.store_summary_cpp_method(name, info, project_id)
+                elif task_type == 'Function':
+                    if 'summary' not in info:
+                        logger.warning(f"Function {name} missing summary, skipping storage")
+                        continue
+                    await self.store_summary_cpp_function(name, info, project_id)
+                
+                await self.update_progress_store(1)
 
         except Exception as e:
             logger.error(f"Error in store_all_cpp: {e}")
             raise FileProcessingError(f"Error in store_all_cpp: {e}")
         
-    async def process_cpp_storage_queue(self, queue, project_id):
-        while True:
-            item = await queue.get()
-            if item is None:
-                break
-            item_type, name, info = item
-            if item_type == 'Class':
-                await self.store_summary_cpp_class(name, info, project_id)
-            elif item_type == 'Method':
-                await self.store_summary_cpp_method(name, info, project_id)
-            elif item_type == 'Function':
-                await self.store_summary_cpp_function(name, info, project_id)
-            await self.update_progress_store(1)
-            queue.task_done()
+#    async def store_all_cpp(self, project_id):
+#        try:
+#            tasks = await self.cpp_processor.prepare_summarization_tasks()
+#
+#            queue = asyncio.Queue()
+#
+#            # Create a task to process the queue
+#            process_task = asyncio.create_task(self.process_cpp_storage_queue(queue, project_id))
+#
+#            for task_type, name, info in tasks:
+#                await queue.put((task_type, name, info))
+#
+#            # Signal that all items have been added to the queue
+#            await queue.put(None)
+#
+#            # Wait for all items to be processed
+#            await process_task
+#
+#        except Exception as e:
+#            logger.error(f"Error in store_all_cpp: {e}")
+#            raise FileProcessingError(f"Error in store_all_cpp: {e}")
+#        
+#    async def process_cpp_storage_queue(self, queue, project_id):
+#        while True:
+#            item = await queue.get()
+#            if item is None:
+#                break
+#            item_type, name, info = item
+#            if item_type == 'Class':
+#                await self.store_summary_cpp_class(name, info, project_id)
+#            elif item_type == 'Method':
+#                await self.store_summary_cpp_method(name, info, project_id)
+#            elif item_type == 'Function':
+#                await self.store_summary_cpp_function(name, info, project_id)
+#            await self.update_progress_store(1)
+#            queue.task_done()
 
     async def store_summary_cpp_class(self, name, info, project_id):
+        logger.debug(f"Storing summary for class: {name}")
+        logger.debug(f"Class info: {info}")
         try:
             type_name = info.get('type', 'Class')
             if not type_name or not type_name.strip():
@@ -832,6 +995,7 @@ class NNeo4JImporter(NBaseImporter):
                 'file_path': file_path,
                 'raw_code': raw_code
             }
+            logger.debug(f"Query parameters for class {name}: {params}")
         except Exception as e:
             logger.error(f"Error forming query for CPP class {name}: {e}")
             raise FileProcessingError(f"Error forming query for CPP class {name}: {e}")
@@ -846,6 +1010,8 @@ class NNeo4JImporter(NBaseImporter):
             raise FileProcessingError(f"Error storing summary for CPP class {name}: {e}")
 
     async def store_summary_cpp_method(self, name, info, project_id):
+        logger.debug(f"Storing summary for method: {name}")
+        logger.debug(f"Method info: {info}")
         try:
             type_name = info.get('type', 'Method')
             if not type_name or not type_name.strip():
@@ -881,6 +1047,7 @@ class NNeo4JImporter(NBaseImporter):
                 'file_path': file_path,
                 'raw_code': raw_code
             }
+            logger.debug(f"Query parameters for method {name}: {params}")
         except Exception as e:
             logger.error(f"Error forming query for CPP method {name}: {e}\n{pprint.pformat(info, indent=4)}")
             raise FileProcessingError(f"Error forming query for CPP method {name}: {e}\n{pprint.pformat(info, indent=4)}")

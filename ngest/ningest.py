@@ -354,7 +354,7 @@ class NIngest:
                     logger.error(f"Error during CPP summarization in Ingest: {e}")
                     await self.cleanup_partial_ingestion(self.project_id)
                     return -1
-        
+    
         # Phase 3: Batching into the Database
         if self.stored_cpp_finished is not True:
             if self.summarized_cpp_finished == True and self.stored_cpp_started == False:

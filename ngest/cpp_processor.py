@@ -4,6 +4,7 @@
 import logging
 import traceback
 import asyncio
+from collections import deque
 from typing import Dict, Any
 import copy
 import pprint
@@ -18,17 +19,57 @@ import clang.cindex
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
 class CppProcessor:
     def __init__(self, do_summarize_text):
+        self.failed_nodes = deque()
+        self.max_retries = 3
+        self.retry_semaphore = asyncio.Semaphore(5)  # Limit concurrent retries
+
         self.do_summarize_text = do_summarize_text
+        
         self.classes = defaultdict(dict)
-        self.functions = defaultdict(dict)
         self.methods = defaultdict(dict)
+        self.functions = defaultdict(dict)
         self.header_files = {}
+        
         self.lock_classes = asyncio.Lock()
         self.lock_methods = asyncio.Lock()
         self.lock_functions = asyncio.Lock()
         self.lock_header_files = asyncio.Lock()
+
+    async def update_class(self, full_name, details):
+        async with self.lock_classes:
+            existing_info = self.classes.get(full_name, {})
+            if not existing_info or (details.get('is_cpp_file', False) and not existing_info.get('is_cpp_file', False)):
+                self.classes[full_name] = details
+            else:
+                merged_details = {**existing_info, **details}
+                if details.get('is_cpp_file', False):
+                    merged_details['raw_code'] = details.get('raw_code', existing_info.get('raw_code', ''))
+                self.classes[full_name] = merged_details
+
+    async def update_method(self, full_name, details):
+        async with self.lock_methods:
+            existing_info = self.methods.get(full_name, {})
+            if not existing_info or (details.get('is_cpp_file', False) and not existing_info.get('is_cpp_file', False)):
+                self.methods[full_name] = details
+            else:
+                merged_details = {**existing_info, **details}
+                if details.get('is_cpp_file', False):
+                    merged_details['raw_code'] = details.get('raw_code', existing_info.get('raw_code', ''))
+                self.methods[full_name] = merged_details
+
+    async def update_function(self, full_name, details):
+        async with self.lock_functions:
+            existing_info = self.functions.get(full_name, {})
+            if not existing_info or (details.get('is_cpp_file', False) and not existing_info.get('is_cpp_file', False)):
+                self.functions[full_name] = details
+            else:
+                merged_details = {**existing_info, **details}
+                if details.get('is_cpp_file', False):
+                    merged_details['raw_code'] = details.get('raw_code', existing_info.get('raw_code', ''))
+                self.functions[full_name] = merged_details
 
     async def process_cpp_file(self, inputPath: str, inputLocation: str, project_id: str):
         logger.info(f"Starting to process C++ file: {inputPath}")
@@ -65,6 +106,9 @@ class CppProcessor:
             await self.process_nodes(translation_unit.cursor, inputLocation, project_id, inputPath.endswith('.cpp'))
             logger.info(f"Finished processing nodes for {inputPath}")
 
+            # After processing all nodes, retry any failed nodes
+            await self.retry_failed_nodes(inputLocation, project_id)
+
         except clang.cindex.TranslationUnitLoadError as tu_error:
             logger.error(f"TranslationUnitLoadError for {inputPath}: {tu_error}")
             logger.error(f"Clang diagnostics: {[diag.spelling for diag in translation_unit.diagnostics]}")
@@ -100,204 +144,252 @@ class CppProcessor:
         return tasks
     
     
+    async def retry_failed_nodes(self, project_path, project_id):
+        retry_tasks = []
+        while self.failed_nodes:
+            node, _, _, is_cpp_file, retry_count = self.failed_nodes.popleft()
+            if retry_count >= self.max_retries:
+                logger.warning(f"Node {node.spelling} has reached max retries. Skipping.")
+                continue
+            retry_tasks.append(self.retry_single_node(node, project_path, project_id, is_cpp_file, retry_count))
+
+        await asyncio.gather(*retry_tasks)
+
+        if self.failed_nodes:
+            logger.warning(f"{len(self.failed_nodes)} nodes still failed after retries")
+
+
+    async def retry_single_node(self, node, project_path, project_id, is_cpp_file, retry_count):
+        async with self.retry_semaphore:
+            try:
+                logger.info(f"Retrying node {node.spelling} (attempt {retry_count + 1})")
+                await self.process_nodes(node, project_path, project_id, is_cpp_file)
+            except Exception as e:
+                logger.error(f"Error retrying node {node.spelling}: {e}")
+                self.failed_nodes.append((node, project_path, project_id, is_cpp_file, retry_count + 1))
+                
     async def process_nodes(self, node, project_path, project_id, is_cpp_file):
+        try:
+            # Process the current node
+            await self.process_single_node(node, project_path, project_id, is_cpp_file)
+            
+            # Recursively process child nodes
+            for child in node.get_children():
+                if project_path in child.location.file.name:
+                    await self.process_nodes(child, project_path, project_id, is_cpp_file)
+        except Exception as e:
+            logger.error(f"Error processing node {node.spelling}: {e}")
+            self.failed_nodes.append((node, project_path, project_id, is_cpp_file, 0))
+
+    async def process_single_node(self, node, project_path, project_id, is_cpp_file):
         def is_exported(node):
             for token in node.get_tokens():
                 if token.spelling in ["__declspec(dllexport)", "__attribute__((visibility(\"default\")))"]:
                     return True
             return False
+        try:
+            for child in node.get_children():
+                file_name = child.location.file.name if child.location.file else ''
+                if project_path in file_name:
+                    if child.kind in (clang.cindex.CursorKind.CLASS_DECL, clang.cindex.CursorKind.STRUCT_DECL,
+                                      clang.cindex.CursorKind.CLASS_TEMPLATE, clang.cindex.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION):
+                        type_name = "Class" if child.kind == clang.cindex.CursorKind.CLASS_DECL else "Struct" if child.kind == clang.cindex.CursorKind.STRUCT_DECL else "ClassTemplate"
+                        class_name = child.spelling
+                        full_scope = self.get_full_scope(child)
+                        fully_qualified_name = f"{full_scope}::{class_name}" if full_scope else class_name
 
-        for child in node.get_children():
-            file_name = child.location.file.name if child.location.file else ''
-            if project_path in file_name:
-                if child.kind in (clang.cindex.CursorKind.CLASS_DECL, clang.cindex.CursorKind.STRUCT_DECL):
-                    type_name = "Class" if child.kind == clang.cindex.CursorKind.CLASS_DECL else "Struct"
-                    class_name = child.spelling
-                    full_scope = self.get_full_scope(child)
-                    fully_qualified_name = f"{full_scope}::{class_name}" if full_scope else class_name
-                    interface_description = ""
-                    implementation_description = ""
+                        logger.debug(f"Processing {type_name}: {fully_qualified_name} in file {file_name}")
 
-                    description = f"Class {class_name} in scope {full_scope} defined in {file_name}"
-                    raw_comment = child.raw_comment if child.raw_comment else ''
-                    if raw_comment:
-                        description += f" with documentation: {raw_comment.strip()}"
+                        interface_description = ""
+                        implementation_description = ""
 
-                    # Base classes
-                    bases = [base for base in child.get_children() if base.kind == clang.cindex.CursorKind.CXX_BASE_SPECIFIER]
-                    if bases:
-                        base_names = [f"{base.spelling} in scope {self.get_full_scope(base.type.get_declaration())}" for base in bases]
-                        description += f". Inherits from: {', '.join(base_names)}"
+                        description = f"{type_name} {class_name} in scope {full_scope} defined in {file_name}"
+                        raw_comment = child.raw_comment if child.raw_comment else ''
+                        if raw_comment:
+                            description += f" with documentation: {raw_comment.strip()}"
 
-                    is_node_exported = is_exported(child)
-                    if is_node_exported:
-                        description += ". (EXPORTED)"
+                        # Base classes
+                        bases = [base for base in child.get_children() if base.kind == clang.cindex.CursorKind.CXX_BASE_SPECIFIER]
+                        if bases:
+                            base_names = [f"{base.spelling} in scope {self.get_full_scope(base.type.get_declaration())}" for base in bases]
+                            description += f". Inherits from: {', '.join(base_names)}"
 
-                    # Public members of the class
-                    members = []
+                        is_node_exported = is_exported(child)
+                        if is_node_exported:
+                            description += ". (EXPORTED)"
 
-                    def get_public_members(node, inherited=False):
-                        for member in node.get_children():
-                            if member.access_specifier == clang.cindex.AccessSpecifier.PUBLIC:
+                        # Public members of the class
+                        members = []
+
+                        def get_public_members(node, inherited=False):
+                            for member in node.get_children():
+                                if member.access_specifier == clang.cindex.AccessSpecifier.PUBLIC:
+                                    origin = " (inherited)" if inherited else ""
+                                    export_status = "exported" if is_node_exported else "not exported"
+                                    if member.kind == clang.cindex.CursorKind.CXX_METHOD:
+                                        members.append(f"public method {member.spelling} in scope {self.get_full_scope(member)} ({export_status}){origin}")
+                                    elif member.kind == clang.cindex.CursorKind.FIELD_DECL:
+                                        members.append(f"public attribute {member.spelling} of type {member.type.spelling} in scope {self.get_full_scope(member)} ({export_status}){origin}")
+
+                        # Get public members of the class itself
+                        get_public_members(child, inherited=False)
+
+                        # Get public members of base classes
+                        for base in bases:
+                            if base.type and base.type.get_declaration().kind == clang.cindex.CursorKind.CLASS_DECL:
+                                base_class = base.type.get_declaration()
+                                get_public_members(base_class, inherited=True)
+
+                        if members:
+                            interface_description = "Public interface: " + ", ".join(members)
+
+                        members = []
+
+                        def get_implementation_members(node, inherited=False):
+                            for member in node.get_children():
                                 origin = " (inherited)" if inherited else ""
-                                export_status = "exported" if is_node_exported else "not exported"
-                                if member.kind == clang.cindex.CursorKind.CXX_METHOD:
-                                    members.append(f"public method {member.spelling} in scope {self.get_full_scope(member)} ({export_status}){origin}")
-                                elif member.kind == clang.cindex.CursorKind.FIELD_DECL:
-                                    members.append(f"public attribute {member.spelling} of type {member.type.spelling} in scope {self.get_full_scope(member)} ({export_status}){origin}")
+                                if member.access_specifier == clang.cindex.AccessSpecifier.PRIVATE:
+                                    if member.kind == clang.cindex.CursorKind.CXX_METHOD:
+                                        members.append(f"private method {member.spelling} in scope {self.get_full_scope(member)}{origin}")
+                                    elif member.kind == clang.cindex.CursorKind.FIELD_DECL:
+                                        members.append(f"private attribute {member.spelling} of type {member.type.spelling} in scope {self.get_full_scope(member)}{origin}")
+                                    elif member.kind == clang.cindex.CursorKind.VAR_DECL:
+                                        members.append(f"private static {member.spelling} of type {member.type.spelling} in scope {self.get_full_scope(member)}{origin}")
+                                elif member.access_specifier == clang.cindex.AccessSpecifier.PROTECTED and inherited:
+                                    if member.kind == clang.cindex.CursorKind.CXX_METHOD:
+                                        members.append(f"protected method {member.spelling} in scope {self.get_full_scope(member)}{origin}")
+                                    elif member.kind == clang.cindex.CursorKind.FIELD_DECL:
+                                        members.append(f"protected attribute {member.spelling} of type {member.type.spelling} in scope {self.get_full_scope(member)}{origin}")
 
-                    # Get public members of the class itself
-                    get_public_members(child, inherited=False)
+                        # Get implementation members of the class itself
+                        get_implementation_members(child, inherited=False)
 
-                    # Get public members of base classes
-                    for base in bases:
-                        if base.type and base.type.get_declaration().kind == clang.cindex.CursorKind.CLASS_DECL:
-                            base_class = base.type.get_declaration()
-                            get_public_members(base_class, inherited=True)
+                        # Get protected members of base classes
+                        for base in bases:
+                            if base.type and base.type.get_declaration().kind == clang.cindex.CursorKind.CLASS_DECL:
+                                base_class = base.type.get_declaration()
+                                get_implementation_members(base_class, inherited=True)
 
-                    if members:
-                        interface_description = "Public interface: " + ", ".join(members)
+                        if members:
+                            implementation_description = "Implementation details: " + ", ".join(members)
 
-                    members = []
-
-                    def get_implementation_members(node, inherited=False):
-                        for member in node.get_children():
-                            origin = " (inherited)" if inherited else ""
-                            if member.access_specifier == clang.cindex.AccessSpecifier.PRIVATE:
-                                if member.kind == clang.cindex.CursorKind.CXX_METHOD:
-                                    members.append(f"private method {member.spelling} in scope {self.get_full_scope(member)}{origin}")
-                                elif member.kind == clang.cindex.CursorKind.FIELD_DECL:
-                                    members.append(f"private attribute {member.spelling} of type {member.type.spelling} in scope {self.get_full_scope(member)}{origin}")
-                                elif member.kind == clang.cindex.CursorKind.VAR_DECL:
-                                    members.append(f"private static {member.spelling} of type {member.type.spelling} in scope {self.get_full_scope(member)}{origin}")
-                            elif member.access_specifier == clang.cindex.AccessSpecifier.PROTECTED and inherited:
-                                if member.kind == clang.cindex.CursorKind.CXX_METHOD:
-                                    members.append(f"protected method {member.spelling} in scope {self.get_full_scope(member)}{origin}")
-                                elif member.kind == clang.cindex.CursorKind.FIELD_DECL:
-                                    members.append(f"protected attribute {member.spelling} of type {member.type.spelling} in scope {self.get_full_scope(member)}{origin}")
-
-                    # Get implementation members of the class itself
-                    get_implementation_members(child, inherited=False)
-
-                    # Get protected members of base classes
-                    for base in bases:
-                        if base.type and base.type.get_declaration().kind == clang.cindex.CursorKind.CLASS_DECL:
-                            base_class = base.type.get_declaration()
-                            get_implementation_members(base_class, inherited=True)
-
-                    if members:
-                        implementation_description = "Implementation details: " + ", ".join(members)
-
-                    async with self.lock_header_files:
-                        header_code = self.header_files.get(file_name, '')
-
-                    # Cache class information
-                    details = {
-                        'type': type_name,
-                        'name': fully_qualified_name,
-                        'scope': full_scope,
-                        'short_name': class_name,
-                        'description' : description,
-                        'interface_description' : interface_description,
-                        'implementation_description' : implementation_description,
-                        'raw_comment': raw_comment,
-                        'file_path': file_name,
-                        'raw_code': header_code
-                    }
-                    await self.update_classes(fully_qualified_name, details)
-
-                    await self.process_nodes(child, project_path, project_id, is_cpp_file)
-
-                elif child.kind == clang.cindex.CursorKind.CXX_METHOD:
-                    type_name = "Method"
-                    class_name = self.get_full_scope(child)
-                    full_scope = class_name
-                    method_name = child.spelling
-                    fully_qualified_method_name = f"{class_name}::{method_name}" if class_name else method_name
-
-                    description = f"Method {method_name} in class {full_scope} defined in {file_name}"
-                    raw_comment = child.raw_comment if child.raw_comment else ''
-                    if raw_comment:
-                        description += f" with documentation: {raw_comment.strip()}"
-
-                    is_node_exported = is_exported(child)
-                    if is_node_exported:
-                        description += ". (EXPORTED)"
-
-                    # Parameters and return type
-                    params = [f"{param.type.spelling} {param.spelling}" for param in child.get_arguments()]
-                    return_type = child.result_type.spelling
-                    description += f". Returns {return_type} and takes parameters: {', '.join(params)}"
-
-                    description += "."
-
-                    async with self.lock_methods:
-                        is_new_method = True if fully_qualified_method_name not in self.methods else False
-
-                    # Cache method information, prioritize CPP file
-                    if is_cpp_file or is_new_method:
+                        async with self.lock_header_files:
+                            header_code = self.header_files.get(file_name, '')
                         raw_code = await self.get_raw_code(child) if is_cpp_file else ''
-                        # Cache method information
                         details = {
                             'type': type_name,
-                            'name': fully_qualified_method_name,
+                            'name': fully_qualified_name,
                             'scope': full_scope,
-                            'short_name': method_name,
-                            'return_type': return_type,
-                            'description' : description,
+                            'short_name': class_name,
+                            'description': description,
+                            'interface_description': interface_description,
+                            'implementation_description': implementation_description,
                             'raw_comment': raw_comment,
                             'file_path': file_name,
                             'is_cpp_file': is_cpp_file,
                             'raw_code': raw_code
                         }
-                        await self.update_methods(fully_qualified_method_name, details)
+                        await self.update_class(fully_qualified_name, details)
+                        logger.debug(f"Finished processing {type_name}: {fully_qualified_name}")
 
-                elif child.kind == clang.cindex.CursorKind.FUNCTION_DECL:
-                    type_name = "Function"
-                    function_name = child.spelling
-                    full_scope = self.get_full_scope(child)
-                    fully_qualified_function_name = f"{full_scope}::{function_name}" if full_scope else function_name
+                    elif child.kind == clang.cindex.CursorKind.CXX_METHOD:
+                        logger.debug(f"Processing method: {child.spelling} in file {file_name}")
+                        type_name = "Method"
+                        class_name = self.get_full_scope(child)
+                        full_scope = class_name
+                        method_name = child.spelling
+                        fully_qualified_method_name = f"{class_name}::{method_name}" if class_name else method_name
 
-                    description = f"Function {function_name} in scope {full_scope} defined in {file_name}"
-                    raw_comment = child.raw_comment if child.raw_comment else ''
-                    if raw_comment:
-                        description += f" with documentation: {raw_comment.strip()}"
+                        description = f"Method {method_name} in class {full_scope} defined in {file_name}"
+                        raw_comment = child.raw_comment if child.raw_comment else ''
+                        if raw_comment:
+                            description += f" with documentation: {raw_comment.strip()}"
 
-                    is_node_exported = is_exported(child)
-                    if is_node_exported:
-                        description += ". (EXPORTED)"
+                        is_node_exported = is_exported(child)
+                        if is_node_exported:
+                            description += ". (EXPORTED)"
 
-                    # Parameters and return type
-                    params = [f"{param.type.spelling} {param.spelling}" for param in child.get_arguments()]
-                    return_type = child.result_type.spelling
-                    description += f". Returns {return_type} and takes parameters: {', '.join(params)}"
+                        # Parameters and return type
+                        params = [f"{param.type.spelling} {param.spelling}" for param in child.get_arguments()]
+                        return_type = child.result_type.spelling
+                        description += f". Returns {return_type} and takes parameters: {', '.join(params)}"
 
-                    description += "."
+                        description += "."
 
-                    async with self.lock_functions:
-                        is_new_function = True if fully_qualified_function_name not in self.functions else False
+                        async with self.lock_methods:
+                            is_new_method = True if fully_qualified_method_name not in self.methods else False
 
-                    # Store function information, prioritize CPP file
-                    if is_cpp_file or is_new_function:
-                        raw_code = await self.get_raw_code(child) if is_cpp_file else ''
-                        details = {
-                            'type': type_name,
-                            'name': fully_qualified_function_name,
-                            'scope': full_scope,
-                            'short_name': function_name,
-                            'description' : description,
-                            'return_type': return_type,
-                            'raw_comment': raw_comment,
-                            'file_path': file_name,
-                            'is_cpp_file': is_cpp_file,
-                            'raw_code': raw_code
-                        }
-                        # Cache function information
-                        await self.update_functions(fully_qualified_function_name, details)
-                else:
-                    await self.process_nodes(child, project_path, project_id, is_cpp_file)
-                    
-                    
+                        # Cache method information, prioritize CPP file
+                        if is_cpp_file or is_new_method:
+                            raw_code = await self.get_raw_code(child) if is_cpp_file else ''
+                            # Cache method information
+                            details = {
+                                'type': type_name,
+                                'name': fully_qualified_method_name,
+                                'scope': full_scope,
+                                'short_name': method_name,
+                                'return_type': return_type,
+                                'description': description,
+                                'raw_comment': raw_comment,
+                                'file_path': file_name,
+                                'is_cpp_file': is_cpp_file,
+                                'raw_code': raw_code
+                            }
+                            await self.update_method(fully_qualified_method_name, details)
+                        logger.debug(f"Finished processing method: {fully_qualified_method_name}")
+
+                    elif child.kind == clang.cindex.CursorKind.FUNCTION_DECL:
+                        logger.debug(f"Processing function: {child.spelling} in file {file_name}")
+                        type_name = "Function"
+                        function_name = child.spelling
+                        full_scope = self.get_full_scope(child)
+                        fully_qualified_function_name = f"{full_scope}::{function_name}" if full_scope else function_name
+
+                        description = f"Function {function_name} in scope {full_scope} defined in {file_name}"
+                        raw_comment = child.raw_comment if child.raw_comment else ''
+                        if raw_comment:
+                            description += f" with documentation: {raw_comment.strip()}"
+
+                        is_node_exported = is_exported(child)
+                        if is_node_exported:
+                            description += ". (EXPORTED)"
+
+                        # Parameters and return type
+                        params = [f"{param.type.spelling} {param.spelling}" for param in child.get_arguments()]
+                        return_type = child.result_type.spelling
+                        description += f". Returns {return_type} and takes parameters: {', '.join(params)}"
+
+                        description += "."
+
+                        async with self.lock_functions:
+                            is_new_function = True if fully_qualified_function_name not in self.functions else False
+
+                        # Store function information, prioritize CPP file
+                        if is_cpp_file or is_new_function:
+                            raw_code = await self.get_raw_code(child) if is_cpp_file else ''
+                            details = {
+                                'type': type_name,
+                                'name': fully_qualified_function_name,
+                                'scope': full_scope,
+                                'short_name': function_name,
+                                'description': description,
+                                'return_type': return_type,
+                                'raw_comment': raw_comment,
+                                'file_path': file_name,
+                                'is_cpp_file': is_cpp_file,
+                                'raw_code': raw_code
+                            }
+                            # Cache function information
+                            await self.update_function(fully_qualified_function_name, details)
+                        logger.debug(f"Finished processing function: {fully_qualified_function_name}")
+                    else:
+                        await self.process_nodes(child, project_path, project_id, is_cpp_file)
+        except Exception as e:
+            logger.error(f"Error processing node {node.spelling}: {e}")
+            logger.error(f"Node details: kind={node.kind}, location={node.location}, type={node.type.spelling if node.type else 'None'}")
+            self.failed_nodes.append((node, project_path, project_id, is_cpp_file, 0))
+            
+        
     async def update_classes(self, full_name, details):
         async with self.lock_classes:
             self.classes[full_name].update(details)
@@ -334,7 +426,6 @@ class CppProcessor:
                 return ''
         return ''
         
-
     async def summarize_cpp_class(self, class_info) -> (str, str, str, str):
         """
         Summarize a C++ class.
@@ -345,7 +436,7 @@ class CppProcessor:
         Returns:
             str: The summary of the class.
         """
-        
+        logger.debug(f"Starting summarization for class: {class_info.get('name', 'Unknown')}")
         try:
             class_name, full_scope, interface_summary, interface_description = await self.summarize_cpp_class_public_interface(class_info)
         except Exception as e:
@@ -353,6 +444,9 @@ class CppProcessor:
             raise DatabaseError(f"Error in summarize_cpp_class_public_interface for {class_name}: {e}")
         try:
             implementation_summary, implementation_description = await self.summarize_cpp_class_implementation(class_info)
+            logger.debug(f"Finished summarization for class: {class_info.get('name', 'Unknown')}. "
+                         f"Interface summary length: {len(interface_summary)}, "
+                         f"Implementation summary length: {len(implementation_summary)}")
         except Exception as e:
             logger.error(f"Error in summarize_cpp_class_implementationfor {class_name}: {e}")
             raise DatabaseError(f"Error in summarize_cpp_class_implementation for {class_name}: {e}")
@@ -445,6 +539,7 @@ class CppProcessor:
             logger.error(f"Error in summarize_cpp_class_implementation: {e}")
             raise DatabaseError(f"Error in summarize_cpp_class_implementation: {e}")
 
+
     async def summarize_cpp_function(self, node_info) -> (str, str, str):
         """
         Summarize a C++ function.
@@ -455,7 +550,8 @@ class CppProcessor:
         Returns:
             str: The summary of the function or method.
         """
-        
+        logger.debug(f"Starting summarization for function: {node_info.get('name', 'Unknown')}")
+
         type_name = node_info.get('type', 'Function')
         full_name = node_info.get('name', 'anonymous')
         full_scope = node_info.get('scope', '')
@@ -488,6 +584,8 @@ class CppProcessor:
         
         try:
             retval = full_name, full_scope, summary + "\n\n" + description
+            logger.debug(f"Finished summarization for function: {node_info.get('name', 'Unknown')}. "
+                         f"Summary length: {len(summary)}")
         except Exception as e:
             logger.error(f"Error in summarize_cpp_function appending strings: {e}\nnode_info contents:\n{pprint.pformat(node_info, indent=4)}")
             raise DatabaseError(f"Error in summarize_cpp_function appending strings: {e}\nnode_info contents:\n{pprint.pformat(node_info, indent=4)}")
