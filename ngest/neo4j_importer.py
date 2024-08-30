@@ -41,6 +41,7 @@ from ngest.cpp_processor import CppProcessor
 from ngest.custom_errors import FileProcessingError
 
 # Load environment variables
+# Load environment variables
 dotenv.load_dotenv()
 
 # Constants (now loaded from environment variables with fallbacks to config file)
@@ -56,7 +57,14 @@ DEFAULT_NEO4J_URL = "bolt://localhost:7689"
 DEFAULT_NEO4J_USER = "neo4j"
 DEFAULT_NEO4J_PASSWORD = "mynewpassword"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
-DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
+DEFAULT_EMBEDDING_LOCAL_MODEL = "nomic-embed-text"
+DEFAULT_EMBEDDING_API_MODEL = "text-embedding-ada-002"
+
+DEFAULT_SUMMARY_API_MODEL = "gpt-4o-mini"
+DEFAULT_SUMMARY_API_URL = "https://api.openai.com/v1/chat/completions"
+DEFAULT_SUMMARY_API_KEY = "your-summary-api-key"  # Replace with your default key if needed
+
+DEFAULT_EMBEDDING_API_URL = "https://api.openai.com/v1/embeddings"
 
 if not os.path.exists(config_dir):
     os.makedirs(config_dir)
@@ -67,7 +75,8 @@ if not os.path.isfile(config_file):
                 f"[Chunks]\nMEDIUM_CHUNK_SIZE = {DEFAULT_MEDIUM_CHUNK_SIZE}\nSMALL_CHUNK_SIZE = {DEFAULT_SMALL_CHUNK_SIZE}\n\n"
                 f"[Database]\nNEO4J_URL = {DEFAULT_NEO4J_URL}\nNEO4J_USER = {DEFAULT_NEO4J_USER}\nNEO4J_PASSWORD = {DEFAULT_NEO4J_PASSWORD}\n\n"
                 f"[Ollama]\nOLLAMA_URL = {DEFAULT_OLLAMA_URL}\n\n"
-                f"[Models]\nEMBEDDING_MODEL = {DEFAULT_EMBEDDING_MODEL}")
+                f"[Models]\nEMBEDDING_LOCAL_MODEL = {DEFAULT_EMBEDDING_LOCAL_MODEL}\nEMBEDDING_API_MODEL = {DEFAULT_EMBEDDING_API_MODEL}\n\n"
+                f"[SummaryAPI]\nSUMMARY_API_URL = {DEFAULT_SUMMARY_API_URL}\nSUMMARY_API_MODEL = {DEFAULT_SUMMARY_API_MODEL}\nSUMMARY_API_KEY = {DEFAULT_SUMMARY_API_KEY}")
 else:
     config.read(config_file)
 
@@ -78,10 +87,16 @@ NEO4J_URL = os.getenv('NEO4J_URL', config.get('Database', 'NEO4J_URL', fallback=
 NEO4J_USER = os.getenv('NEO4J_USER', config.get('Database', 'NEO4J_USER', fallback=DEFAULT_NEO4J_USER))
 NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD', config.get('Database', 'NEO4J_PASSWORD', fallback=DEFAULT_NEO4J_PASSWORD))
 OLLAMA_URL = os.getenv('OLLAMA_URL', config.get('Ollama', 'OLLAMA_URL', fallback=DEFAULT_OLLAMA_URL))
-EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', config.get('Models', 'EMBEDDING_MODEL', fallback=DEFAULT_EMBEDDING_MODEL))
+
+EMBEDDING_LOCAL_MODEL = os.getenv('EMBEDDING_LOCAL_MODEL', config.get('Models', 'EMBEDDING_LOCAL_MODEL', fallback=DEFAULT_EMBEDDING_LOCAL_MODEL))
+EMBEDDING_API_MODEL = os.getenv('EMBEDDING_API_MODEL', config.get('Models', 'EMBEDDING_API_MODEL', fallback=DEFAULT_EMBEDDING_API_MODEL))
+
+SUMMARY_API_URL = os.getenv('SUMMARY_API_URL', config.get('SummaryAPI', 'SUMMARY_API_URL', fallback=DEFAULT_SUMMARY_API_URL))
+SUMMARY_API_MODEL = os.getenv('SUMMARY_API_MODEL', config.get('SummaryAPI', 'SUMMARY_API_MODEL', fallback=DEFAULT_SUMMARY_API_MODEL))
+SUMMARY_API_KEY = os.getenv('SUMMARY_API_KEY', config.get('SummaryAPI', 'SUMMARY_API_KEY', fallback=DEFAULT_SUMMARY_API_KEY))
 
 # Configure logging with different levels
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.info, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Set the logging level based on a condition (e.g., a command-line argument or an environment variable)
@@ -97,10 +112,11 @@ class NNeo4JImporter(NBaseImporter):
     """
     A file importer that ingests various file types into a Neo4j database.
     """
-    def __init__(self, neo4j_url: str = NEO4J_URL, neo4j_user: str = NEO4J_USER, neo4j_password: str = NEO4J_PASSWORD, use_api=False, api_url=None, api_key=None):
+    def __init__(self, neo4j_url: str = NEO4J_URL, neo4j_user: str = NEO4J_USER, neo4j_password: str = NEO4J_PASSWORD, use_api=True, api_url=SUMMARY_API_URL, api_key=SUMMARY_API_KEY):
         self.use_api = use_api
-        self.api_url = api_url
-        self.api_key = api_key
+        self.summary_api_url = api_url
+        self.summary_api_key = api_key
+        self.summary_api_model = SUMMARY_API_MODEL
         self.cpp_processor = CppProcessor(do_summarize_text=self.do_summarize_text)
         self.neo4j_url = neo4j_url
         self.neo4j_user = neo4j_user
@@ -132,8 +148,8 @@ class NNeo4JImporter(NBaseImporter):
             self.rate_limiter_summary = AsyncLimiter(10, 1)  # 10 operations per second for API
             self.rate_limiter_embedding = AsyncLimiter(10, 1)  # 10 operations per second for API
         else:
-            self.rate_limiter_summary = AsyncLimiter(2, 1)  # 2 operations per second for local
-            self.rate_limiter_embedding = AsyncLimiter(2, 1)  # 2 operations per second for local
+            self.rate_limiter_summary = AsyncLimiter(1, 1)  # 2 operations per second for local
+            self.rate_limiter_embedding = AsyncLimiter(1, 1)  # 2 operations per second for local
 
         self.bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
         self.bert_model = BertModel.from_pretrained('bert-base-uncased').to(self.device)
@@ -397,29 +413,92 @@ class NNeo4JImporter(NBaseImporter):
     async def do_summarize_text(self, text, max_length=50, min_length=25) -> str:
         async with self.rate_limiter_summary:
             if self.use_api:
-                return await self.api_summarize_text(text, max_length, min_length)
+                return await self.api_summarize_text(text)
             else:
                 return await self.local_summarize_text(text, max_length, min_length)
 
     @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=15, max=30),
            retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)))
-    async def api_summarize_text(self, text, max_length, min_length):
+    async def api_summarize_text(self, text):
+        payload = {
+            "model": self.summary_api_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Summarize the content you are provided."
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": text
+                        }
+                    ]
+                }
+            ],
+            "temperature": 1,
+            "max_tokens": 256,
+            "top_p": 1,
+            "frequency_penalty": 0,
+            "presence_penalty": 0,
+            "response_format": {
+                "type": "text"
+            }
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.summary_api_key}"
+        }
+
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.post(
-                    self.api_url,
-                    json={"text": text, "max_length": max_length, "min_length": min_length},
-                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    self.summary_api_url,  # Ensure this is set to "https://api.openai.com/v1/chat/completions"
+                    json=payload,
+                    headers=headers,
                     timeout=60  # Add a timeout
                 ) as response:
                     if response.status == 200:
                         data = await response.json()
-                        return data["summary"]
+                        if isinstance(data["choices"][0]["message"]["content"], list):
+                            summary = data["choices"][0]["message"]["content"][0]["text"]
+                        else:
+                            summary = data["choices"][0]["message"]["content"]
+                        return summary
+#                    if response.status == 200:
+#                        data = await response.json()
+#                        summary = data["choices"][0]["message"]["content"][0]["text"]
+#                        return summary
                     else:
                         raise Exception(f"API request failed with status {response.status}")
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.error(f"API summarization error: {e}")
                 raise  # Re-raise the error to trigger the retry
+               
+#    async def api_summarize_text(self, text, max_length, min_length):
+#        async with aiohttp.ClientSession() as session:
+#            try:
+#                async with session.post(
+#                    self.summary_api_url,
+#                    json={"text": text, "max_length": max_length, "min_length": min_length},
+#                    headers={"Authorization": f"Bearer {self.summary_api_key}"},
+#                    timeout=60  # Add a timeout
+#                ) as response:
+#                    if response.status == 200:
+#                        data = await response.json()
+#                        return data["summary"]
+#                    else:
+#                        raise Exception(f"API request failed with status {response.status}")
+#            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+#                logger.error(f"API summarization error: {e}")
+#                raise  # Re-raise the error to trigger the retry
 
     @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=15, max=30))
     async def local_summarize_text(self, text, max_length=50, min_length=25) -> str:
@@ -671,38 +750,76 @@ class NNeo4JImporter(NBaseImporter):
         if self.progress_callback_store:
             await self.progress_callback_store(increment)
         
+#    async def summarize_all_cpp(self, project_id):
+#        try:
+#            tasks = await self.cpp_processor.prepare_summarization_tasks()
+#            logger.info(f"Prepared {len(tasks)} summarization tasks")
+#
+#            for task_type, name, info in tasks:
+#                logger.info(f"Starting summarization for {task_type} {name}")
+#                try:
+#                    if task_type == 'Class':
+#                        await self.summarize_cpp_class_prep(name, info)
+#                    elif task_type == 'Method':
+#                        await self.summarize_cpp_method_prep(name, info)
+#                    elif task_type == 'Function':
+#                        await self.summarize_cpp_function_prep(name, info)
+#                    logger.info(f"Completed summarization for {task_type} {name}")
+#                except Exception as e:
+#                    logger.error(f"Error in summarization task for {task_type} {name}: {e}")
+#
+#            logger.info("Completed all summarization tasks")
+#
+#        except Exception as e:
+#            logger.error(f"Error while gathering summarization tasks: {e}")
+#            raise FileProcessingError(f"Error while gathering summarization tasks: {e}")
+        
     async def summarize_all_cpp(self, project_id):
         try:
             tasks = await self.cpp_processor.prepare_summarization_tasks()
             semaphore = asyncio.Semaphore(5)  # Limit to 5 concurrent tasks
             total_tasks = len(tasks)
             completed_tasks = 0
+            logger.info(f"Prepared {total_tasks} summarization tasks")
 
             async def process_task(task):
                 nonlocal completed_tasks
                 async with semaphore:
                     task_type, name, info = task
                     try:
+                        logger.info(f"Starting summarization for {task_type} {name}")
                         if task_type == 'Class':
-                            await self.summarize_cpp_class_prep(name, info)
+                            result = await self.summarize_cpp_class_prep(name, info)
                         elif task_type == 'Method':
-                            await self.summarize_cpp_method_prep(name, info)
+                            result = await self.summarize_cpp_method_prep(name, info)
                         elif task_type == 'Function':
-                            await self.summarize_cpp_function_prep(name, info)
-                        completed_tasks += 1
-                        logger.info(f"Completed {completed_tasks}/{total_tasks} summarization tasks")
+                            result = await self.summarize_cpp_function_prep(name, info)
+                        else:
+                            logger.warning(f"Unknown task type {task_type} for {name}")
+                            return
+
+                        if result:
+                            logger.info(f"Completed summarization for {task_type} {name}")
+                            completed_tasks += 1
+                            logger.info(f"Completed {completed_tasks}/{total_tasks} summarization tasks")
+                        else:
+                            logger.warning(f"Summarization for {task_type} {name} did not produce a result")
                     except Exception as e:
                         logger.error(f"Error in summarization task for {task_type} {name}: {e}")
+                        logger.error(f"Error details: {traceback.format_exc()}")
 
             await asyncio.gather(*[process_task(task) for task in tasks])
 
             if completed_tasks != total_tasks:
-                logger.warning(f"Only {completed_tasks} out of {total_tasks} summarization tasks completed")
+                logger.warning(f"Only {completed_tasks} out of {total_tasks} summarization tasks completed successfully")
+            else:
+                logger.info("Completed all summarization tasks successfully")
 
         except Exception as e:
             logger.error(f"Error while gathering summarization tasks: {e}")
+            logger.error(f"Error details: {traceback.format_exc()}")
             raise FileProcessingError(f"Error while gathering summarization tasks: {e}")
-        
+
 #    async def summarize_all_cpp(self, project_id):
 #        try:
 #            tasks = await self.cpp_processor.prepare_summarization_tasks()
@@ -741,65 +858,35 @@ class NNeo4JImporter(NBaseImporter):
         
     async def summarize_cpp_class_prep(self, name, class_info):
         try:
-            if name is None:
-                logger.info(f"Skipping anonymous class")
-                return class_info
-        except Exception as e:
-            logger.error(f"Error in summarize_cpp_class_prep grabbing dict values: {e}")
-            raise FileProcessingError(f"Error in summarize_cpp_class_prep grabbing dict values: {e}")
-
-        try:
-            class_name, class_scope, interface_summary, implementation_summary = await self.cpp_processor.summarize_cpp_class(class_info)
-        except Exception as e:
-            logger.error(f"Error in summarize_cpp_class_prep calling summarize_cpp_class: {e}")
-#            await self.cpp_processor.update_classes(name, {})
-            raise FileProcessingError(f"Error in summarize_cpp_class_prep calling summarize_cpp_class: {e}")
-
-        try:
-            interface_embedding = await self.make_embedding(interface_summary)
-        except Exception as e:
-            logger.error(f"Error in summarize_cpp_class_prep calling make_embedding for interface_summary: {e}")
-#            details = {
-#                'interface_summary': interface_summary,
-#                'implementation_summary': implementation_summary
-#            }
-#            await self.cpp_processor.update_classes(name, details)
-#            await self.cpp_processor.update_classes(name, {})
-            raise FileProcessingError(f"Error in summarize_cpp_class_prep calling make_embedding for interface_summary: {e}")
+            logger.info(f"Starting summarization for class: {name}, namespace: {class_info.get('namespace', 'N/A')}")
             
-        try:
+            class_name, class_scope, interface_summary, implementation_summary = await self.cpp_processor.summarize_cpp_class(class_info)
+            logger.info(f"Summaries created for class: {name}")
+            
+            interface_embedding = await self.make_embedding(interface_summary)
             implementation_embedding = await self.make_embedding(implementation_summary)
-        except Exception as e:
-            logger.error(f"Error in summarize_cpp_class_prep calling make_embedding for implementation_summary: {e}")
-#            details = {
-#                'interface_summary': interface_summary,
-#                'implementation_summary': implementation_summary,
-#                'interface_embedding': interface_embedding
-#            }
-#            await self.cpp_processor.update_classes(name, details)
-#            await self.cpp_processor.update_classes(name, {})
-            raise FileProcessingError(f"Error in summarize_cpp_class_prep calling make_embedding for implementation_summary: {e}")
-        
-        try:
+            logger.info(f"Embeddings created for class: {name}")
+            
             details = {
                 'interface_summary': interface_summary,
                 'implementation_summary': implementation_summary,
                 'interface_embedding': interface_embedding,
                 'implementation_embedding': implementation_embedding
             }
-            await self.cpp_processor.update_classes(name, details)
+            await self.cpp_processor.update_class(name, details)
             await self.update_progress_summarize(1)
             logger.info(f"Finished summarizing/embedding class: {name}")
         except Exception as e:
             logger.error(f"Error in summarize_cpp_class_prep for class {name}: {e}")
-            # Ensure we still update the class with empty details
-            await self.cpp_processor.update_classes(name, {})
+            # Try to salvage partial information
+            partial_details = {k: v for k, v in class_info.items() if k in ['interface_description', 'implementation_description']}
+            await self.cpp_processor.update_class(name, partial_details)
         finally:
             return class_info
             
-            
 
     async def summarize_cpp_method_prep(self, name, method_info):
+        function_name = name
         try:
             if name is None:
                 logger.info(f"Skipping anonymous method")
@@ -812,7 +899,7 @@ class NNeo4JImporter(NBaseImporter):
             function_name, function_scope, function_summary = await self.cpp_processor.summarize_cpp_function(method_info)
         except Exception as e:
             logger.error(f"Error in summarize_cpp_method_prep: {e}\nmethod_info contents:\n{pprint.pformat(method_info, indent=4)}")
-#            await self.cpp_processor.update_methods(name, {})
+#            await self.cpp_processor.update_method(name, {})
             raise FileProcessingError(f"Error in summarize_cpp_method_prep calling summarize_cpp_function for method {name}: {e}")
         
         try:
@@ -822,26 +909,27 @@ class NNeo4JImporter(NBaseImporter):
 #            details = {
 #                'summary': function_summary,
 #            }
-#            await self.cpp_processor.update_methods(name, details)
-#            await self.cpp_processor.update_methods(name, {})
+#            await self.cpp_processor.update_method(name, details)
+#            await self.cpp_processor.update_method(name, {})
             raise FileProcessingError(f"Error in summarize_cpp_method_prep calling make_embedding: {e}")
         try:
             details = {
                 'summary': function_summary,
                 'embedding': embedding
             }
-            await self.cpp_processor.update_methods(name, details)
+            await self.cpp_processor.update_method(name, details)
             await self.update_progress_summarize(1)
             logger.info(f"Finished summarizing/embedding cpp method: {name}")
         except Exception as e:
             logger.error(f"Error in summarize_cpp_method_prep for method {name}: {e}")
             # Ensure we still update the method with empty details
-            await self.cpp_processor.update_methods(name, {})
+            await self.cpp_processor.update_method(name, {})
         finally:
             return method_info
 
 
     async def summarize_cpp_function_prep(self, name, function_info):
+        function_name = name
         try:
             if name is None:
                 logger.info(f"Skipping anonymous function")
@@ -854,7 +942,7 @@ class NNeo4JImporter(NBaseImporter):
             function_name, function_scope, function_summary = await self.cpp_processor.summarize_cpp_function(function_info)
         except Exception as e:
             logger.error(f"Error in summarize_cpp_function_prep calling summarize_cpp_function: {e}")
-#            await self.cpp_processor.update_functions(name, {})
+#            await self.cpp_processor.update_function(name, {})
             raise FileProcessingError(f"Error in summarize_cpp_function_prep calling summarize_cpp_function: {e}")
 
         try:
@@ -864,8 +952,8 @@ class NNeo4JImporter(NBaseImporter):
 #            details = {
 #                'summary': function_summary,
 #            }
-#            await self.cpp_processor.update_functions(name, details)
-#            await self.cpp_processor.update_functions(name, {})
+#            await self.cpp_processor.update_function(name, details)
+#            await self.cpp_processor.update_function(name, {})
             raise FileProcessingError(f"Error in summarize_cpp_function_prep calling make_embedding: {e}")
         
         try:
@@ -873,12 +961,12 @@ class NNeo4JImporter(NBaseImporter):
                 'summary': function_summary,
                 'embedding': embedding
             }
-            await self.cpp_processor.update_functions(name, details)
+            await self.cpp_processor.update_function(name, details)
             await self.update_progress_summarize(1)
             logger.info(f"Finished summarizing/embedding cpp function: {name}")
         except Exception as e:
             logger.error(f"Error in summarize_cpp_function_prep calling update_functions: {e}")
-            await self.cpp_processor.update_functions(name, {})
+            await self.cpp_processor.update_function(name, {})
             raise FileProcessingError(f"Error in summarize_cpp_function_prep calling update_functions: {e}")
         finally:
             return function_info
@@ -910,65 +998,18 @@ class NNeo4JImporter(NBaseImporter):
         except Exception as e:
             logger.error(f"Error in store_all_cpp: {e}")
             raise FileProcessingError(f"Error in store_all_cpp: {e}")
-        
-#    async def store_all_cpp(self, project_id):
-#        try:
-#            tasks = await self.cpp_processor.prepare_summarization_tasks()
-#
-#            queue = asyncio.Queue()
-#
-#            # Create a task to process the queue
-#            process_task = asyncio.create_task(self.process_cpp_storage_queue(queue, project_id))
-#
-#            for task_type, name, info in tasks:
-#                await queue.put((task_type, name, info))
-#
-#            # Signal that all items have been added to the queue
-#            await queue.put(None)
-#
-#            # Wait for all items to be processed
-#            await process_task
-#
-#        except Exception as e:
-#            logger.error(f"Error in store_all_cpp: {e}")
-#            raise FileProcessingError(f"Error in store_all_cpp: {e}")
-#        
-#    async def process_cpp_storage_queue(self, queue, project_id):
-#        while True:
-#            item = await queue.get()
-#            if item is None:
-#                break
-#            item_type, name, info = item
-#            if item_type == 'Class':
-#                await self.store_summary_cpp_class(name, info, project_id)
-#            elif item_type == 'Method':
-#                await self.store_summary_cpp_method(name, info, project_id)
-#            elif item_type == 'Function':
-#                await self.store_summary_cpp_function(name, info, project_id)
-#            await self.update_progress_store(1)
-#            queue.task_done()
 
-    async def store_summary_cpp_class(self, name, info, project_id):
-        logger.debug(f"Storing summary for class: {name}")
-        logger.debug(f"Class info: {info}")
+
+    async def store_summary_cpp_class(self, full_name, info, project_id):
+        logger.info(f"Storing summary for class: {full_name}")
         try:
             type_name = info.get('type', 'Class')
-            if not type_name or not type_name.strip():
-                type_name = 'Class'
-
-            scope = info.get('scope', '')
-            short_name = info.get('short_name', '')
-            interface_summary = info.get('interface_summary', '')
-            implementation_summary = info.get('implementation_summary', '')
-            interface_embedding = info.get('interface_embedding', [])
-            implementation_embedding = info.get('implementation_embedding', [])
-            file_path = info.get('file_path', '')
-            raw_code = info.get('raw_code', '')
-
+            
             query = """
-                MERGE (n:{type} {{name: $name, project_id: $project_id}})
-                ON CREATE SET n.scope = $scope,
+                MERGE (n:{type} {{name: $full_name, project_id: $project_id}})
+                ON CREATE SET n.namespace = $namespace,
                               n.short_name = $short_name,
+                              n.scope = $scope,
                               n.interface_summary = $interface_summary,
                               n.implementation_summary = $implementation_summary,
                               n.interface_embedding = $interface_embedding,
@@ -976,155 +1017,135 @@ class NNeo4JImporter(NBaseImporter):
                               n.file_path = $file_path,
                               n.raw_code = $raw_code
                 ON MATCH SET
-                    n.interface_summary = CASE WHEN size($interface_summary) > size(n.interface_summary) THEN $interface_summary ELSE n.interface_summary END,
-                    n.interface_embedding = CASE WHEN size($interface_summary) > size(n.interface_summary) THEN $interface_embedding ELSE n.interface_embedding END,
-                    n.implementation_summary = CASE WHEN size($implementation_summary) > size(n.implementation_summary) THEN $implementation_summary ELSE n.implementation_summary END,
-                    n.implementation_embedding = CASE WHEN size($implementation_summary) > size(n.implementation_embedding) THEN $implementation_embedding ELSE n.implementation_embedding END,
-                    n.raw_code = CASE WHEN size($raw_code) > size(n.raw_code) THEN $raw_code ELSE n.raw_code END
+                    n.interface_summary = $interface_summary,
+                    n.implementation_summary = $implementation_summary,
+                    n.interface_embedding = $interface_embedding,
+                    n.implementation_embedding = $implementation_embedding
                 RETURN elementId(n)
             """.format(type=type_name)
+            
             params = {
-                'name': name if name else 'anonymous',
+                'full_name': full_name,
+                'namespace': info.get('namespace', ''),
+                'short_name': info.get('short_name', ''),
                 'project_id': project_id if project_id else 'Unknown',
-                'scope': scope,
-                'short_name': short_name,
-                'interface_summary': interface_summary,
-                'implementation_summary': implementation_summary,
-                'interface_embedding': interface_embedding,
-                'implementation_embedding': implementation_embedding,
-                'file_path': file_path,
-                'raw_code': raw_code
+                'scope': info.get('scope', ''),
+                'interface_summary': info.get('interface_summary', ''),
+                'implementation_summary': info.get('implementation_summary', ''),
+                'interface_embedding': info.get('interface_embedding', []),
+                'implementation_embedding': info.get('implementation_embedding', []),
+                'file_path': info.get('file_path', ''),
+                'raw_code': info.get('raw_code', '')
             }
-            logger.debug(f"Query parameters for class {name}: {params}")
-        except Exception as e:
-            logger.error(f"Error forming query for CPP class {name}: {e}")
-            raise FileProcessingError(f"Error forming query for CPP class {name}: {e}")
-
-        try:
+            
             async with self.rate_limiter_db:
                 async with self.get_session() as session:
                     await self.run_query_and_get_element_id(session, query, **params)
-                    logger.info(f"Finished storing CPP class: {name}")
+                    logger.info(f"Finished storing CPP class: {full_name}")
         except Exception as e:
-            logger.error(f"Error storing summary for CPP class {name}: {e}")
-            raise FileProcessingError(f"Error storing summary for CPP class {name}: {e}")
-
-    async def store_summary_cpp_method(self, name, info, project_id):
-        logger.debug(f"Storing summary for method: {name}")
-        logger.debug(f"Method info: {info}")
+            logger.error(f"Error storing summary for CPP class {full_name}: {e}")
+            raise FileProcessingError(f"Error storing summary for CPP class {full_name}: {e}")
+            
+            
+        
+    async def store_summary_cpp_method(self, full_name, info, project_id):
+        logger.info(f"Storing summary for method: {full_name}")
         try:
             type_name = info.get('type', 'Method')
-            if not type_name or not type_name.strip():
-                type_name = 'Method'
-
-            scope = info.get('scope', '')
-            short_name = info.get('short_name', '')
-            summary = info.get('summary', '')
-            embedding = info.get('embedding', [])
-            file_path = info.get('file_path', '')
-            raw_code = info.get('raw_code', '')
-
+            
             query = """
-                MERGE (n:{type} {{name: $name, project_id: $project_id}})
-                ON CREATE SET n.scope = $scope,
+                MERGE (n:{type} {{name: $full_name, project_id: $project_id}})
+                ON CREATE SET n.namespace = $namespace,
                               n.short_name = $short_name,
+                              n.scope = $scope,
                               n.summary = $summary,
                               n.embedding = $embedding,
                               n.file_path = $file_path,
                               n.raw_code = $raw_code
                 ON MATCH SET
-                    n.summary = CASE WHEN size($raw_code) > size(n.raw_code) THEN $summary ELSE n.summary END,
-                    n.embedding = CASE WHEN size($raw_code) > size(n.raw_code) THEN $embedding ELSE n.embedding END
+                    n.summary = $summary,
+                    n.embedding = $embedding
                 RETURN elementId(n)
             """.format(type=type_name)
+            
             params = {
-                'name': name if name is not None else 'Unknown',
-                'project_id': project_id if project_id is not None else 'Unknown',
-                'scope': scope,
-                'short_name': short_name,
-                'summary': summary,
-                'embedding': embedding,
-                'file_path': file_path,
-                'raw_code': raw_code
+                'full_name': full_name,
+                'namespace': info.get('namespace', ''),
+                'short_name': info.get('short_name', ''),
+                'project_id': project_id if project_id else 'Unknown',
+                'scope': info.get('scope', ''),
+                'summary': info.get('summary', ''),
+                'embedding': info.get('embedding', []),
+                'file_path': info.get('file_path', ''),
+                'raw_code': info.get('raw_code', '')
             }
-            logger.debug(f"Query parameters for method {name}: {params}")
-        except Exception as e:
-            logger.error(f"Error forming query for CPP method {name}: {e}\n{pprint.pformat(info, indent=4)}")
-            raise FileProcessingError(f"Error forming query for CPP method {name}: {e}\n{pprint.pformat(info, indent=4)}")
-
-        try:
+            
             async with self.rate_limiter_db:
                 async with self.get_session() as session:
                     element_id = await self.run_query_and_get_element_id(session, query, **params)
-
-                    # Here we create the relationship (edge) between the class and its method.
-                    if element_id:
-                        await (await session.run(
+                    
+                    # Create relationship between class and method
+                    class_scope = info.get('scope', '')
+                    if class_scope:
+                        await session.run(
                             "MATCH (c) "
-                            "WHERE (c.name = $scope AND c:Class AND c.project_id = $project_id) "
-                            "OR (c.name = $scope AND c:Struct AND c.project_id = $project_id) "
-                            "MATCH (f:Method) WHERE elementId(f) = $element_id AND f.project_id = $project_id "
-                            "MERGE (c)-[:HAS_METHOD]->(f) "
-                            "MERGE (f)-[:BELONGS_TO]->(c)",
-                            {"name": name, "scope": scope, "element_id": element_id, "project_id": project_id}
-                        )).consume()
-                       
-                        logger.info(f"Finished storing CPP method: {name}")
-
+                            "WHERE (c.name = $class_full_name AND c:Class AND c.project_id = $project_id) "
+                            "OR (c.name = $class_full_name AND c:Struct AND c.project_id = $project_id) "
+                            "MATCH (m:{type}) WHERE elementId(m) = $element_id AND m.project_id = $project_id "
+                            "MERGE (c)-[:HAS_METHOD]->(m) "
+                            "MERGE (m)-[:BELONGS_TO]->(c)".format(type=type_name),
+                            {"class_full_name": class_scope, "element_id": element_id, "project_id": project_id}
+                        )
+                    
+                    logger.info(f"Finished storing CPP method: {full_name}")
         except Exception as e:
-            logger.error(f"Error storing summary for CPP method {name}: {e}")
-            raise FileProcessingError(f"Error storing summary for CPP method {name}: {e}")
-
-    async def store_summary_cpp_function(self, name, info, project_id):
+            logger.error(f"Error storing summary for CPP method {full_name}: {e}")
+            raise FileProcessingError(f"Error storing summary for CPP method {full_name}: {e}")
+    
+    
+        
+    async def store_summary_cpp_function(self, full_name, info, project_id):
+        logger.info(f"Storing summary for function: {full_name}")
         try:
             type_name = info.get('type', 'Function')
-            if not type_name or not type_name.strip():
-                type_name = 'Function'
-
-            scope = info.get('scope', '')
-            short_name = info.get('short_name', '')
-            summary = info.get('summary', '')
-            embedding = info.get('embedding', [])
-            file_path = info.get('file_path', '')
-            raw_code = info.get('raw_code', '')
-
+            
             query = """
-                MERGE (n:{type} {{name: $name, project_id: $project_id}})
-                ON CREATE SET n.scope = $scope,
+                MERGE (n:{type} {{name: $full_name, project_id: $project_id}})
+                ON CREATE SET n.namespace = $namespace,
                               n.short_name = $short_name,
+                              n.scope = $scope,
                               n.summary = $summary,
                               n.embedding = $embedding,
                               n.file_path = $file_path,
                               n.raw_code = $raw_code
                 ON MATCH SET
-                    n.summary = CASE WHEN size($raw_code) > size(n.raw_code) THEN $summary ELSE n.summary END,
-                    n.embedding = CASE WHEN size($raw_code) > size(n.raw_code) THEN $embedding ELSE n.embedding END
+                    n.summary = $summary,
+                    n.embedding = $embedding
                 RETURN elementId(n)
             """.format(type=type_name)
+            
             params = {
-                'name': name if name is not None else 'anonymous',
-                'project_id': project_id if project_id is not None else 'Unknown',
-                'scope': scope,
-                'short_name': short_name,
-                'summary': summary,
-                'embedding': embedding,
-                'file_path': file_path,
-                'raw_code': raw_code
+                'full_name': full_name,
+                'namespace': info.get('namespace', ''),
+                'short_name': info.get('short_name', ''),
+                'project_id': project_id if project_id else 'Unknown',
+                'scope': info.get('scope', ''),
+                'summary': info.get('summary', ''),
+                'embedding': info.get('embedding', []),
+                'file_path': info.get('file_path', ''),
+                'raw_code': info.get('raw_code', '')
             }
-        except Exception as e:
-            logger.error(f"Error forming query for CPP function {name}: {e}\n{pprint.pformat(info, indent=4)}")
-            raise FileProcessingError(f"Error forming query for CPP function {name}: {e}\n{pprint.pformat(info, indent=4)}")
-
-        try:
+            
             async with self.rate_limiter_db:
                 async with self.get_session() as session:
                     await self.run_query_and_get_element_id(session, query, **params)
-                    logger.info(f"Finished storing CPP function: {name}")
-
+                    logger.info(f"Finished storing CPP function: {full_name}")
         except Exception as e:
-            logger.error(f"Error storing summary for CPP function {name}: {e}")
-            raise FileProcessingError(f"Error storing summary for CPP function {name}: {e}")
-
+            logger.error(f"Error storing summary for CPP function {full_name}: {e}")
+            raise FileProcessingError(f"Error storing summary for CPP function {full_name}: {e}")
+        
+        
+        
     def get_full_scope(self, node):
         scopes = []
         current = node.semantic_parent
