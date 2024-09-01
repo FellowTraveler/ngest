@@ -773,7 +773,7 @@ class NNeo4JImporter(NBaseImporter):
 #        except Exception as e:
 #            logger.error(f"Error while gathering summarization tasks: {e}")
 #            raise FileProcessingError(f"Error while gathering summarization tasks: {e}")
-        
+
     async def summarize_all_cpp(self, project_id):
         try:
             tasks = await self.cpp_processor.prepare_summarization_tasks()
@@ -785,18 +785,18 @@ class NNeo4JImporter(NBaseImporter):
             async def process_task(task):
                 nonlocal completed_tasks
                 async with semaphore:
-                    task_type, name, info = task
+                    task_type, name, details = task
+                    result = False
                     try:
                         logger.info(f"Starting summarization for {task_type} {name}")
                         if task_type == 'Class':
-                            result = await self.summarize_cpp_class_prep(name, info)
+                            result = await self.summarize_cpp_class_prep(name, details)
                         elif task_type == 'Method':
-                            result = await self.summarize_cpp_method_prep(name, info)
+                            result = await self.summarize_cpp_method_prep(name, details)
                         elif task_type == 'Function':
-                            result = await self.summarize_cpp_function_prep(name, info)
+                            result = await self.summarize_cpp_function_prep(name, details)
                         else:
                             logger.warning(f"Unknown task type {task_type} for {name}")
-                            return
 
                         if result:
                             logger.info(f"Completed summarization for {task_type} {name}")
@@ -855,7 +855,7 @@ class NNeo4JImporter(NBaseImporter):
 #            logger.error(f"Error while gathering summarization and embedding tasks: {e}")
 #            raise FileProcessingError(f"Error while gathering summarization and embedding tasks: {e}")
 
-        
+
     async def summarize_cpp_class_prep(self, name, class_info):
         try:
             logger.info(f"Starting summarization for class: {name}, namespace: {class_info.get('namespace', 'N/A')}")
@@ -876,13 +876,14 @@ class NNeo4JImporter(NBaseImporter):
             await self.cpp_processor.update_class(name, details)
             await self.update_progress_summarize(1)
             logger.info(f"Finished summarizing/embedding class: {name}")
+            return True
+
         except Exception as e:
             logger.error(f"Error in summarize_cpp_class_prep for class {name}: {e}")
             # Try to salvage partial information
-            partial_details = {k: v for k, v in class_info.items() if k in ['interface_description', 'implementation_description']}
-            await self.cpp_processor.update_class(name, partial_details)
-        finally:
-            return class_info
+#            partial_details = {k: v for k, v in class_info.items() if k in ['interface_description', 'implementation_description']}
+#            await self.cpp_processor.update_class(name, partial_details)
+            return False
             
 
     async def summarize_cpp_method_prep(self, name, method_info):
@@ -890,7 +891,7 @@ class NNeo4JImporter(NBaseImporter):
         try:
             if name is None:
                 logger.info(f"Skipping anonymous method")
-                return method_info
+                return True
         except Exception as e:
             logger.error(f"Error in summarize_cpp_method_prep grabbing dict values: {e}")
             raise FileProcessingError(f"Error in summarize_cpp_method_prep grabbing dict values: {e}")
@@ -912,6 +913,7 @@ class NNeo4JImporter(NBaseImporter):
 #            await self.cpp_processor.update_method(name, details)
 #            await self.cpp_processor.update_method(name, {})
             raise FileProcessingError(f"Error in summarize_cpp_method_prep calling make_embedding: {e}")
+            
         try:
             details = {
                 'summary': function_summary,
@@ -920,12 +922,13 @@ class NNeo4JImporter(NBaseImporter):
             await self.cpp_processor.update_method(name, details)
             await self.update_progress_summarize(1)
             logger.info(f"Finished summarizing/embedding cpp method: {name}")
+            return True
+            
         except Exception as e:
             logger.error(f"Error in summarize_cpp_method_prep for method {name}: {e}")
             # Ensure we still update the method with empty details
-            await self.cpp_processor.update_method(name, {})
-        finally:
-            return method_info
+#            await self.cpp_processor.update_method(name, {})
+            return False
 
 
     async def summarize_cpp_function_prep(self, name, function_info):
@@ -964,12 +967,13 @@ class NNeo4JImporter(NBaseImporter):
             await self.cpp_processor.update_function(name, details)
             await self.update_progress_summarize(1)
             logger.info(f"Finished summarizing/embedding cpp function: {name}")
+            return True
+            
         except Exception as e:
             logger.error(f"Error in summarize_cpp_function_prep calling update_functions: {e}")
             await self.cpp_processor.update_function(name, {})
-            raise FileProcessingError(f"Error in summarize_cpp_function_prep calling update_functions: {e}")
-        finally:
-            return function_info
+#            raise FileProcessingError(f"Error in summarize_cpp_function_prep calling update_functions: {e}")
+            return False
 
 
     async def store_all_cpp(self, project_id):

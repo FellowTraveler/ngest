@@ -45,10 +45,7 @@ class CppProcessor:
             existing_info = self.namespaces.get(full_name, {})
             merged_details = existing_info.copy()
             for key, value in details.items():
-                if key == 'raw_code':
-                    if details.get('is_cpp_file', False) or not merged_details.get('raw_code'):
-                        merged_details['raw_code'] = value
-                elif value or isinstance(value, (int, float)):
+                if value or isinstance(value, (int, float)):
                     merged_details[key] = value
             self.namespaces[full_name] = merged_details
 
@@ -58,7 +55,9 @@ class CppProcessor:
             merged_details = existing_info.copy()
             for key, value in details.items():
                 if key == 'raw_code':
-                    if details.get('is_cpp_file', False) or not merged_details.get('raw_code'):
+                    if (details.get('is_cpp_file', False) or
+                        not merged_details.get('raw_code') or
+                        len(value) > len(merged_details['raw_code'])):
                         merged_details['raw_code'] = value
                 elif value or isinstance(value, (int, float)):
                     merged_details[key] = value
@@ -70,7 +69,9 @@ class CppProcessor:
             merged_details = existing_info.copy()
             for key, value in details.items():
                 if key == 'raw_code':
-                    if details.get('is_cpp_file', False) or not merged_details.get('raw_code'):
+                    if (details.get('is_cpp_file', False) or
+                        not merged_details.get('raw_code') or
+                        len(value) > len(merged_details['raw_code'])):
                         merged_details['raw_code'] = value
                 elif value or isinstance(value, (int, float)):
                     merged_details[key] = value
@@ -82,12 +83,13 @@ class CppProcessor:
             merged_details = existing_info.copy()
             for key, value in details.items():
                 if key == 'raw_code':
-                    if details.get('is_cpp_file', False) or not merged_details.get('raw_code'):
+                    if (details.get('is_cpp_file', False) or
+                        not merged_details.get('raw_code') or
+                        len(value) > len(merged_details['raw_code'])):
                         merged_details['raw_code'] = value
                 elif value or isinstance(value, (int, float)):
                     merged_details[key] = value
             self.functions[full_name] = merged_details
-            
         
     async def process_cpp_file(self, inputPath: str, inputLocation: str, project_id: str):
         try:
@@ -130,7 +132,19 @@ class CppProcessor:
             logger.error(f"Unexpected error processing C++ file {inputPath}: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
             raise
-                
+
+    async def get_class_info(self, full_name):
+        async with self.lock_classes:
+            return self.classes.get(full_name, {})
+        
+    async def get_method_info(self, full_name):
+        async with self.lock_methods:
+            return self.methods.get(full_name, {})
+        
+    async def get_function_info(self, full_name):
+        async with self.lock_functions:
+            return self.functions.get(full_name, {})
+        
     async def prepare_summarization_tasks(self):
         tasks = []
         async with self.lock_classes:
@@ -158,12 +172,12 @@ class CppProcessor:
                 
                 logger.info(f"Simplified class info: {simplified_info}")
                 
-                if 'interface_description' in class_info and 'implementation_description' in class_info:
+                if 'interface_description' in class_info or 'implementation_description' in class_info:
                     tasks.append(('Class', full_name, copy.deepcopy(class_info)))
                     logger.info(f"Added summarization task for class: {full_name}")
                 else:
                     logger.warning(f"Skipping summarization for class {full_name} in namespace {namespace}. "
-                                   f"Missing descriptions: interface_description: {'interface_description' in class_info}, "
+                                   f"Missing one of: interface_description: {'interface_description' in class_info}, "
                                    f"implementation_description: {'implementation_description' in class_info}")
                                    
         async with self.lock_methods:
@@ -441,13 +455,12 @@ class CppProcessor:
 #        logger.info(f"Finished processing {type_name}: {full_name} in file {file_name}")
 
     async def process_method_node(self, node, file_name, full_scope, namespace, is_cpp_file):
-#        logger.info(f"Processing method: {node.spelling} in file {file_name}")
         type_name = "Method"
         class_name = full_scope
         method_name = node.spelling
         fully_qualified_method_name = f"{class_name}::{method_name}" if class_name else method_name
 
-        logger.info(f"Processing {type_name}: {fully_qualified_method_name} in file {file_name}")
+#        logger.info(f"Processing {type_name}: {fully_qualified_method_name} in file {file_name}")
 
         description = f"Method {method_name} in class {full_scope} defined in {file_name}"
         raw_comment = node.raw_comment if node.raw_comment else ''
@@ -489,7 +502,6 @@ class CppProcessor:
 #        logger.info(f"Finished processing method: {node.spelling} in file {file_name} full_name: {fully_qualified_method_name}")
 
     async def process_function_node(self, node, file_name, full_scope, namespace, is_cpp_file):
-#        logger.info(f"Processing function: {node.spelling} in file {file_name}")
         type_name = "Function"
         function_name = node.spelling
         fully_qualified_function_name = f"{full_scope}::{function_name}" if full_scope else function_name
