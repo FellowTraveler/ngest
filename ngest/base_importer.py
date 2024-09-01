@@ -52,7 +52,7 @@ class NBaseImporter(ABC):
     and handle file chunking and graph node creation.
     """
     @abstractmethod
-    async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, project_id: str) -> None:
+    async def ParseFile(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, project_id: str) -> None:
         pass
 
     def ascertain_file_type(self, inputPath: str) -> dict:
@@ -238,7 +238,7 @@ class NFilesystemImporter(NBaseImporter):
     """
     A file importer that simply copies files to the output directory.
     """
-    async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, project_id: str) -> None:
+    async def ParseFile(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a file by copying it to the output directory.
 

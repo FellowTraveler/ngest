@@ -251,7 +251,7 @@ class NNeo4JImporter(NBaseImporter):
 #            logger.error(f"Error generating embedding: {e}")
 #            raise
 
-    async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, project_id: str) -> None:
+    async def ParseFile(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a file by determining its type and using the appropriate ingestion method.
 
@@ -306,10 +306,13 @@ class NNeo4JImporter(NBaseImporter):
                         logger.error("Failed to create file in database")
                         return -1
                     file_id = file.id
-        
-            ingest_method = getattr(self, f"Ingest{file_type['type'].capitalize()}", None)
+
+            parse_method = getattr(self, f"Parse{file_type['type'].capitalize()}", None)
             
-            if ingest_method:
+            if file_type['extension'] == ".pdf" and not parse_method:
+                logger.info(f"Can't find parse_method for file type pdf for file: {inputPath}")
+            
+            if parse_method:
                 await self.add_file_path(inputPath)
 
                 # localPath                 == "blindsecp/sec2-v2.pdf"
@@ -395,8 +398,8 @@ class NNeo4JImporter(NBaseImporter):
                             logger.error("Failed to create document in database")
                             return -1
                         document_id = document.id
-
-                await ingest_method(inputPath, inputLocation, inputName, localPath, currentOutputPath, project_id)
+                        
+                await parse_method(inputPath, inputLocation, inputName, localPath, currentOutputPath, project_id)
             else:
                 logger.warning(f"No ingest method for file type: {file_type['type']}, inputPath: {inputPath}")
         except Exception as e:
@@ -408,7 +411,7 @@ class NNeo4JImporter(NBaseImporter):
             await self.update_progress_summarize(1)
             await self.update_progress_store(1)
 
-        logger.info(f"Completed scanning for inputPath: {inputPath}, inputLocation: {inputLocation}, inputName: {inputName}, currentOutputPath: {currentOutputPath}")
+#        logger.info(f"Completed scanning for inputPath: {inputPath}, inputLocation: {inputLocation}, inputName: {inputName}, currentOutputPath: {currentOutputPath}")
 
     async def do_summarize_text(self, text, max_length=50, min_length=25) -> str:
         async with self.rate_limiter_summary:
@@ -592,14 +595,14 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Error storing chunk with embedding: {e}")
             raise DatabaseError(f"Error storing chunk with embedding: {e}")
 
-    async def IngestText(self, input_path: str, input_location: str, input_name: str, localPath: str, current_output_path: str, project_id: str) -> None:
+    async def ParseText(self, input_path: str, input_location: str, input_name: str, localPath: str, current_output_path: str, project_id: str) -> None:
             try:
                 # File reading operation - doesn't need rate limiting
                 async with aiofiles.open(input_path, 'r') as file:
                     file_content = await file.read()
             except Exception as e:
-                logger.error(f"IngestText: Error reading file {input_path}: {e}")
-                raise FileProcessingError(f"IngestText: Error reading file {input_path}: {e}")
+                logger.error(f"ParseText: Error reading file {input_path}: {e}")
+                raise FileProcessingError(f"ParseText: Error reading file {input_path}: {e}")
 
             try:
                 # Database operation - needs rate limiting
@@ -643,7 +646,7 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Error extracting image features: {e}")
             raise FileProcessingError(f"Error extracting image features: {e}")
 
-    async def IngestImg(self, input_path: str, input_location: str, input_name: str, localPath: str, current_output_path: str, project_id: str) -> None:
+    async def ParseImg(self, input_path: str, input_location: str, input_name: str, localPath: str, current_output_path: str, project_id: str) -> None:
         """
         Ingest an image file by extracting features and creating nodes in the database.
 
@@ -719,16 +722,16 @@ class NNeo4JImporter(NBaseImporter):
         return outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy().tolist()
 
 
-    async def IngestCpp(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str):
+    async def ParseCpp(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str):
         try:
-            await self.cpp_processor.process_cpp_file(inputPath, inputLocation, project_id)
+            await self.cpp_processor.parse_cpp_file(inputPath, inputLocation, project_id)
         except FileProcessingError as e:
-            logger.error(f"Error ingesting C++ file {inputPath}: {e}")
-            raise  # Re-raise the FileProcessingError
+            logger.error(f"Error parsing C++ file {inputPath}: {e}")
+            raise
         except Exception as e:
-            logger.error(f"Unexpected error ingesting C++ file {inputPath}: {e}")
-            raise FileProcessingError(f"Unexpected error ingesting C++ file {inputPath}: {e}")
-
+            logger.error(f"Unexpected error parsing C++ file {inputPath}: {e}")
+            raise FileProcessingError(f"Unexpected error parsing C++ file {inputPath}: {e}")
+            
     def get_raw_code(self, node):
         # Extract raw code from the source node
         if node.extent.start.file and node.extent.end.file:
@@ -776,7 +779,10 @@ class NNeo4JImporter(NBaseImporter):
 
     async def summarize_all_cpp(self, project_id):
         try:
+#            await self.cpp_processor.retry_failed_nodes(project_id)
+
             tasks = await self.cpp_processor.prepare_summarization_tasks()
+                        
             semaphore = asyncio.Semaphore(5)  # Limit to 5 concurrent tasks
             total_tasks = len(tasks)
             completed_tasks = 0
@@ -788,7 +794,7 @@ class NNeo4JImporter(NBaseImporter):
                     task_type, name, details = task
                     result = False
                     try:
-                        logger.info(f"Starting summarization for {task_type} {name}")
+#                        logger.info(f"Starting summarization for {task_type} {name}")
                         if task_type == 'Class':
                             result = await self.summarize_cpp_class_prep(name, details)
                         elif task_type == 'Method':
@@ -799,9 +805,9 @@ class NNeo4JImporter(NBaseImporter):
                             logger.warning(f"Unknown task type {task_type} for {name}")
 
                         if result:
-                            logger.info(f"Completed summarization for {task_type} {name}")
+#                            logger.info(f"Completed summarization for {task_type} {name}")
                             completed_tasks += 1
-                            logger.info(f"Completed {completed_tasks}/{total_tasks} summarization tasks")
+#                            logger.info(f"Completed {completed_tasks}/{total_tasks} summarization tasks")
                         else:
                             logger.warning(f"Summarization for {task_type} {name} did not produce a result")
                     except Exception as e:
@@ -858,14 +864,14 @@ class NNeo4JImporter(NBaseImporter):
 
     async def summarize_cpp_class_prep(self, name, class_info):
         try:
-            logger.info(f"Starting summarization for class: {name}, namespace: {class_info.get('namespace', 'N/A')}")
+#            logger.info(f"Starting summarization for class: {name}, namespace: {class_info.get('namespace', 'N/A')}")
             
             class_name, class_scope, interface_summary, implementation_summary = await self.cpp_processor.summarize_cpp_class(class_info)
-            logger.info(f"Summaries created for class: {name}")
+#            logger.info(f"Summaries created for class: {name}")
             
             interface_embedding = await self.make_embedding(interface_summary)
             implementation_embedding = await self.make_embedding(implementation_summary)
-            logger.info(f"Embeddings created for class: {name}")
+#            logger.info(f"Embeddings created for class: {name}")
             
             details = {
                 'interface_summary': interface_summary,
@@ -875,7 +881,7 @@ class NNeo4JImporter(NBaseImporter):
             }
             await self.cpp_processor.update_class(name, details)
             await self.update_progress_summarize(1)
-            logger.info(f"Finished summarizing/embedding class: {name}")
+#            logger.info(f"Finished summarizing/embedding class: {name}")
             return True
 
         except Exception as e:
@@ -921,7 +927,7 @@ class NNeo4JImporter(NBaseImporter):
             }
             await self.cpp_processor.update_method(name, details)
             await self.update_progress_summarize(1)
-            logger.info(f"Finished summarizing/embedding cpp method: {name}")
+#            logger.info(f"Finished summarizing/embedding cpp method: {name}")
             return True
             
         except Exception as e:
@@ -966,7 +972,7 @@ class NNeo4JImporter(NBaseImporter):
             }
             await self.cpp_processor.update_function(name, details)
             await self.update_progress_summarize(1)
-            logger.info(f"Finished summarizing/embedding cpp function: {name}")
+#            logger.info(f"Finished summarizing/embedding cpp function: {name}")
             return True
             
         except Exception as e:
@@ -1005,7 +1011,7 @@ class NNeo4JImporter(NBaseImporter):
 
 
     async def store_summary_cpp_class(self, full_name, info, project_id):
-        logger.info(f"Storing summary for class: {full_name}")
+#        logger.info(f"Storing summary for class: {full_name}")
         try:
             type_name = info.get('type', 'Class')
             
@@ -1045,7 +1051,7 @@ class NNeo4JImporter(NBaseImporter):
             async with self.rate_limiter_db:
                 async with self.get_session() as session:
                     await self.run_query_and_get_element_id(session, query, **params)
-                    logger.info(f"Finished storing CPP class: {full_name}")
+#                    logger.info(f"Finished storing CPP class: {full_name}")
         except Exception as e:
             logger.error(f"Error storing summary for CPP class {full_name}: {e}")
             raise FileProcessingError(f"Error storing summary for CPP class {full_name}: {e}")
@@ -1053,7 +1059,7 @@ class NNeo4JImporter(NBaseImporter):
             
         
     async def store_summary_cpp_method(self, full_name, info, project_id):
-        logger.info(f"Storing summary for method: {full_name}")
+#        logger.info(f"Storing summary for method: {full_name}")
         try:
             type_name = info.get('type', 'Method')
             
@@ -1097,11 +1103,11 @@ class NNeo4JImporter(NBaseImporter):
                             "OR (c.name = $class_full_name AND c:Struct AND c.project_id = $project_id) "
                             "MATCH (m:{type}) WHERE elementId(m) = $element_id AND m.project_id = $project_id "
                             "MERGE (c)-[:HAS_METHOD]->(m) "
-                            "MERGE (m)-[:BELONGS_TO]->(c)".format(type=type_name),
+                            "MERGE (m)-[:BELONGS_TO_TYPE]->(c)".format(type=type_name),
                             {"class_full_name": class_scope, "element_id": element_id, "project_id": project_id}
                         )
                     
-                    logger.info(f"Finished storing CPP method: {full_name}")
+#                    logger.info(f"Finished storing CPP method: {full_name}")
         except Exception as e:
             logger.error(f"Error storing summary for CPP method {full_name}: {e}")
             raise FileProcessingError(f"Error storing summary for CPP method {full_name}: {e}")
@@ -1109,7 +1115,7 @@ class NNeo4JImporter(NBaseImporter):
     
         
     async def store_summary_cpp_function(self, full_name, info, project_id):
-        logger.info(f"Storing summary for function: {full_name}")
+#        logger.info(f"Storing summary for function: {full_name}")
         try:
             type_name = info.get('type', 'Function')
             
@@ -1143,7 +1149,7 @@ class NNeo4JImporter(NBaseImporter):
             async with self.rate_limiter_db:
                 async with self.get_session() as session:
                     await self.run_query_and_get_element_id(session, query, **params)
-                    logger.info(f"Finished storing CPP function: {full_name}")
+#                    logger.info(f"Finished storing CPP function: {full_name}")
         except Exception as e:
             logger.error(f"Error storing summary for CPP function {full_name}: {e}")
             raise FileProcessingError(f"Error storing summary for CPP function {full_name}: {e}")
@@ -1158,7 +1164,7 @@ class NNeo4JImporter(NBaseImporter):
             current = current.semantic_parent
         return "::".join(reversed(scopes))
 
-    async def IngestPython(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
+    async def ParsePython(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a Python file by parsing it, summarizing classes and functions, and storing them in the database.
 
@@ -1248,7 +1254,7 @@ class NNeo4JImporter(NBaseImporter):
         description = f"Function {func.name} with arguments: {', '.join(arg.arg for arg in func.args.args)}. It performs the following tasks: "
         return await self.do_summarize_text(description)
 
-    async def IngestRust(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
+    async def ParseRust(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a Rust file by parsing it, summarizing implementations and functions, and storing them in the database.
 
@@ -1384,7 +1390,7 @@ class NNeo4JImporter(NBaseImporter):
         description += ", ".join(methods)
         return await self.do_summarize_text(description)
 
-    async def IngestJavascript(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
+    async def ParseJavascript(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a JavaScript file by parsing it, summarizing classes, functions, and variables, and storing them in the database.
 
@@ -1542,7 +1548,7 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Error running query: {query}")
             raise DatabaseError(f"Error running query: {e}")
 
-    async def IngestPdf(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
+    async def ParsePdf(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
         try:
             reader = PdfReader(inputPath)
             num_pages = len(reader.pages)
@@ -1585,7 +1591,7 @@ class NNeo4JImporter(NBaseImporter):
                                 "MATCH (p:File:Document:PDF) WHERE p.id = $pdf_id "
                                 "MATCH (m:MediumChunk) WHERE elementId(m) = $medium_chunk_id "
                                 "MERGE (p)-[:HAS_CHUNK]->(m) "
-                                "MERGE (m)-[:BELONGS_TO]->(p)",
+                                "MERGE (m)-[:BELONGS_TO_FILE]->(p)",
                                 {"pdf_id": pdf_id, "medium_chunk_id": medium_chunk_id}
                             )).consume()
 
@@ -1611,7 +1617,7 @@ class NNeo4JImporter(NBaseImporter):
                                     "MATCH (m:MediumChunk) WHERE elementId(m) = $medium_chunk_id "
                                     "MATCH (s:SmallChunk) WHERE elementId(s) = $small_chunk_id "
                                     "MERGE (m)-[:HAS_CHUNK]->(s) "
-                                    "MERGE (s)-[:BELONGS_TO]->(m) "
+                                    "MERGE (s)-[:BELONGS_TO_CHUNK]->(m) "
                                     "MERGE (s)-[:HAS_PARENT_DOC]->(p)",
                                     {"pdf_id": pdf_id, "medium_chunk_id": medium_chunk_id, "small_chunk_id": small_chunk_id}
                                 )).consume()

@@ -36,11 +36,8 @@ class NIngest:
         self.progress_updater_task_store = None
         
         self.started_ingestion = False
-        self.summarized_cpp_started = False
-        self.summarized_cpp_finished = False
-        self.stored_cpp_started = False
-        self.stored_cpp_finished = False
         self.start_ingest_semaphore = asyncio.Semaphore(1)
+
         self.summarize_semaphore = asyncio.Semaphore(1)
         self.store_semaphore = asyncio.Semaphore(1)
 
@@ -143,7 +140,7 @@ class NIngest:
         try:
             async with self.progress_lock_scan:
                 if self.progress_bar_scan is None:
-                    self.progress_bar_scan = tqdm(total=total, desc="Scanning / Ingesting", unit="files")
+                    self.progress_bar_scan = tqdm(total=total, desc="Parsing / Ingesting", unit="files")
                     self.progress_updater_task_scan = asyncio.create_task(self.progress_updater_scan())
         except Exception as e:
             logger.error(f"Error in start_progress_scan: {e}")
@@ -165,6 +162,7 @@ class NIngest:
                     self.progress_updater_task_store = asyncio.create_task(self.progress_updater_store())
         except Exception as e:
             logger.error(f"Error in start_progress_store: {e}")
+
 
     async def start_ingestion(self, inputPath: str) -> int:
         async with self.start_ingest_semaphore:
@@ -205,10 +203,16 @@ class NIngest:
                 result = 0
 
                 await self.start_progress_scan(self.total_files)
-                await self.start_progress_summarize(self.total_files)
-                await self.start_progress_store(self.total_files)
-
-                result = await self.Ingest(inputPath, project_input_location, topLevelOutputPath, self.currentOutputPath)
+                result = await self.RecursiveParse(inputPath, project_input_location, topLevelOutputPath, self.currentOutputPath)
+                
+                if result == 0:
+                    async with self.summarize_semaphore:
+                        await self.start_progress_summarize(self.total_files)
+                        await self.importer_.summarize_all_cpp(self.project_id)
+                    
+                    async with self.store_semaphore:
+                        await self.start_progress_store(self.total_files)
+                        await self.importer_.store_all_cpp(self.project_id)
                 
             except Exception as e:
                 result = -1
@@ -238,7 +242,8 @@ class NIngest:
                 except Exception as e:
                     logger.error(f"Error during cleanup: {e}")
                 return result
-
+            
+                        
     async def count_files(self, path: str) -> int:
         """
         Count the total number of files in a directory.
@@ -280,11 +285,9 @@ class NIngest:
             except Exception as e:
                 logger.error(f"Error during cleanup for project {self.project_id}: {e}")
 
-    ## RESUME
-
     # This is where the root input directory is passed. Everyhing scanned / ingested happens from here on in.
     # Recursively starting here.
-    async def Ingest(self, inputPath: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str) -> int:
+    async def RecursiveParse(self, inputPath: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str) -> int:
         """
         Ingest files from the input path into the output path.
 
@@ -307,10 +310,8 @@ class NIngest:
                 return inputPath[len(topLevelInputPath):].lstrip(os.sep)
             else:
                 return inputPath
-
         try:
-            # Phase 1: Scanning / Ingestion
-            # Currently all non-CPP files are also summarized / stored here.
+            # Phase 1: Scanning / Parsing
             if not os.path.exists(inputPath):
                 logger.error(f"Invalid path: {inputPath}")
                 return -1
@@ -326,51 +327,22 @@ class NIngest:
             inputLocation, inputName = os.path.split(inputPath)
             tasks = []
 
-            ## RESUME need to pass localPath to IngestDirectory
-
             if inputType == 'd':
-                tasks.append(self.IngestDirectory(inputPath=inputPath, inputLocation=inputLocation, inputName=inputName, topLevelInputPath=topLevelInputPath, topLevelOutputPath=topLevelOutputPath, currentOutputPath=currentOutputPath, project_id=self.project_id))
+                tasks.append(self.ParseDirectory(inputPath=inputPath, inputLocation=inputLocation, inputName=inputName, topLevelInputPath=topLevelInputPath, topLevelOutputPath=topLevelOutputPath, currentOutputPath=currentOutputPath, project_id=self.project_id))
             else:
                 if not self.should_ignore_file(inputPath):
-                    tasks.append(self.IngestFile(inputPath=inputPath, inputLocation=inputLocation, inputName=inputName, topLevelInputPath=topLevelInputPath, topLevelOutputPath=topLevelOutputPath, currentOutputPath=currentOutputPath, project_id=self.project_id))
+                    tasks.append(self.ParseFile(inputPath=inputPath, inputLocation=inputLocation, inputName=inputName, topLevelInputPath=topLevelInputPath, topLevelOutputPath=topLevelOutputPath, currentOutputPath=currentOutputPath, project_id=self.project_id))
 
-#            logger.info("Gathering scanning tasks...")
-            # Wait for all ingestion tasks to complete
+            # Wait for all parsing tasks to complete
             await asyncio.gather(*tasks)
+            return 0
         except Exception as e:
-            logger.error(f"Error during ingestion in Ingest: {e}")
+            logger.error(f"Error during parsing in Ingest: {e}")
             await self.cleanup_partial_ingestion(self.project_id)
             return -1
-        # -------------------------------------------------------------------
-        # Phase 2: Summarizing and Embedding CPP files
-        if self.summarized_cpp_started == False:
-            self.summarized_cpp_started = True
-#            logger.info("Finished gathering scanning tasks.")
-            async with self.summarize_semaphore:
-                try:
-                    await self.importer_.summarize_all_cpp(self.project_id)
-                    self.summarized_cpp_finished = True
-                except Exception as e:
-                    logger.error(f"Error during CPP summarization in Ingest: {e}")
-                    await self.cleanup_partial_ingestion(self.project_id)
-                    return -1
     
-        # Phase 3: Batching into the Database
-        if self.stored_cpp_finished is not True:
-            if self.summarized_cpp_finished == True and self.stored_cpp_started == False:
-                self.stored_cpp_started = True
-                async with self.store_semaphore:
-                    try:
-                        await self.importer_.store_all_cpp(self.project_id)
-                        self.stored_cpp_finished = True
-                        return 0
-                    except Exception as e:
-                        logger.error(f"Error during CPP storing in Ingest: {e}")
-                        await self.cleanup_partial_ingestion(self.project_id)
-                        return -1
-        return 0
-
-    async def IngestDirectory(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, project_id: str) -> None:
+    
+    async def ParseDirectory(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a directory by recursively processing its contents.
 
@@ -390,10 +362,10 @@ class NIngest:
         for item in os.listdir(inputPath):
             itemPath = os.path.join(inputPath, item)
             if not self.should_ignore_file(itemPath):
-                tasks.append(self.Ingest(itemPath, topLevelInputPath, topLevelOutputPath, newOutputPath))
+                tasks.append(self.RecursiveParse(itemPath, topLevelInputPath, topLevelOutputPath, newOutputPath))
         await asyncio.gather(*tasks)
 
-    async def IngestFile(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, project_id: str) -> None:
+    async def ParseFile(self, inputPath: str, inputLocation: str, inputName: str, topLevelInputPath: str, topLevelOutputPath: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a single file.
 
@@ -406,7 +378,7 @@ class NIngest:
             currentOutputPath (str): The current output path.
             project_id (str): The project ID.
         """
-        await self.importer_.IngestFile(inputPath, inputLocation, inputName, topLevelInputPath, topLevelOutputPath, currentOutputPath, project_id)
+        await self.importer_.ParseFile(inputPath, inputLocation, inputName, topLevelInputPath, topLevelOutputPath, currentOutputPath, project_id)
 
     def should_ignore_file(self, file_path: str) -> bool:
         """

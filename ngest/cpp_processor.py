@@ -32,13 +32,13 @@ class CppProcessor:
         self.classes = defaultdict(dict)
         self.methods = defaultdict(dict)
         self.functions = defaultdict(dict)
-        self.header_files = {}
+#        self.header_files = {}
         
         self.lock_namespaces = asyncio.Lock()
         self.lock_classes = asyncio.Lock()
         self.lock_methods = asyncio.Lock()
         self.lock_functions = asyncio.Lock()
-        self.lock_header_files = asyncio.Lock()
+#        self.lock_header_files = asyncio.Lock()
 
     async def update_namespace(self, full_name, details):
         async with self.lock_namespaces:
@@ -91,9 +91,9 @@ class CppProcessor:
                     merged_details[key] = value
             self.functions[full_name] = merged_details
         
-    async def process_cpp_file(self, inputPath: str, inputLocation: str, project_id: str):
+    async def parse_cpp_file(self, inputPath: str, inputLocation: str, project_id: str):
         try:
-            logger.info(f"Creating Clang Index for parsing C++ file: {inputPath}")
+#            logger.info(f"Creating Clang Index for parsing C++ file: {inputPath}")
             index = clang.cindex.Index.create()
             translation_unit = index.parse(inputPath)
             
@@ -105,24 +105,21 @@ class CppProcessor:
             try:
                 with open(inputPath, 'r') as file:
                     file_contents = file.read()
-                logger.info(f"Successfully read {len(file_contents)} characters from {inputPath}")
+#                logger.info(f"Successfully read {len(file_contents)} characters from {inputPath}")
             except IOError as io_err:
                 logger.error(f"IOError while reading {inputPath}: {io_err}")
                 raise
 
             # Save raw code of header files
-            if inputPath.endswith('.hpp') or inputPath.endswith('.h'):
-#                logger.info(f"Saving contents of header file: {inputPath}")
-                async with self.lock_header_files:
-                    self.header_files[inputPath] = file_contents
-                logger.info(f"Saved contents of header file: {inputPath}")
+#            if inputPath.endswith('.hpp') or inputPath.endswith('.h'):
+##                logger.info(f"Saving contents of header file: {inputPath}")
+#                async with self.lock_header_files:
+#                    self.header_files[inputPath] = file_contents
+#                logger.info(f"Saved contents of header file: {inputPath}")
 
 #            logger.info(f"Starting to process nodes for {inputPath}")
             await self.process_nodes(translation_unit.cursor, inputLocation, project_id, inputPath.endswith('.cpp'))
-            logger.info(f"Finished processing nodes for {inputPath}")
-
-            # After processing all nodes, retry any failed nodes
-            await self.retry_failed_nodes(inputLocation, project_id)
+#            logger.info(f"Finished parsing nodes for {inputPath}")
 
         except clang.cindex.TranslationUnitLoadError as tu_error:
             logger.error(f"TranslationUnitLoadError for {inputPath}: {tu_error}")
@@ -151,7 +148,7 @@ class CppProcessor:
             logger.info(f"Preparing summarization tasks. Total classes: {len(self.classes)}")
             for full_name, class_info in self.classes.items():
                 namespace = class_info.get('namespace', '')
-                logger.info(f"Checking class: {full_name}, namespace: {namespace}")
+#                logger.info(f"Checking class: {full_name}, namespace: {namespace}")
                 
                 # Create a simplified version of class_info for logging
                 simplified_info = {
@@ -170,11 +167,11 @@ class CppProcessor:
                     'has_implementation_embedding': 'implementation_embedding' in class_info
                 }
                 
-                logger.info(f"Simplified class info: {simplified_info}")
+#                logger.info(f"Simplified class info: {simplified_info}")
                 
                 if 'interface_description' in class_info or 'implementation_description' in class_info:
                     tasks.append(('Class', full_name, copy.deepcopy(class_info)))
-                    logger.info(f"Added summarization task for class: {full_name}")
+#                    logger.info(f"Added summarization task for class: {full_name}")
                 else:
                     logger.warning(f"Skipping summarization for class {full_name} in namespace {namespace}. "
                                    f"Missing one of: interface_description: {'interface_description' in class_info}, "
@@ -196,12 +193,12 @@ class CppProcessor:
                     'has_raw_code': 'raw_code' in method_info,
                     'has_embedding': 'embedding' in method_info
                 }
-                logger.info(f"Checking method: {full_name}, namespace: {namespace}")
-                logger.info(f"Simplified method info: {simplified_info}")
+#                logger.info(f"Checking method: {full_name}, namespace: {namespace}")
+#                logger.info(f"Simplified method info: {simplified_info}")
                 
                 if 'description' in method_info:
                     tasks.append(('Method', full_name, copy.deepcopy(method_info)))
-                    logger.info(f"Added summarization task for method: {full_name}")
+#                    logger.info(f"Added summarization task for method: {full_name}")
                 else:
                     logger.warning(f"Skipping summarization for method {full_name} in namespace {namespace} due to missing description")
 
@@ -221,12 +218,12 @@ class CppProcessor:
                     'has_raw_code': 'raw_code' in function_info,
                     'has_embedding': 'embedding' in function_info
                 }
-                logger.info(f"Checking function: {full_name}, namespace: {namespace}")
-                logger.info(f"Simplified function info: {simplified_info}")
+#                logger.info(f"Checking function: {full_name}, namespace: {namespace}")
+#                logger.info(f"Simplified function info: {simplified_info}")
                 
                 if 'description' in function_info:
                     tasks.append(('Function', full_name, copy.deepcopy(function_info)))
-                    logger.info(f"Added summarization task for function: {full_name}")
+#                    logger.info(f"Added summarization task for function: {full_name}")
                 else:
                     logger.warning(f"Skipping summarization for function {full_name} in namespace {namespace} due to missing description")
 
@@ -234,19 +231,19 @@ class CppProcessor:
         return tasks
     
     
-    async def retry_failed_nodes(self, project_path, project_id):
-        retry_tasks = []
-        while self.failed_nodes:
-            node, _, _, is_cpp_file, retry_count = self.failed_nodes.popleft()
-            if retry_count >= self.max_retries:
-                logger.warning(f"Node {node.spelling} has reached max retries. Skipping.")
-                continue
-            retry_tasks.append(self.retry_single_node(node, project_path, project_id, is_cpp_file, retry_count))
-
-        await asyncio.gather(*retry_tasks)
-
-        if self.failed_nodes:
-            logger.warning(f"{len(self.failed_nodes)} nodes still failed after retries")
+#    async def retry_failed_nodes(self, project_path, project_id):
+#        retry_tasks = []
+#        while self.failed_nodes:
+#            node, _, _, is_cpp_file, retry_count = self.failed_nodes.popleft()
+#            if retry_count >= self.max_retries:
+#                logger.warning(f"Node {node.spelling} has reached max retries. Skipping.")
+#                continue
+#            retry_tasks.append(self.retry_single_node(node, project_path, project_id, is_cpp_file, retry_count))
+#
+#        await asyncio.gather(*retry_tasks)
+#
+#        if self.failed_nodes:
+#            logger.warning(f"{len(self.failed_nodes)} nodes still failed after retries")
 
 
     async def retry_single_node(self, node, project_path, project_id, is_cpp_file, retry_count):
@@ -357,7 +354,7 @@ class CppProcessor:
         type_name = "Class" if node.kind == clang.cindex.CursorKind.CLASS_DECL else "Struct" if node.kind == clang.cindex.CursorKind.STRUCT_DECL else "ClassTemplate"
         class_name = node.spelling
 
-        logger.info(f"Processing {type_name}: {full_name} in file {file_name}")
+#        logger.info(f"Processing {type_name}: {full_name} in file {file_name}")
 
         interface_description = ""
         implementation_description = ""
@@ -432,8 +429,8 @@ class CppProcessor:
         if members:
             implementation_description = "Implementation details: " + ", ".join(members)
 
-        async with self.lock_header_files:
-            header_code = self.header_files.get(file_name, '')
+#        async with self.lock_header_files:
+#            header_code = self.header_files.get(file_name, '')
         raw_code = await self.get_raw_code(node) if is_cpp_file else ''
         details = {
             'type': type_name,
@@ -506,7 +503,7 @@ class CppProcessor:
         function_name = node.spelling
         fully_qualified_function_name = f"{full_scope}::{function_name}" if full_scope else function_name
 
-        logger.info(f"Processing {type_name}: {fully_qualified_function_name} in file {file_name}")
+#        logger.info(f"Processing {type_name}: {fully_qualified_function_name} in file {file_name}")
 
         description = f"Function {function_name} in scope {full_scope} defined in {file_name}"
         raw_comment = node.raw_comment if node.raw_comment else ''
@@ -586,15 +583,15 @@ class CppProcessor:
         try:
             class_name = class_info.get('name', 'Unknown')
             namespace = class_info.get('namespace', '')
-            logger.info(f"Summarizing class: {class_info['name']}, interface_description: {class_info.get('interface_description', 'Missing')}, implementation_description: {class_info.get('implementation_description', 'Missing')}")
+#            logger.info(f"Summarizing class: {class_info['name']}, interface_description: {class_info.get('interface_description', 'Missing')}, implementation_description: {class_info.get('implementation_description', 'Missing')}")
 
             class_name, full_scope, interface_summary, interface_description = await self.summarize_cpp_class_public_interface(class_info)
-            logger.info(f"Completed public interface summarization for {class_name}")
+#            logger.info(f"Completed public interface summarization for {class_name}")
             
             implementation_summary, implementation_description = await self.summarize_cpp_class_implementation(class_info)
-            logger.info(f"Completed implementation summarization for {class_name}")
+#            logger.info(f"Completed implementation summarization for {class_name}")
             
-            logger.info(f"Finished summarization for class: {class_name}, interface_summary length: {len(interface_summary)}, implementation_summary length: {len(implementation_summary)}")
+#            logger.info(f"Finished summarization for class: {class_name}, interface_summary length: {len(interface_summary)}, implementation_summary length: {len(implementation_summary)}")
             
             return class_name, full_scope, interface_summary + "\n\n" + interface_description, implementation_summary + "\n\n" + implementation_description
         except Exception as e:
@@ -634,14 +631,14 @@ class CppProcessor:
             
             # Combine background and description with clear separation
             full_prompt = f"{background}\n\nClass Details:\n{description}. {interface_description}"
-            logger.info(f"Public interface prompt for {class_info.get('name', 'Unknown')}: {full_prompt[:100]}...")  # Log first 100 chars
+#            logger.info(f"Public interface prompt for {class_info.get('name', 'Unknown')}: {full_prompt[:100]}...")  # Log first 100 chars
         except Exception as e:
             logger.error(f"Error in summarize_cpp_class_public_interface accessing dict: {e}")
             raise DatabaseError(f"Error in summarize_cpp_class_public_interface accessing dict: {e}")
 
         try:
             summary = await self.do_summarize_text(full_prompt, 200, 25)
-            logger.info(f"Public interface summary for {class_info.get('name', 'Unknown')}: {summary[:100]}...")  # Log first 100 chars
+#            logger.info(f"Public interface summary for {class_info.get('name', 'Unknown')}: {summary[:100]}...")  # Log first 100 chars
             return full_name, full_scope, summary, description + ". " + interface_description
         except Exception as e:
             logger.error(f"Error in summarize_cpp_class_public_interface for {class_info.get('name', 'Unknown')}: {e}")
@@ -679,14 +676,14 @@ class CppProcessor:
             
             # Combine background and description with clear separation
             full_prompt = f"{background}\n\nClass Details: {description}. {implementation_description}"
-            logger.info(f"Implementation prompt for {class_info.get('name', 'Unknown')}: {full_prompt[:100]}...")  # Log first 100 chars
+#            logger.info(f"Implementation prompt for {class_info.get('name', 'Unknown')}: {full_prompt[:100]}...")  # Log first 100 chars
         except Exception as e:
             logger.error(f"Error in summarize_cpp_class_implementation accessing dict: {e}")
             raise DatabaseError(f"Error in summarize_cpp_class_implementation accessing dict: {e}")
 
         try:
             summary = await self.do_summarize_text(full_prompt, 200, 25)
-            logger.info(f"Implementation summary for {class_info.get('name', 'Unknown')}: {summary[:100]}...")  # Log first 100 chars
+#            logger.info(f"Implementation summary for {class_info.get('name', 'Unknown')}: {summary[:100]}...")  # Log first 100 chars
             return summary, description + ". " + implementation_description
 
         except Exception as e:
