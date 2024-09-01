@@ -1,6 +1,13 @@
 # ngest
 Python script for ingesting various files into a semantic graph. For text, images, cpp, python, rust, javascript, and PDFs.
 
+### Note / Status
+
+This project isn't done yet so don't bother using it.
+When it's ready there will also be a retrieval script.
+
+Status: we have minimal CPP ingestion now working, as well as 2-layer ingestion for PDFs.
+
 ## Requirements
 
 This package requires LLVM and its Python bindings to be installed. You can install LLVM using your system's package manager:
@@ -10,6 +17,10 @@ This package requires LLVM and its Python bindings to be installed. You can inst
 - On Fedora/RHEL: `sudo dnf install llvm llvm-devel`
 
 After installing LLVM, you may need to set the `LLVM_CONFIG` environment variable to the path of your `llvm-config` binary before installing this package.
+
+### Neo4J
+
+This project currently uses Neo4J 
 
 ## Installation
 
@@ -66,20 +77,25 @@ This manual setup should only be necessary if the automatic setup fails or if yo
 
 After installing the ngest package, you can use it from the command line as follows:
 
+```
+ngest --help
+```
+
+### Config file
+
+The first time you run it, it will create a a config file at: ```~/.ngest/config.ini```
+
+- Make sure you edit that config file.
+- Set your OpenAI API key for summarizations.
+- It currently uses Ollama for embeddings. So you'll need Ollama. More options coming soon.
+- By default it uses port 7689 for Neo4J, so you'll probably want to change that to the normal Neo4J port which is 7687. (The reason I use 7689 is because I'm separately running another Neo4J in my R2R setup. Sorry).
+
 ### Ingesting a project folder
 
 To ingest a project folder, use the following command:
 
 ```
 ngest --input_path /path/to/folder create
-```
-
-### Other commands
-
-You can see all available commands by running:
-
-```
-ngest --help
 ```
 
 ### Using ngest in a Python script
@@ -93,12 +109,6 @@ from ngest import NIngest, ProjectManager
 ```
 
 Remember that the Clang setup is automatically performed when you import ngest, so no additional setup is required in most cases.
-### Note / Status
-
-This project isn't done yet so don't bother using it yet.
-When it's ready there will also be a Retriever script.
-
-Status: we have minimal CPP ingestion now working, as well as 2-layer ingestion for PDFs.
 
 P.S. in case you're curious, this can be used to wipe a Neo4J DB.
 Use with caution: ```CALL apoc.schema.assert({},{},true); MATCH (n) DETACH DELETE n;```

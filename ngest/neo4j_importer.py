@@ -287,6 +287,8 @@ class NNeo4JImporter(NBaseImporter):
 
 #       logger.info(f"Starting scanning for file: {inputPath}")
         try:
+            file_id = None
+            document_id = None
             localPath = strip_top_level(inputPath, topLevelInputPath)
             file_type = self.ascertain_file_type(inputPath)
 
@@ -399,7 +401,7 @@ class NNeo4JImporter(NBaseImporter):
                             return -1
                         document_id = document.id
                         
-                await parse_method(inputPath, inputLocation, inputName, localPath, currentOutputPath, project_id)
+                await parse_method(file_id, inputPath, inputLocation, inputName, localPath, currentOutputPath, project_id)
             else:
                 logger.warning(f"No ingest method for file type: {file_type['type']}, inputPath: {inputPath}")
         except Exception as e:
@@ -595,7 +597,7 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Error storing chunk with embedding: {e}")
             raise DatabaseError(f"Error storing chunk with embedding: {e}")
 
-    async def ParseText(self, input_path: str, input_location: str, input_name: str, localPath: str, current_output_path: str, project_id: str) -> None:
+    async def ParseText(self, file_id: str, input_path: str, input_location: str, input_name: str, localPath: str, current_output_path: str, project_id: str) -> None:
             try:
                 # File reading operation - doesn't need rate limiting
                 async with aiofiles.open(input_path, 'r') as file:
@@ -646,7 +648,7 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Error extracting image features: {e}")
             raise FileProcessingError(f"Error extracting image features: {e}")
 
-    async def ParseImg(self, input_path: str, input_location: str, input_name: str, localPath: str, current_output_path: str, project_id: str) -> None:
+    async def ParseImg(self, file_id: str, input_path: str, input_location: str, input_name: str, localPath: str, current_output_path: str, project_id: str) -> None:
         """
         Ingest an image file by extracting features and creating nodes in the database.
 
@@ -722,7 +724,7 @@ class NNeo4JImporter(NBaseImporter):
         return outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy().tolist()
 
 
-    async def ParseCpp(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str):
+    async def ParseCpp(self, file_id: str, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str):
         try:
             await self.cpp_processor.parse_cpp_file(inputPath, inputLocation, project_id)
         except FileProcessingError as e:
@@ -984,33 +986,48 @@ class NNeo4JImporter(NBaseImporter):
 
     async def store_all_cpp(self, project_id):
         try:
-            tasks = await self.cpp_processor.prepare_summarization_tasks()
+            tasks = await self.cpp_processor.prepare_storage_tasks()
 
-            for task_type, name, info in tasks:
-                if task_type == 'Class':
-                    if 'interface_summary' not in info or 'implementation_summary' not in info:
-                        logger.warning(f"Class {name} missing summaries, skipping storage")
-                        continue
-                    await self.store_summary_cpp_class(name, info, project_id)
-                elif task_type == 'Method':
-                    if 'summary' not in info:
-                        logger.warning(f"Method {name} missing summary, skipping storage")
-                        continue
-                    await self.store_summary_cpp_method(name, info, project_id)
-                elif task_type == 'Function':
-                    if 'summary' not in info:
-                        logger.warning(f"Function {name} missing summary, skipping storage")
-                        continue
-                    await self.store_summary_cpp_function(name, info, project_id)
+            batch_size = 100  # Adjust this value based on your needs
+            max_concurrent_batches = 5  # Adjust based on your system's capabilities
+            total_tasks = len(tasks)
+            completed_tasks = 0
+
+            async def process_batch(batch):
+                nonlocal completed_tasks
+                storage_tasks = []
+                for task_type, name, info in batch:
+                    if task_type == 'Class':
+                        storage_tasks.append(self.store_cpp_class(name, info, project_id))
+                    elif task_type == 'Method':
+                        storage_tasks.append(self.store_cpp_method(name, info, project_id))
+                    elif task_type == 'Function':
+                        storage_tasks.append(self.store_cpp_function(name, info, project_id))
                 
-                await self.update_progress_store(1)
+                await asyncio.gather(*storage_tasks)
+                completed_tasks += len(batch)
+                await self.update_progress_store(len(batch))
+                logger.info(f"Completed {completed_tasks}/{total_tasks} storage tasks")
+
+            # Create more balanced batches
+            batches = [tasks[i:i+batch_size] for i in range(0, len(tasks), batch_size)]
+            
+            # Process batches concurrently with a limit
+            semaphore = asyncio.Semaphore(max_concurrent_batches)
+            async def process_batch_with_semaphore(batch):
+                async with semaphore:
+                    await process_batch(batch)
+
+            await asyncio.gather(*[process_batch_with_semaphore(batch) for batch in batches])
+
+            logger.info(f"Completed all storage tasks successfully")
 
         except Exception as e:
             logger.error(f"Error in store_all_cpp: {e}")
+            logger.error(f"Error details: {traceback.format_exc()}")
             raise FileProcessingError(f"Error in store_all_cpp: {e}")
 
-
-    async def store_summary_cpp_class(self, full_name, info, project_id):
+    async def store_cpp_class(self, full_name, info, project_id):
 #        logger.info(f"Storing summary for class: {full_name}")
         try:
             type_name = info.get('type', 'Class')
@@ -1058,7 +1075,7 @@ class NNeo4JImporter(NBaseImporter):
             
             
         
-    async def store_summary_cpp_method(self, full_name, info, project_id):
+    async def store_cpp_method(self, full_name, info, project_id):
 #        logger.info(f"Storing summary for method: {full_name}")
         try:
             type_name = info.get('type', 'Method')
@@ -1114,7 +1131,7 @@ class NNeo4JImporter(NBaseImporter):
     
     
         
-    async def store_summary_cpp_function(self, full_name, info, project_id):
+    async def store_cpp_function(self, full_name, info, project_id):
 #        logger.info(f"Storing summary for function: {full_name}")
         try:
             type_name = info.get('type', 'Function')
@@ -1164,7 +1181,7 @@ class NNeo4JImporter(NBaseImporter):
             current = current.semantic_parent
         return "::".join(reversed(scopes))
 
-    async def ParsePython(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
+    async def ParsePython(self, file_id: str, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a Python file by parsing it, summarizing classes and functions, and storing them in the database.
 
@@ -1254,7 +1271,7 @@ class NNeo4JImporter(NBaseImporter):
         description = f"Function {func.name} with arguments: {', '.join(arg.arg for arg in func.args.args)}. It performs the following tasks: "
         return await self.do_summarize_text(description)
 
-    async def ParseRust(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
+    async def ParseRust(self, file_id: str, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a Rust file by parsing it, summarizing implementations and functions, and storing them in the database.
 
@@ -1390,7 +1407,7 @@ class NNeo4JImporter(NBaseImporter):
         description += ", ".join(methods)
         return await self.do_summarize_text(description)
 
-    async def ParseJavascript(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
+    async def ParseJavascript(self, file_id: str, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
         """
         Ingest a JavaScript file by parsing it, summarizing classes, functions, and variables, and storing them in the database.
 
@@ -1548,7 +1565,7 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Error running query: {query}")
             raise DatabaseError(f"Error running query: {e}")
 
-    async def ParsePdf(self, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
+    async def ParsePdf(self, file_id: str, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
         try:
             reader = PdfReader(inputPath)
             num_pages = len(reader.pages)
@@ -1618,7 +1635,7 @@ class NNeo4JImporter(NBaseImporter):
                                     "MATCH (s:SmallChunk) WHERE elementId(s) = $small_chunk_id "
                                     "MERGE (m)-[:HAS_CHUNK]->(s) "
                                     "MERGE (s)-[:BELONGS_TO_CHUNK]->(m) "
-                                    "MERGE (s)-[:HAS_PARENT_DOC]->(p)",
+                                    "MERGE (s)-[:BELONGS_TO_FILE]->(p)",
                                     {"pdf_id": pdf_id, "medium_chunk_id": medium_chunk_id, "small_chunk_id": small_chunk_id}
                                 )).consume()
                                 
