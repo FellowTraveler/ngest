@@ -51,7 +51,7 @@ async def main():
             if not args.input_path:
                 raise ValueError("input_path is required for create action")
             project_id = await project_manager.create_project(args.input_path)
-            print(f"Project created and ingestion started successfully. Project ID: {project_id}")
+            print(f"Project created successfully. Project ID: {project_id}")
         elif args.action == 'update':
             if not args.project_id or not args.input_path:
                 raise ValueError("Both project_id and input_path are required for update action")

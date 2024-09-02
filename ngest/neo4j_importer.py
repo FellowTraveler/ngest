@@ -6,8 +6,9 @@ import os
 import datetime
 import logging
 import asyncio
+from asyncio import sleep
 from neo4j import AsyncGraphDatabase
-from neo4j.exceptions import ServiceUnavailable
+from neo4j.exceptions import ServiceUnavailable, TransientError
 import PIL.Image
 import torchvision.transforms as transforms
 import torchvision.models as models
@@ -195,7 +196,16 @@ class NNeo4JImporter(NBaseImporter):
         await self.driver.close()
 
     @asynccontextmanager
-    @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=4, max=10), retry=retry_if_exception_type(ServiceUnavailable))
+    @retry(
+        stop=stop_after_attempt(10),
+        wait=wait_exponential(multiplier=2, min=4, max=10),
+        retry=(retry_if_exception_type(ServiceUnavailable) | retry_if_exception_type(TransientError)),
+        before_sleep=lambda retry_state: logger.warning(
+            f"Attempt {retry_state.attempt_number}/10: Transient error occurred while getting session. "
+            f"Retrying in {retry_state.next_action.sleep} seconds. "
+            f"Error: {retry_state.outcome.exception()}"
+        )
+    )
     async def get_session(self):
         """
         Get a session for Neo4j database operations.
@@ -206,11 +216,15 @@ class NNeo4JImporter(NBaseImporter):
         async with self.driver.session() as session:
             try:
                 yield session
+            except (ServiceUnavailable, TransientError) as e:
+                # These exceptions are handled by the retry decorator
+                raise
             except Exception as e:
-                logger.error(f"Error in get_session: {e}")
+                logger.error(f"Unhandled error in get_session: {e}")
+                raise
             finally:
                 await session.close()
-
+                
     async def make_embedding(self, text: str) -> List[float]:
         try:
             # this only limits the creation of new threads.
@@ -726,7 +740,7 @@ class NNeo4JImporter(NBaseImporter):
 
     async def ParseCpp(self, file_id: str, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str):
         try:
-            await self.cpp_processor.parse_cpp_file(inputPath, inputLocation, project_id)
+            await self.cpp_processor.parse_cpp_file(file_id, inputPath, inputLocation, project_id)
         except FileProcessingError as e:
             logger.error(f"Error parsing C++ file {inputPath}: {e}")
             raise
@@ -984,27 +998,118 @@ class NNeo4JImporter(NBaseImporter):
             return False
 
 
+    async def store_cpp_classes_batch(self, classes, project_id, session):
+        query = """
+        UNWIND $classes AS class
+        MERGE (n:Class {name: class.full_name, project_id: $project_id})
+        ON CREATE SET n.namespace = class.namespace,
+                      n.short_name = class.short_name,
+                      n.scope = class.scope,
+                      n.interface_summary = class.interface_summary,
+                      n.implementation_summary = class.implementation_summary,
+                      n.interface_embedding = class.interface_embedding,
+                      n.implementation_embedding = class.implementation_embedding,
+                      n.file_path = class.file_path,
+                      n.raw_code = class.raw_code
+        ON MATCH SET
+            n.interface_summary = class.interface_summary,
+            n.implementation_summary = class.implementation_summary,
+            n.interface_embedding = class.interface_embedding,
+            n.implementation_embedding = class.implementation_embedding
+        WITH n, class
+        UNWIND class.file_ids AS file_id
+        MATCH (f:File {id: file_id, project_id: $project_id})
+        MERGE (n)-[:HAS_FILE]->(f)
+        MERGE (f)-[:HAS_CLASS]->(n)
+        """
+        
+        await session.run(query, {'classes': classes, 'project_id': project_id})
+
+    async def store_cpp_methods_batch(self, methods, project_id, session):
+        query = """
+        UNWIND $methods AS method
+        MERGE (n:Method {name: method.full_name, project_id: $project_id})
+        ON CREATE SET n.namespace = method.namespace,
+                      n.short_name = method.short_name,
+                      n.scope = method.scope,
+                      n.summary = method.summary,
+                      n.embedding = method.embedding,
+                      n.file_path = method.file_path,
+                      n.raw_code = method.raw_code
+        ON MATCH SET
+            n.summary = method.summary,
+            n.embedding = method.embedding
+        WITH n, method
+        MATCH (c)
+        WHERE (c.name = method.scope AND (c:Class OR c:Struct) AND c.project_id = $project_id)
+        MERGE (c)-[:HAS_METHOD]->(n)
+        MERGE (n)-[:BELONGS_TO_TYPE]->(c)
+        WITH n, method
+        UNWIND method.file_ids AS file_id
+        MATCH (f:File {id: file_id, project_id: $project_id})
+        MERGE (n)-[:HAS_FILE]->(f)
+        MERGE (f)-[:HAS_METHOD]->(n)
+        """
+        
+        await session.run(query, {'methods': methods, 'project_id': project_id})
+
+    async def store_cpp_functions_batch(self, functions, project_id, session):
+        query = """
+        UNWIND $functions AS func
+        MERGE (n:Function {name: func.full_name, project_id: $project_id})
+        ON CREATE SET n.namespace = func.namespace,
+                      n.short_name = func.short_name,
+                      n.scope = func.scope,
+                      n.summary = func.summary,
+                      n.embedding = func.embedding,
+                      n.file_path = func.file_path,
+                      n.raw_code = func.raw_code
+        ON MATCH SET
+            n.summary = func.summary,
+            n.embedding = func.embedding
+        WITH n, func
+        UNWIND func.file_ids AS file_id
+        MATCH (f:File {id: file_id, project_id: $project_id})
+        MERGE (n)-[:HAS_FILE]->(f)
+        MERGE (f)-[:HAS_FUNCTION]->(n)
+        """
+        
+        await session.run(query, {'functions': functions, 'project_id': project_id})
+
     async def store_all_cpp(self, project_id):
         try:
             tasks = await self.cpp_processor.prepare_storage_tasks()
 
-            batch_size = 100  # Adjust this value based on your needs
-            max_concurrent_batches = 5  # Adjust based on your system's capabilities
+            batch_size = 50
+            max_concurrent_batches = 3
             total_tasks = len(tasks)
             completed_tasks = 0
 
             async def process_batch(batch):
                 nonlocal completed_tasks
-                storage_tasks = []
+                classes = []
+                methods = []
+                functions = []
                 for task_type, name, info in batch:
                     if task_type == 'Class':
-                        storage_tasks.append(self.store_cpp_class(name, info, project_id))
+                        classes.append({'full_name': name, **info})
                     elif task_type == 'Method':
-                        storage_tasks.append(self.store_cpp_method(name, info, project_id))
+                        methods.append({'full_name': name, **info})
                     elif task_type == 'Function':
-                        storage_tasks.append(self.store_cpp_function(name, info, project_id))
+                        functions.append({'full_name': name, **info})
                 
-                await asyncio.gather(*storage_tasks)
+                try:
+                    async with self.get_session() as session:
+                        if classes:
+                            await self.store_cpp_classes_batch(classes, project_id, session)
+                        if methods:
+                            await self.store_cpp_methods_batch(methods, project_id, session)
+                        if functions:
+                            await self.store_cpp_functions_batch(functions, project_id, session)
+                except Exception as e:
+                    logger.error(f"Error processing batch: {str(e)}")
+                    raise
+                
                 completed_tasks += len(batch)
                 await self.update_progress_store(len(batch))
                 logger.info(f"Completed {completed_tasks}/{total_tasks} storage tasks")
@@ -1026,7 +1131,8 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Error in store_all_cpp: {e}")
             logger.error(f"Error details: {traceback.format_exc()}")
             raise FileProcessingError(f"Error in store_all_cpp: {e}")
-
+        
+        
     async def store_cpp_class(self, full_name, info, project_id):
 #        logger.info(f"Storing summary for class: {full_name}")
         try:
