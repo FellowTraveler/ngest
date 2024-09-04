@@ -2,6 +2,7 @@
 # MIT License
 
 import aiohttp
+import traceback
 import os
 import datetime
 import logging
@@ -634,17 +635,9 @@ class NNeo4JImporter(NBaseImporter):
                 raise FileProcessingError(f"ParseText: Error reading file {input_path}: {e}")
 
             try:
-                # Database operation - needs rate limiting
-                async with self.rate_limiter_db:
-                    async with self.get_session() as session:
-                        parent_doc_id = await self.run_query_and_get_element_id(session,
-                            "CREATE (n:Document {name: $name, type: 'text', project_id: $project_id}) RETURN elementId(n)",
-                            name=input_name, project_id=project_id
-                        )
-
                 # This method likely contains multiple database operations,
                 # so we don't wrap it in rate_limiter here. It should handle its own rate limiting internally.
-                await self.process_chunks(file_content, parent_doc_id, "Document", MEDIUM_CHUNK_SIZE, "MediumChunk", project_id)
+                await self.process_chunks(file_content, file_id, "Document", MEDIUM_CHUNK_SIZE, "MediumChunk", project_id)
         
             except Exception as e:
                 logger.error(f"Error ingesting text file {input_path}: {e}")
@@ -982,6 +975,34 @@ class NNeo4JImporter(NBaseImporter):
             return False
 
 
+    async def store_cpp_namespaces_batch(self, namespaces, project_id, session):
+        query = """
+        UNWIND $namespaces AS ns
+        MERGE (n:Namespace {name: ns.name, project_id: $project_id})
+        ON CREATE SET n.scope = ns.scope,
+                      n.short_name = ns.short_name,
+                      n.description = ns.description
+        WITH n, ns
+        CALL {
+            WITH n, ns
+            MATCH (p:Namespace {name: ns.parent_namespace, project_id: $project_id})
+            WHERE ns.parent_namespace IS NOT NULL
+            MERGE (p)-[:CONTAINS_NAMESPACE]->(n)
+        }
+        WITH n, ns
+        UNWIND ns.files AS file
+        MATCH (f:File {id: file.file_id, project_id: $project_id})
+        MERGE (n)-[r:DECLARED_IN_FILE]->(f)
+        ON CREATE SET r = {
+            start_line: file.start_line,
+            end_line: file.end_line,
+            raw_code: file.raw_code,
+            raw_comment: file.raw_comment
+        }
+        """
+        
+        await session.run(query, {'namespaces': namespaces, 'project_id': project_id})
+    
     async def store_cpp_classes_batch(self, classes, project_id, session):
         query = """
         UNWIND $classes AS class
@@ -991,25 +1012,43 @@ class NNeo4JImporter(NBaseImporter):
                       n.scope = class.scope,
                       n.interface_summary = class.interface_summary,
                       n.implementation_summary = class.implementation_summary,
-                      n.interface_embedding = class.interface_embedding,
-                      n.implementation_embedding = class.implementation_embedding
+                      n.embedding = class.embedding
         ON MATCH SET
             n.interface_summary = class.interface_summary,
             n.implementation_summary = class.implementation_summary,
-            n.interface_embedding = class.interface_embedding,
-            n.implementation_embedding = class.implementation_embedding
+            n.embedding = class.embedding
+        WITH n, class
+        UNWIND class.base_classes AS base
+        MATCH (b:Class {name: base.name, project_id: $project_id})
+        CREATE (n)-[r:INHERITS_FROM]->(b)
+        SET r.access_specifier = base.access_specifier
         WITH n, class
         UNWIND class.files AS file
         MATCH (f:File {id: file.file_id, project_id: $project_id})
-        MERGE (n)-[r:APPEARS_IN]->(f)
-        ON CREATE SET r = {file_type: file.file_type,
-                           start_line: file.start_line,
-                           end_line: file.end_line,
-                           raw_code: file.raw_code,
-                           raw_comment: file.raw_comment}
+        FOREACH (ignored IN CASE WHEN file.file_type = 'CppHeader' THEN [1] ELSE [] END |
+            CREATE (n)-[r:DEFINED_IN_FILE]->(f)
+            SET r.start_line = file.start_line,
+                r.end_line = file.end_line,
+                r.raw_code = file.raw_code,
+                r.raw_comment = file.raw_comment
+        )
+        FOREACH (ignored IN CASE WHEN file.file_type = 'CppCode' THEN [1] ELSE [] END |
+            CREATE (n)-[r:IMPLEMENTED_IN_FILE]->(f)
+            SET r.start_line = file.start_line,
+                r.end_line = file.end_line,
+                r.raw_code = file.raw_code,
+                r.raw_comment = file.raw_comment
+        )
+        FOREACH (ignored IN CASE WHEN file.file_type <> 'CppHeader' AND file.file_type <> 'CppCode' THEN [1] ELSE [] END |
+            CREATE (n)-[r:INCLUDED_IN_FILE]->(f)
+            SET r.start_line = file.start_line,
+                r.end_line = file.end_line,
+                r.raw_code = file.raw_code,
+                r.raw_comment = file.raw_comment
+        )
         """
-        
         await session.run(query, {'classes': classes, 'project_id': project_id})
+    
 
     async def store_cpp_methods_batch(self, methods, project_id, session):
         query = """
@@ -1024,23 +1063,29 @@ class NNeo4JImporter(NBaseImporter):
             n.summary = method.summary,
             n.embedding = method.embedding
         WITH n, method
-        MATCH (c)
-        WHERE (c.name = method.scope AND (c:Class OR c:Struct) AND c.project_id = $project_id)
-        MERGE (c)-[:HAS_METHOD]->(n)
-        MERGE (n)-[:BELONGS_TO_TYPE]->(c)
+        MATCH (c:Class {name: method.scope, project_id: $project_id})
+        CREATE (c)-[:HAS_METHOD]->(n)
+        CREATE (n)-[:DEFINED_IN_CLASS]->(c)
         WITH n, method
         UNWIND method.files AS file
         MATCH (f:File {id: file.file_id, project_id: $project_id})
-        MERGE (n)-[r:APPEARS_IN]->(f)
-        ON CREATE SET r = {file_type: file.file_type,
-                           start_line: file.start_line,
-                           end_line: file.end_line,
-                           raw_code: file.raw_code,
-                           raw_comment: file.raw_comment}
+        FOREACH (ignored IN CASE WHEN file.file_type = 'CppHeader' THEN [1] ELSE [] END |
+            CREATE (n)-[r:DECLARED_IN_FILE]->(f)
+            SET r.start_line = file.start_line,
+                r.end_line = file.end_line,
+                r.raw_code = file.raw_code,
+                r.raw_comment = file.raw_comment
+        )
+        FOREACH (ignored IN CASE WHEN file.file_type = 'CppCode' THEN [1] ELSE [] END |
+            CREATE (n)-[r:IMPLEMENTED_IN_FILE]->(f)
+            SET r.start_line = file.start_line,
+                r.end_line = file.end_line,
+                r.raw_code = file.raw_code,
+                r.raw_comment = file.raw_comment
+        )
         """
-        
         await session.run(query, {'methods': methods, 'project_id': project_id})
-
+        
 
     async def store_cpp_functions_batch(self, functions, project_id, session):
         query = """
@@ -1057,16 +1102,27 @@ class NNeo4JImporter(NBaseImporter):
         WITH n, func
         UNWIND func.files AS file
         MATCH (f:File {id: file.file_id, project_id: $project_id})
-        MERGE (n)-[r:APPEARS_IN]->(f)
-        ON CREATE SET r = {file_type: file.file_type,
-                           start_line: file.start_line,
-                           end_line: file.end_line,
-                           raw_code: file.raw_code,
-                           raw_comment: file.raw_comment}
+        FOREACH (ignored IN CASE WHEN file.file_type = 'CppHeader' THEN [1] ELSE [] END |
+            MERGE (n)-[r:DECLARED_IN_FILE]->(f)
+            ON CREATE SET r = {
+                start_line: file.start_line,
+                end_line: file.end_line,
+                raw_code: file.raw_code,
+                raw_comment: file.raw_comment
+            }
+        )
+        FOREACH (ignored IN CASE WHEN file.file_type = 'CppCode' THEN [1] ELSE [] END |
+            MERGE (n)-[r:DEFINED_IN_FILE]->(f)
+            ON CREATE SET r = {
+                start_line: file.start_line,
+                end_line: file.end_line,
+                raw_code: file.raw_code,
+                raw_comment: file.raw_comment
+            }
+        )
         """
         
         await session.run(query, {'functions': functions, 'project_id': project_id})
-
 
     async def store_all_cpp(self, project_id):
         try:

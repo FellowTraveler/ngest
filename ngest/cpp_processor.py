@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 from enum import Enum
 
+
 class FileType(Enum):
     CppCode = 1
     CppHeader = 2
@@ -299,6 +300,7 @@ class CppProcessor:
                         'implementation_summary': class_info.get('implementation_summary', ''),
                         'interface_embedding': class_info.get('interface_embedding', []),
                         'implementation_embedding': class_info.get('implementation_embedding', []),
+                        'base_classes': class_info.get('base_classes', []),
                         'files': converted_files
                     }))
 
@@ -316,7 +318,7 @@ class CppProcessor:
                         'embedding': method_info.get('embedding', []),
                         'files': converted_files
                     }))
-
+                
         async with self.lock_functions:
             for full_name, function_info in self.functions.items():
                 if 'summary' in function_info:
@@ -449,14 +451,20 @@ class CppProcessor:
                 'scope': full_scope,
                 'short_name': node.spelling,
                 'description': description,
-                'namespace': namespace,
+                'parent_namespace': self.get_parent_namespace(node),
                 'files': [file_info]
             }
             await self.update_namespace(full_name, details)
 
         await self.process_child_nodes(file_id=file_id, node=node, project_path=project_path, project_id=project_id, is_cpp_file=is_cpp_file)
     
-    
+
+    def get_parent_namespace(self, node):
+        parent = node.semantic_parent
+        while parent and parent.kind != clang.cindex.CursorKind.NAMESPACE:
+            parent = parent.semantic_parent
+        return parent.spelling if parent else None
+
 
     async def process_class_node(self, file_id: str, node, project_path, project_id, file_name, full_scope, full_name, namespace, is_cpp_file):
         type_name = "Class" if node.kind == clang.cindex.CursorKind.CLASS_DECL else "Struct" if node.kind == clang.cindex.CursorKind.STRUCT_DECL else "ClassTemplate"
@@ -540,7 +548,17 @@ class CppProcessor:
 #        async with self.lock_header_files:
 #            header_code = self.header_files.get(file_name, '')
         raw_code, start_line, end_line = await self.get_raw_code(node)
-        
+                
+        # Update base classes information
+        base_classes = []
+        for base in bases:
+            base_type = base.get_definition()
+            if base_type:
+                base_classes.append({
+                    'name': self.get_full_scope(base_type, include_self=True),
+                    'access_specifier': base.access_specifier.name  # Convert to string
+                })
+
         file_info = {
             'file_id': file_id,
             'file_path': file_name,
@@ -560,10 +578,11 @@ class CppProcessor:
             'interface_description': interface_description,
             'implementation_description': implementation_description,
             'namespace': namespace,
+            'base_classes': base_classes,
             'files': [file_info]
         }
         await self.update_class(full_name, details)
-        
+    
         await self.process_child_nodes(file_id, node, project_path, project_id, is_cpp_file)
 #        logger.info(f"Finished processing {type_name}: {full_name} in file {file_name}")
 
@@ -618,8 +637,8 @@ class CppProcessor:
                 'namespace': namespace,
                 'files': [file_info]
             }
-
             await self.update_method(fully_qualified_method_name, details)
+    
 #        logger.info(f"Finished processing method: {node.spelling} in file {file_name} full_name: {fully_qualified_method_name}")
 
     async def process_function_node(self, file_id: str, node, file_name, full_scope, namespace, is_cpp_file):
