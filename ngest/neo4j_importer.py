@@ -38,6 +38,7 @@ from ngest.project import Project
 from ngest.file import File
 from ngest.document import Document
 from ngest.pdf import PDF
+from ngest.cpp_processor import FileType
 from ngest.cpp_processor import CppProcessor
 from ngest.custom_errors import FileProcessingError
 
@@ -462,7 +463,7 @@ class NNeo4JImporter(NBaseImporter):
                 }
             ],
             "temperature": 1,
-            "max_tokens": 256,
+            "max_tokens": 2048,
             "top_p": 1,
             "frequency_penalty": 0,
             "presence_penalty": 0,
@@ -479,28 +480,40 @@ class NNeo4JImporter(NBaseImporter):
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.post(
-                    self.summary_api_url,  # Ensure this is set to "https://api.openai.com/v1/chat/completions"
+                    self.summary_api_url,
                     json=payload,
                     headers=headers,
                     timeout=60  # Add a timeout
                 ) as response:
                     if response.status == 200:
                         data = await response.json()
-                        if isinstance(data["choices"][0]["message"]["content"], list):
-                            summary = data["choices"][0]["message"]["content"][0]["text"]
+                        # Log the entire response for debugging
+#                        logger.info(f"API response:\n{pprint.pformat(data)}")
+
+                        # Attempt to extract the summary based on the expected structure
+                        content = data["choices"][0]["message"]["content"]
+                        if isinstance(content, list):
+                            summary = content[0].get("text", "")
                         else:
-                            summary = data["choices"][0]["message"]["content"]
+                            summary = content
+
+                        # Assuming 'summary' is the extracted summary from the API response
+                        if not isinstance(summary, str):
+                            # Log the summary using pretty print
+                            logger.info(f"Extracted summary (non-string):\n{pprint.pformat(summary)}")
+
+                        # Ensure summary is a string
+                        if not isinstance(summary, str):
+                            raise ValueError(f"Expected summary to be a string, but got {type(summary).__name__}: {summary}")
+
                         return summary
-#                    if response.status == 200:
-#                        data = await response.json()
-#                        summary = data["choices"][0]["message"]["content"][0]["text"]
-#                        return summary
                     else:
                         raise Exception(f"API request failed with status {response.status}")
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.error(f"API summarization error: {e}")
                 raise  # Re-raise the error to trigger the retry
-               
+
+
 #    async def api_summarize_text(self, text, max_length, min_length):
 #        async with aiohttp.ClientSession() as session:
 #            try:
@@ -920,30 +933,15 @@ class NNeo4JImporter(NBaseImporter):
 
         try:
             function_name, function_scope, function_summary = await self.cpp_processor.summarize_cpp_function(method_info)
-        except Exception as e:
-            logger.error(f"Error in summarize_cpp_method_prep: {e}\nmethod_info contents:\n{pprint.pformat(method_info, indent=4)}")
-#            await self.cpp_processor.update_method(name, {})
-            raise FileProcessingError(f"Error in summarize_cpp_method_prep calling summarize_cpp_function for method {name}: {e}")
-        
-        try:
             embedding = await self.make_embedding(function_summary)
-        except Exception as e:
-            logger.error(f"Error in summarize_cpp_method_prep calling make_embedding: {e}")
-#            details = {
-#                'summary': function_summary,
-#            }
-#            await self.cpp_processor.update_method(name, details)
-#            await self.cpp_processor.update_method(name, {})
-            raise FileProcessingError(f"Error in summarize_cpp_method_prep calling make_embedding: {e}")
             
-        try:
             details = {
                 'summary': function_summary,
-                'embedding': embedding
+                'embedding': embedding,
+                'files': method_info.get('files', [])
             }
             await self.cpp_processor.update_method(name, details)
             await self.update_progress_summarize(1)
-#            logger.info(f"Finished summarizing/embedding cpp method: {name}")
             return True
             
         except Exception as e:
@@ -965,26 +963,12 @@ class NNeo4JImporter(NBaseImporter):
         
         try:
             function_name, function_scope, function_summary = await self.cpp_processor.summarize_cpp_function(function_info)
-        except Exception as e:
-            logger.error(f"Error in summarize_cpp_function_prep calling summarize_cpp_function: {e}")
-#            await self.cpp_processor.update_function(name, {})
-            raise FileProcessingError(f"Error in summarize_cpp_function_prep calling summarize_cpp_function: {e}")
-
-        try:
             embedding = await self.make_embedding(function_summary)
-        except Exception as e:
-            logger.error(f"Error in summarize_cpp_function_prep calling make_embedding: {e}")
-#            details = {
-#                'summary': function_summary,
-#            }
-#            await self.cpp_processor.update_function(name, details)
-#            await self.cpp_processor.update_function(name, {})
-            raise FileProcessingError(f"Error in summarize_cpp_function_prep calling make_embedding: {e}")
-        
-        try:
+            
             details = {
                 'summary': function_summary,
-                'embedding': embedding
+                'embedding': embedding,
+                'files': function_info.get('files', [])
             }
             await self.cpp_processor.update_function(name, details)
             await self.update_progress_summarize(1)
@@ -1008,19 +992,21 @@ class NNeo4JImporter(NBaseImporter):
                       n.interface_summary = class.interface_summary,
                       n.implementation_summary = class.implementation_summary,
                       n.interface_embedding = class.interface_embedding,
-                      n.implementation_embedding = class.implementation_embedding,
-                      n.file_path = class.file_path,
-                      n.raw_code = class.raw_code
+                      n.implementation_embedding = class.implementation_embedding
         ON MATCH SET
             n.interface_summary = class.interface_summary,
             n.implementation_summary = class.implementation_summary,
             n.interface_embedding = class.interface_embedding,
             n.implementation_embedding = class.implementation_embedding
         WITH n, class
-        UNWIND class.file_ids AS file_id
-        MATCH (f:File {id: file_id, project_id: $project_id})
-        MERGE (n)-[:HAS_FILE]->(f)
-        MERGE (f)-[:HAS_CLASS]->(n)
+        UNWIND class.files AS file
+        MATCH (f:File {id: file.file_id, project_id: $project_id})
+        MERGE (n)-[r:APPEARS_IN]->(f)
+        ON CREATE SET r = {file_type: file.file_type,
+                           start_line: file.start_line,
+                           end_line: file.end_line,
+                           raw_code: file.raw_code,
+                           raw_comment: file.raw_comment}
         """
         
         await session.run(query, {'classes': classes, 'project_id': project_id})
@@ -1033,9 +1019,7 @@ class NNeo4JImporter(NBaseImporter):
                       n.short_name = method.short_name,
                       n.scope = method.scope,
                       n.summary = method.summary,
-                      n.embedding = method.embedding,
-                      n.file_path = method.file_path,
-                      n.raw_code = method.raw_code
+                      n.embedding = method.embedding
         ON MATCH SET
             n.summary = method.summary,
             n.embedding = method.embedding
@@ -1045,13 +1029,18 @@ class NNeo4JImporter(NBaseImporter):
         MERGE (c)-[:HAS_METHOD]->(n)
         MERGE (n)-[:BELONGS_TO_TYPE]->(c)
         WITH n, method
-        UNWIND method.file_ids AS file_id
-        MATCH (f:File {id: file_id, project_id: $project_id})
-        MERGE (n)-[:HAS_FILE]->(f)
-        MERGE (f)-[:HAS_METHOD]->(n)
+        UNWIND method.files AS file
+        MATCH (f:File {id: file.file_id, project_id: $project_id})
+        MERGE (n)-[r:APPEARS_IN]->(f)
+        ON CREATE SET r = {file_type: file.file_type,
+                           start_line: file.start_line,
+                           end_line: file.end_line,
+                           raw_code: file.raw_code,
+                           raw_comment: file.raw_comment}
         """
         
         await session.run(query, {'methods': methods, 'project_id': project_id})
+
 
     async def store_cpp_functions_batch(self, functions, project_id, session):
         query = """
@@ -1061,20 +1050,23 @@ class NNeo4JImporter(NBaseImporter):
                       n.short_name = func.short_name,
                       n.scope = func.scope,
                       n.summary = func.summary,
-                      n.embedding = func.embedding,
-                      n.file_path = func.file_path,
-                      n.raw_code = func.raw_code
+                      n.embedding = func.embedding
         ON MATCH SET
             n.summary = func.summary,
             n.embedding = func.embedding
         WITH n, func
-        UNWIND func.file_ids AS file_id
-        MATCH (f:File {id: file_id, project_id: $project_id})
-        MERGE (n)-[:HAS_FILE]->(f)
-        MERGE (f)-[:HAS_FUNCTION]->(n)
+        UNWIND func.files AS file
+        MATCH (f:File {id: file.file_id, project_id: $project_id})
+        MERGE (n)-[r:APPEARS_IN]->(f)
+        ON CREATE SET r = {file_type: file.file_type,
+                           start_line: file.start_line,
+                           end_line: file.end_line,
+                           raw_code: file.raw_code,
+                           raw_comment: file.raw_comment}
         """
         
         await session.run(query, {'functions': functions, 'project_id': project_id})
+
 
     async def store_all_cpp(self, project_id):
         try:

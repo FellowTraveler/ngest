@@ -19,7 +19,15 @@ import clang.cindex
 logging.basicConfig(level=logging.info, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+from enum import Enum
 
+class FileType(Enum):
+    CppCode = 1
+    CppHeader = 2
+    PythonCode = 3
+    RustCode = 4
+    JavascriptCode = 5
+    
 class CppProcessor:
     def __init__(self, do_summarize_text):
         self.failed_nodes = deque()
@@ -45,28 +53,41 @@ class CppProcessor:
             existing_info = self.namespaces.get(full_name, {})
             merged_details = existing_info.copy()
             for key, value in details.items():
-                if key == 'file_ids':
-                    existing_file_ids = set(merged_details.get('file_ids', []))
-                    new_file_ids = set(details['file_ids'])
-                    merged_details['file_ids'] = list(existing_file_ids | new_file_ids)
+                if key == 'files':
+                    existing_files = merged_details.get('files', [])
+                    new_file = value[0]
+                    file_exists = False
+                    for existing_file in existing_files:
+                        if existing_file['file_id'] == new_file['file_id']:
+                            file_exists = True
+                            if new_file['file_type'] == FileType.CppCode or len(new_file['raw_code']) > len(existing_file['raw_code']):
+                                existing_file.update(new_file)
+                            break
+                    if not file_exists:
+                        existing_files.append(new_file)
+                    merged_details['files'] = existing_files
                 elif value or isinstance(value, (int, float)):
                     merged_details[key] = value
             self.namespaces[full_name] = merged_details
-
+        
     async def update_class(self, full_name, details):
         async with self.lock_classes:
             existing_info = self.classes.get(full_name, {})
             merged_details = existing_info.copy()
             for key, value in details.items():
-                if key == 'raw_code':
-                    if (details.get('is_cpp_file', False) or
-                        not merged_details.get('raw_code') or
-                        len(value) > len(merged_details['raw_code'])):
-                        merged_details['raw_code'] = value
-                elif key == 'file_ids':
-                    existing_file_ids = set(merged_details.get('file_ids', []))
-                    new_file_ids = set(details['file_ids'])
-                    merged_details['file_ids'] = list(existing_file_ids | new_file_ids)
+                if key == 'files':
+                    existing_files = merged_details.get('files', [])
+                    new_file = value[0]
+                    file_exists = False
+                    for existing_file in existing_files:
+                        if existing_file['file_id'] == new_file['file_id']:
+                            file_exists = True
+                            if new_file['file_type'] == FileType.CppCode or len(new_file['raw_code']) > len(existing_file['raw_code']):
+                                existing_file.update(new_file)
+                            break
+                    if not file_exists:
+                        existing_files.append(new_file)
+                    merged_details['files'] = existing_files
                 elif value or isinstance(value, (int, float)):
                     merged_details[key] = value
             self.classes[full_name] = merged_details
@@ -76,15 +97,19 @@ class CppProcessor:
             existing_info = self.methods.get(full_name, {})
             merged_details = existing_info.copy()
             for key, value in details.items():
-                if key == 'raw_code':
-                    if (details.get('is_cpp_file', False) or
-                        not merged_details.get('raw_code') or
-                        len(value) > len(merged_details['raw_code'])):
-                        merged_details['raw_code'] = value
-                elif key == 'file_ids':
-                    existing_file_ids = set(merged_details.get('file_ids', []))
-                    new_file_ids = set(details['file_ids'])
-                    merged_details['file_ids'] = list(existing_file_ids | new_file_ids)
+                if key == 'files':
+                    existing_files = merged_details.get('files', [])
+                    new_file = value[0]
+                    file_exists = False
+                    for existing_file in existing_files:
+                        if existing_file['file_id'] == new_file['file_id']:
+                            file_exists = True
+                            if new_file['file_type'] == FileType.CppCode or len(new_file['raw_code']) > len(existing_file['raw_code']):
+                                existing_file.update(new_file)
+                            break
+                    if not file_exists:
+                        existing_files.append(new_file)
+                    merged_details['files'] = existing_files
                 elif value or isinstance(value, (int, float)):
                     merged_details[key] = value
             self.methods[full_name] = merged_details
@@ -94,18 +119,23 @@ class CppProcessor:
             existing_info = self.functions.get(full_name, {})
             merged_details = existing_info.copy()
             for key, value in details.items():
-                if key == 'raw_code':
-                    if (details.get('is_cpp_file', False) or
-                        not merged_details.get('raw_code') or
-                        len(value) > len(merged_details['raw_code'])):
-                        merged_details['raw_code'] = value
-                elif key == 'file_ids':
-                    existing_file_ids = set(merged_details.get('file_ids', []))
-                    new_file_ids = set(details['file_ids'])
-                    merged_details['file_ids'] = list(existing_file_ids | new_file_ids)
+                if key == 'files':
+                    existing_files = merged_details.get('files', [])
+                    new_file = value[0]
+                    file_exists = False
+                    for existing_file in existing_files:
+                        if existing_file['file_id'] == new_file['file_id']:
+                            file_exists = True
+                            if new_file['file_type'] == FileType.CppCode or len(new_file['raw_code']) > len(existing_file['raw_code']):
+                                existing_file.update(new_file)
+                            break
+                    if not file_exists:
+                        existing_files.append(new_file)
+                    merged_details['files'] = existing_files
                 elif value or isinstance(value, (int, float)):
                     merged_details[key] = value
             self.functions[full_name] = merged_details
+
 
     async def parse_cpp_file(self, file_id: str, inputPath: str, inputLocation: str, project_id: str):
         try:
@@ -246,37 +276,64 @@ class CppProcessor:
         logger.info(f"Total summarization tasks prepared: {len(tasks)}")
         return tasks
     
+    
+    
     async def prepare_storage_tasks(self):
         tasks = []
+        
+        async with self.lock_namespaces:
+            for full_name, namespace_info in self.namespaces.items():
+                tasks.append(('Namespace', full_name, copy.deepcopy(namespace_info)))
+
         async with self.lock_classes:
-            logger.info(f"Preparing storage tasks for classes. Total classes: {len(self.classes)}")
             for full_name, class_info in self.classes.items():
                 if 'interface_summary' in class_info or 'implementation_summary' in class_info:
-                    tasks.append(('Class', full_name, copy.deepcopy(class_info)))
-                else:
-                    logger.warning(f"Skipping storage for class {full_name}. "
-                                   f"Missing summaries: interface_summary: {'interface_summary' in class_info}, "
-                                   f"implementation_summary: {'implementation_summary' in class_info}")
+                    files = class_info.get('files', [])
+                    converted_files = [{**f, 'file_type': f['file_type'].name} for f in files]
+                    tasks.append(('Class', full_name, {
+                        'full_name': full_name,
+                        'namespace': class_info.get('namespace', ''),
+                        'short_name': class_info.get('short_name', ''),
+                        'scope': class_info.get('scope', ''),
+                        'interface_summary': class_info.get('interface_summary', ''),
+                        'implementation_summary': class_info.get('implementation_summary', ''),
+                        'interface_embedding': class_info.get('interface_embedding', []),
+                        'implementation_embedding': class_info.get('implementation_embedding', []),
+                        'files': converted_files
+                    }))
 
         async with self.lock_methods:
-            logger.info(f"Preparing storage tasks for methods. Total methods: {len(self.methods)}")
             for full_name, method_info in self.methods.items():
                 if 'summary' in method_info:
-                    tasks.append(('Method', full_name, copy.deepcopy(method_info)))
-                else:
-                    logger.warning(f"Skipping storage for method {full_name} due to missing summary")
+                    files = method_info.get('files', [])
+                    converted_files = [{**f, 'file_type': f['file_type'].name} for f in files]
+                    tasks.append(('Method', full_name, {
+                        'full_name': full_name,
+                        'namespace': method_info.get('namespace', ''),
+                        'short_name': method_info.get('short_name', ''),
+                        'scope': method_info.get('scope', ''),
+                        'summary': method_info.get('summary', ''),
+                        'embedding': method_info.get('embedding', []),
+                        'files': converted_files
+                    }))
 
         async with self.lock_functions:
-            logger.info(f"Preparing storage tasks for functions. Total functions: {len(self.functions)}")
             for full_name, function_info in self.functions.items():
                 if 'summary' in function_info:
-                    tasks.append(('Function', full_name, copy.deepcopy(function_info)))
-                else:
-                    logger.warning(f"Skipping storage for function {full_name} due to missing summary")
+                    files = function_info.get('files', [])
+                    converted_files = [{**f, 'file_type': f['file_type'].name} for f in files]
+                    tasks.append(('Function', full_name, {
+                        'full_name': full_name,
+                        'namespace': function_info.get('namespace', ''),
+                        'short_name': function_info.get('short_name', ''),
+                        'scope': function_info.get('scope', ''),
+                        'summary': function_info.get('summary', ''),
+                        'embedding': function_info.get('embedding', []),
+                        'files': converted_files
+                    }))
 
-        logger.info(f"Total storage tasks prepared: {len(tasks)}")
         return tasks
-        
+    
 #    async def retry_failed_nodes(self, project_path, project_id):
 #        retry_tasks = []
 #        while self.failed_nodes:
@@ -361,7 +418,6 @@ class CppProcessor:
 
 
     async def process_namespace_node(self, file_id: str, node, project_path, project_id, is_cpp_file):
-#        logger.info(f"Processing namespace: {node.spelling}")
         file_name = node.location.file.name if node.location.file else ''
         if project_path not in file_name:
             logger.info(f"project_path not in file_name for namespace node: {node.spelling}, kind: {node.kind}, project_path: {project_path}, file_name: {file_name}")
@@ -375,28 +431,33 @@ class CppProcessor:
             if raw_comment:
                 description += f" with documentation: {raw_comment.strip()}"
 
-            async with self.lock_namespaces:
-                is_new_namespace = True if full_name not in self.namespaces else False
+            raw_code, start_line, end_line = await self.get_raw_code(node)
 
-            if is_new_namespace:
-                details = {
-                    'type': 'Namespace',
-                    'name': full_name,
-                    'scope': full_scope,
-                    'short_name': node.spelling,
-                    'description': description,
-                    'raw_comment': raw_comment,
-                    'file_path': file_name,
-                    'namespace': namespace,
-                    'file_ids': [file_id]
-                }
-                await self.update_namespace(full_name, details)
+            file_info = {
+                'file_id': file_id,
+                'file_path': file_name,
+                'file_type': FileType.CppCode if is_cpp_file else FileType.CppHeader,
+                'start_line': start_line,
+                'end_line': end_line,
+                'raw_code': raw_code,
+                'raw_comment': raw_comment
+            }
 
-            # Process the namespace's children
-            await self.process_child_nodes(file_id=file_id, node=node, project_path=project_path, project_id=project_id, is_cpp_file=is_cpp_file)
-            
-#        logger.info(f"Finished processing namespace: {node.spelling}")
+            details = {
+                'type': 'Namespace',
+                'name': full_name,
+                'scope': full_scope,
+                'short_name': node.spelling,
+                'description': description,
+                'namespace': namespace,
+                'files': [file_info]
+            }
+            await self.update_namespace(full_name, details)
+
+        await self.process_child_nodes(file_id=file_id, node=node, project_path=project_path, project_id=project_id, is_cpp_file=is_cpp_file)
     
+    
+
     async def process_class_node(self, file_id: str, node, project_path, project_id, file_name, full_scope, full_name, namespace, is_cpp_file):
         type_name = "Class" if node.kind == clang.cindex.CursorKind.CLASS_DECL else "Struct" if node.kind == clang.cindex.CursorKind.STRUCT_DECL else "ClassTemplate"
         class_name = node.spelling
@@ -478,7 +539,18 @@ class CppProcessor:
 
 #        async with self.lock_header_files:
 #            header_code = self.header_files.get(file_name, '')
-        raw_code = await self.get_raw_code(node) if is_cpp_file else ''
+        raw_code, start_line, end_line = await self.get_raw_code(node)
+        
+        file_info = {
+            'file_id': file_id,
+            'file_path': file_name,
+            'file_type': FileType.CppCode if is_cpp_file else FileType.CppHeader,
+            'start_line': start_line,
+            'end_line': end_line,
+            'raw_code': raw_code,
+            'raw_comment': node.raw_comment if node.raw_comment else ''
+        }
+
         details = {
             'type': type_name,
             'name': full_name,
@@ -487,15 +559,11 @@ class CppProcessor:
             'description': description,
             'interface_description': interface_description,
             'implementation_description': implementation_description,
-            'raw_comment': raw_comment,
-            'file_path': file_name,
-            'is_cpp_file': is_cpp_file,
-            'raw_code': raw_code,
             'namespace': namespace,
-            'file_ids': [file_id]
+            'files': [file_info]
         }
         await self.update_class(full_name, details)
-                    
+        
         await self.process_child_nodes(file_id, node, project_path, project_id, is_cpp_file)
 #        logger.info(f"Finished processing {type_name}: {full_name} in file {file_name}")
 
@@ -528,8 +596,18 @@ class CppProcessor:
 
         # Cache method information, prioritize CPP file
         if is_cpp_file or is_new_method:
-            raw_code = await self.get_raw_code(node) if is_cpp_file else ''
+            raw_code, start_line, end_line = await self.get_raw_code(node)
             # Cache method information
+            file_info = {
+                'file_id': file_id,
+                'file_path': file_name,
+                'file_type': FileType.CppCode if is_cpp_file else FileType.CppHeader,
+                'start_line': node.extent.start.line,
+                'end_line': node.extent.end.line,
+                'raw_code': raw_code,
+                'raw_comment': raw_comment
+            }
+
             details = {
                 'type': type_name,
                 'name': fully_qualified_method_name,
@@ -537,13 +615,10 @@ class CppProcessor:
                 'short_name': method_name,
                 'return_type': return_type,
                 'description': description,
-                'raw_comment': raw_comment,
-                'file_path': file_name,
-                'is_cpp_file': is_cpp_file,
-                'raw_code': raw_code,
                 'namespace': namespace,
-                'file_ids': [file_id]
+                'files': [file_info]
             }
+
             await self.update_method(fully_qualified_method_name, details)
 #        logger.info(f"Finished processing method: {node.spelling} in file {file_name} full_name: {fully_qualified_method_name}")
 
@@ -575,7 +650,17 @@ class CppProcessor:
 
         # Store function information, prioritize CPP file
         if is_cpp_file or is_new_function:
-            raw_code = await self.get_raw_code(node) if is_cpp_file else ''
+            raw_code, start_line, end_line = await self.get_raw_code(node)
+            file_info = {
+                'file_id': file_id,
+                'file_path': file_name,
+                'file_type': FileType.CppCode if is_cpp_file else FileType.CppHeader,
+                'start_line': node.extent.start.line,
+                'end_line': node.extent.end.line,
+                'raw_code': raw_code,
+                'raw_comment': raw_comment
+            }
+
             details = {
                 'type': type_name,
                 'name': fully_qualified_function_name,
@@ -583,12 +668,8 @@ class CppProcessor:
                 'short_name': function_name,
                 'description': description,
                 'return_type': return_type,
-                'raw_comment': raw_comment,
-                'file_path': file_name,
-                'is_cpp_file': is_cpp_file,
-                'raw_code': raw_code,
                 'namespace': namespace,
-                'file_ids': [file_id]
+                'files': [file_info]
             }
             # Cache function information
             await self.update_function(fully_qualified_function_name, details)
@@ -612,10 +693,13 @@ class CppProcessor:
                 scopes.append(current.spelling)
             current = current.semantic_parent
         return "::".join(reversed(scopes))
-        
+
+
     async def get_raw_code(self, node):
         if node.extent.start.file and node.extent.end.file:
             file_name = node.extent.start.file.name
+            start_line = node.extent.start.line
+            end_line = node.extent.end.line
             start_offset = node.extent.start.offset
             end_offset = node.extent.end.offset
 
@@ -623,27 +707,39 @@ class CppProcessor:
                 async with aiofiles.open(file_name, 'r') as file:
                     await file.seek(start_offset)
                     raw_code = await file.read(end_offset - start_offset)
-                return raw_code
+                return raw_code, start_line, end_line
             except Exception as e:
                 logger.error(f"get_raw_code: Error reading file {file_name}: {e}")
-                return ''
-        return ''
+                return '', start_line, end_line
+        return '', 0, 0
+    
+
 
     async def summarize_cpp_class(self, class_info) -> (str, str, str, str):
         try:
             class_name = class_info.get('name', 'Unknown')
             namespace = class_info.get('namespace', '')
-#            logger.info(f"Summarizing class: {class_info['name']}, interface_description: {class_info.get('interface_description', 'Missing')}, implementation_description: {class_info.get('implementation_description', 'Missing')}")
 
-            class_name, full_scope, interface_summary, interface_description = await self.summarize_cpp_class_public_interface(class_info)
-#            logger.info(f"Completed public interface summarization for {class_name}")
-            
-            implementation_summary, implementation_description = await self.summarize_cpp_class_implementation(class_info)
-#            logger.info(f"Completed implementation summarization for {class_name}")
-            
-#            logger.info(f"Finished summarization for class: {class_name}, interface_summary length: {len(interface_summary)}, implementation_summary length: {len(implementation_summary)}")
-            
-            return class_name, full_scope, interface_summary + "\n\n" + interface_description, implementation_summary + "\n\n" + implementation_description
+            header_file_info = next((f for f in class_info.get('files', []) if f['file_type'] == FileType.CppHeader), None)
+            impl_file_info = next((f for f in class_info.get('files', []) if f['file_type'] == FileType.CppCode), None)
+
+            interface_info = class_info.copy()
+            interface_info['raw_code'] = header_file_info['raw_code'] if header_file_info else ''
+            interface_info['raw_comment'] = header_file_info['raw_comment'] if header_file_info else ''
+
+            implementation_info = class_info.copy()
+            implementation_info['raw_code'] = impl_file_info['raw_code'] if impl_file_info else ''
+            implementation_info['raw_comment'] = impl_file_info['raw_comment'] if impl_file_info else ''
+
+            class_name, full_scope, interface_summary, interface_description = await self.summarize_cpp_class_public_interface(interface_info)
+            implementation_summary, implementation_description = await self.summarize_cpp_class_implementation(implementation_info)
+
+            return (
+                class_name,
+                full_scope,
+                f"{interface_summary}\n\n{interface_description}",
+                f"{implementation_summary}\n\n{implementation_description}"
+            )
         except Exception as e:
             logger.error(f"Error in summarize_cpp_class for {class_name}: {e}")
             logger.error(f"Class info: {class_info}")
@@ -733,14 +829,25 @@ class CppProcessor:
 
         try:
             summary = await self.do_summarize_text(full_prompt, 200, 25)
+        except Exception as e:
+            logger.error(f"Error 1 in summarize_cpp_class_implementation for {class_info.get('name', 'Unknown')}: {e}")
+            raise DatabaseError(f"Error in summarize_cpp_class_implementation: {e}")
+
+        try:
 #            logger.info(f"Implementation summary for {class_info.get('name', 'Unknown')}: {summary[:100]}...")  # Log first 100 chars
             return summary, description + ". " + implementation_description
 
         except Exception as e:
-            logger.error(f"Error in summarize_cpp_class_implementation for {class_info.get('name', 'Unknown')}: {e}")
+            logger.error(f"Error 2 in summarize_cpp_class_implementation for {class_info.get('name', 'Unknown')}: {e}")
+            
+            logger.info(f"raw_code:\n{pprint.pformat(raw_code)}")
+            logger.info(f"Implementation Description:\n{pprint.pformat(implementation_description)}")
+
             raise DatabaseError(f"Error in summarize_cpp_class_implementation: {e}")
 
 
+
+    
     async def summarize_cpp_function(self, node_info) -> (str, str, str):
         """
         Summarize a C++ function.
@@ -751,17 +858,16 @@ class CppProcessor:
         Returns:
             str: The summary of the function or method.
         """
-#        logger.info(f"Starting summarization for function: {node_info.get('name', 'Unknown')}")
-
+        longest_file_info = max(node_info.get('files', []), key=lambda x: len(x['raw_code']))
+        
         type_name = node_info.get('type', 'Function')
         full_name = node_info.get('name', 'anonymous')
         full_scope = node_info.get('scope', '')
         short_name = node_info.get('short_name', '')
-        raw_code = node_info.get('raw_code', '')
-        file_path = node_info.get('file_path', '')
-        raw_comment = node_info.get('raw_comment', '')
+        raw_code = longest_file_info['raw_code']
+        file_path = longest_file_info['file_path']
+        raw_comment = longest_file_info['raw_comment']
         description = node_info.get('description', '')
-        is_cpp_file = node_info.get('is_cpp_file', False)
 
         if type_name is None:
             logger.error(f"Error in summarize_cpp_function - type_name is None")
@@ -804,3 +910,17 @@ class CppProcessor:
         async with self.lock_functions:
             len_functions = len(self.functions)
         return len_classes + len_methods + len_functions + len_namespaces
+
+
+
+
+
+
+
+
+
+
+
+
+
+

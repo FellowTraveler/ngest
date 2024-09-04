@@ -20,7 +20,7 @@ After installing LLVM, you may need to set the `LLVM_CONFIG` environment variabl
 
 ### Neo4J
 
-This project currently uses Neo4J 
+This project uses Neo4J to store the graph and embeddings. 
 
 ## Installation
 
