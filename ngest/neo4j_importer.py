@@ -1002,7 +1002,7 @@ class NNeo4JImporter(NBaseImporter):
         """
         
         await session.run(query, {'namespaces': namespaces, 'project_id': project_id})
-    
+
     async def store_cpp_classes_batch(self, classes, project_id, session):
         query = """
         UNWIND $classes AS class
@@ -1020,35 +1020,34 @@ class NNeo4JImporter(NBaseImporter):
         WITH n, class
         UNWIND class.base_classes AS base
         MATCH (b:Class {name: base.name, project_id: $project_id})
-        CREATE (n)-[r:INHERITS_FROM]->(b)
+        MERGE (n)-[r:INHERITS_FROM]->(b)
         SET r.access_specifier = base.access_specifier
         WITH n, class
-        UNWIND class.files AS file
+        UNWIND [file IN class.files WHERE file.relationship_type = 'DEFINED_IN_FILE'] AS file
         MATCH (f:File {id: file.file_id, project_id: $project_id})
-        FOREACH (ignored IN CASE WHEN file.file_type = 'CppHeader' THEN [1] ELSE [] END |
-            CREATE (n)-[r:DEFINED_IN_FILE]->(f)
-            SET r.start_line = file.start_line,
-                r.end_line = file.end_line,
-                r.raw_code = file.raw_code,
-                r.raw_comment = file.raw_comment
-        )
-        FOREACH (ignored IN CASE WHEN file.file_type = 'CppCode' THEN [1] ELSE [] END |
-            CREATE (n)-[r:IMPLEMENTED_IN_FILE]->(f)
-            SET r.start_line = file.start_line,
-                r.end_line = file.end_line,
-                r.raw_code = file.raw_code,
-                r.raw_comment = file.raw_comment
-        )
-        FOREACH (ignored IN CASE WHEN file.file_type <> 'CppHeader' AND file.file_type <> 'CppCode' THEN [1] ELSE [] END |
-            CREATE (n)-[r:INCLUDED_IN_FILE]->(f)
-            SET r.start_line = file.start_line,
-                r.end_line = file.end_line,
-                r.raw_code = file.raw_code,
-                r.raw_comment = file.raw_comment
-        )
+        MERGE (n)-[r1:DEFINED_IN_FILE]->(f)
+        ON CREATE SET r1.start_line = file.start_line,
+                      r1.end_line = file.end_line,
+                      r1.raw_code = file.raw_code,
+                      r1.raw_comment = file.raw_comment
+        WITH n, class
+        UNWIND [file IN class.files WHERE file.relationship_type = 'DECLARED_IN_FILE'] AS file
+        MATCH (f:File {id: file.file_id, project_id: $project_id})
+        MERGE (n)-[r2:DECLARED_IN_FILE]->(f)
+        ON CREATE SET r2.start_line = file.start_line,
+                      r2.end_line = file.end_line,
+                      r2.raw_code = file.raw_code,
+                      r2.raw_comment = file.raw_comment
+        WITH n, class
+        UNWIND [file IN class.files WHERE file.relationship_type = 'INCLUDED_IN_FILE'] AS file
+        MATCH (f:File {id: file.file_id, project_id: $project_id})
+        MERGE (n)-[r3:INCLUDED_IN_FILE]->(f)
+        ON CREATE SET r3.start_line = file.start_line,
+                      r3.end_line = file.end_line,
+                      r3.raw_code = file.raw_code,
+                      r3.raw_comment = file.raw_comment
         """
         await session.run(query, {'classes': classes, 'project_id': project_id})
-    
 
     async def store_cpp_methods_batch(self, methods, project_id, session):
         query = """
@@ -1064,28 +1063,34 @@ class NNeo4JImporter(NBaseImporter):
             n.embedding = method.embedding
         WITH n, method
         MATCH (c:Class {name: method.scope, project_id: $project_id})
-        CREATE (c)-[:HAS_METHOD]->(n)
-        CREATE (n)-[:DEFINED_IN_CLASS]->(c)
+        MERGE (c)-[:HAS_METHOD]->(n)
+        MERGE (n)-[:DEFINED_IN_CLASS]->(c)
         WITH n, method
-        UNWIND method.files AS file
+        UNWIND [file IN method.files WHERE file.relationship_type = 'DECLARED_IN_FILE'] AS file
         MATCH (f:File {id: file.file_id, project_id: $project_id})
-        FOREACH (ignored IN CASE WHEN file.file_type = 'CppHeader' THEN [1] ELSE [] END |
-            CREATE (n)-[r:DECLARED_IN_FILE]->(f)
-            SET r.start_line = file.start_line,
-                r.end_line = file.end_line,
-                r.raw_code = file.raw_code,
-                r.raw_comment = file.raw_comment
-        )
-        FOREACH (ignored IN CASE WHEN file.file_type = 'CppCode' THEN [1] ELSE [] END |
-            CREATE (n)-[r:IMPLEMENTED_IN_FILE]->(f)
-            SET r.start_line = file.start_line,
-                r.end_line = file.end_line,
-                r.raw_code = file.raw_code,
-                r.raw_comment = file.raw_comment
-        )
+        MERGE (n)-[r1:DECLARED_IN_FILE]->(f)
+        ON CREATE SET r1.start_line = file.start_line,
+                      r1.end_line = file.end_line,
+                      r1.raw_code = file.raw_code,
+                      r1.raw_comment = file.raw_comment
+        WITH n, method
+        UNWIND [file IN method.files WHERE file.relationship_type = 'IMPLEMENTED_IN_FILE'] AS file
+        MATCH (f:File {id: file.file_id, project_id: $project_id})
+        MERGE (n)-[r2:IMPLEMENTED_IN_FILE]->(f)
+        ON CREATE SET r2.start_line = file.start_line,
+                      r2.end_line = file.end_line,
+                      r2.raw_code = file.raw_code,
+                      r2.raw_comment = file.raw_comment
+        WITH n, method
+        UNWIND [file IN method.files WHERE file.relationship_type = 'INCLUDED_IN_FILE'] AS file
+        MATCH (f:File {id: file.file_id, project_id: $project_id})
+        MERGE (n)-[r3:INCLUDED_IN_FILE]->(f)
+        ON CREATE SET r3.start_line = file.start_line,
+                      r3.end_line = file.end_line,
+                      r3.raw_code = file.raw_code,
+                      r3.raw_comment = file.raw_comment
         """
         await session.run(query, {'methods': methods, 'project_id': project_id})
-        
 
     async def store_cpp_functions_batch(self, functions, project_id, session):
         query = """
@@ -1100,30 +1105,33 @@ class NNeo4JImporter(NBaseImporter):
             n.summary = func.summary,
             n.embedding = func.embedding
         WITH n, func
-        UNWIND func.files AS file
+        UNWIND [file IN func.files WHERE file.relationship_type = 'IMPLEMENTED_IN_FILE'] AS file
         MATCH (f:File {id: file.file_id, project_id: $project_id})
-        FOREACH (ignored IN CASE WHEN file.file_type = 'CppHeader' THEN [1] ELSE [] END |
-            MERGE (n)-[r:DECLARED_IN_FILE]->(f)
-            ON CREATE SET r = {
-                start_line: file.start_line,
-                end_line: file.end_line,
-                raw_code: file.raw_code,
-                raw_comment: file.raw_comment
-            }
-        )
-        FOREACH (ignored IN CASE WHEN file.file_type = 'CppCode' THEN [1] ELSE [] END |
-            MERGE (n)-[r:DEFINED_IN_FILE]->(f)
-            ON CREATE SET r = {
-                start_line: file.start_line,
-                end_line: file.end_line,
-                raw_code: file.raw_code,
-                raw_comment: file.raw_comment
-            }
-        )
+        MERGE (n)-[r1:IMPLEMENTED_IN_FILE]->(f)
+        ON CREATE SET r1.start_line = file.start_line,
+                      r1.end_line = file.end_line,
+                      r1.raw_code = file.raw_code,
+                      r1.raw_comment = file.raw_comment
+        WITH n, func
+        UNWIND [file IN func.files WHERE file.relationship_type = 'DECLARED_IN_FILE'] AS file
+        MATCH (f:File {id: file.file_id, project_id: $project_id})
+        MERGE (n)-[r2:DECLARED_IN_FILE]->(f)
+        ON CREATE SET r2.start_line = file.start_line,
+                      r2.end_line = file.end_line,
+                      r2.raw_code = file.raw_code,
+                      r2.raw_comment = file.raw_comment
+        WITH n, func
+        UNWIND [file IN func.files WHERE file.relationship_type = 'INCLUDED_IN_FILE'] AS file
+        MATCH (f:File {id: file.file_id, project_id: $project_id})
+        MERGE (n)-[r3:INCLUDED_IN_FILE]->(f)
+        ON CREATE SET r3.start_line = file.start_line,
+                      r3.end_line = file.end_line,
+                      r3.raw_code = file.raw_code,
+                      r3.raw_comment = file.raw_comment
         """
-        
         await session.run(query, {'functions': functions, 'project_id': project_id})
-
+                      
+                      
     async def store_all_cpp(self, project_id):
         try:
             tasks = await self.cpp_processor.prepare_storage_tasks()

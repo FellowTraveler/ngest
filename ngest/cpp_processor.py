@@ -49,6 +49,8 @@ class CppProcessor:
         self.lock_functions = asyncio.Lock()
 #        self.lock_header_files = asyncio.Lock()
 
+        self.true_declarations = {}
+        
     async def update_namespace(self, full_name, details):
         async with self.lock_namespaces:
             existing_info = self.namespaces.get(full_name, {})
@@ -71,6 +73,7 @@ class CppProcessor:
                     merged_details[key] = value
             self.namespaces[full_name] = merged_details
         
+        
     async def update_class(self, full_name, details):
         async with self.lock_classes:
             existing_info = self.classes.get(full_name, {})
@@ -83,7 +86,7 @@ class CppProcessor:
                     for existing_file in existing_files:
                         if existing_file['file_id'] == new_file['file_id']:
                             file_exists = True
-                            if new_file['file_type'] == FileType.CppCode or len(new_file['raw_code']) > len(existing_file['raw_code']):
+                            if new_file['relationship_type'] in ['DEFINED_IN_FILE', 'IMPLEMENTED_IN_FILE'] or len(new_file['raw_code']) > len(existing_file['raw_code']):
                                 existing_file.update(new_file)
                             break
                     if not file_exists:
@@ -92,6 +95,7 @@ class CppProcessor:
                 elif value or isinstance(value, (int, float)):
                     merged_details[key] = value
             self.classes[full_name] = merged_details
+        
 
     async def update_method(self, full_name, details):
         async with self.lock_methods:
@@ -105,7 +109,7 @@ class CppProcessor:
                     for existing_file in existing_files:
                         if existing_file['file_id'] == new_file['file_id']:
                             file_exists = True
-                            if new_file['file_type'] == FileType.CppCode or len(new_file['raw_code']) > len(existing_file['raw_code']):
+                            if new_file['relationship_type'] in ['IMPLEMENTED_IN_FILE'] or len(new_file['raw_code']) > len(existing_file['raw_code']):
                                 existing_file.update(new_file)
                             break
                     if not file_exists:
@@ -114,7 +118,7 @@ class CppProcessor:
                 elif value or isinstance(value, (int, float)):
                     merged_details[key] = value
             self.methods[full_name] = merged_details
-
+        
     async def update_function(self, full_name, details):
         async with self.lock_functions:
             existing_info = self.functions.get(full_name, {})
@@ -127,7 +131,7 @@ class CppProcessor:
                     for existing_file in existing_files:
                         if existing_file['file_id'] == new_file['file_id']:
                             file_exists = True
-                            if new_file['file_type'] == FileType.CppCode or len(new_file['raw_code']) > len(existing_file['raw_code']):
+                            if new_file['relationship_type'] in ['IMPLEMENTED_IN_FILE'] or len(new_file['raw_code']) > len(existing_file['raw_code']):
                                 existing_file.update(new_file)
                             break
                     if not file_exists:
@@ -136,8 +140,7 @@ class CppProcessor:
                 elif value or isinstance(value, (int, float)):
                     merged_details[key] = value
             self.functions[full_name] = merged_details
-
-
+        
     async def parse_cpp_file(self, file_id: str, inputPath: str, inputLocation: str, project_id: str):
         try:
 #            logger.info(f"Creating Clang Index for parsing C++ file: {inputPath}")
@@ -414,10 +417,9 @@ class CppProcessor:
 #                    logger.info(f"Unhandled node type: {node.kind} for node: {node.spelling}")
 #                    await self.process_child_nodes(node, project_path, project_id, is_cpp_file)
         except Exception as e:
-            logger.error(f"Error processing node {node.spelling}: {e}")
+            logger.error(f"Error processing node {node.spelling} of kind {node.kind}: {e}")
             logger.error(f"Node details: kind={node.kind}, location={node.location}, type={node.type.spelling if node.type else 'None'}")
             self.failed_nodes.append((node, project_path, project_id, is_cpp_file, 0))
-
 
     async def process_namespace_node(self, file_id: str, node, project_path, project_id, is_cpp_file):
         file_name = node.location.file.name if node.location.file else ''
@@ -559,6 +561,15 @@ class CppProcessor:
                     'access_specifier': base.access_specifier.name  # Convert to string
                 })
 
+        original_file = node.location.file.name if node.location.file else file_name
+        
+        if node.is_definition():
+            relationship_type = 'DEFINED_IN_FILE'
+        elif original_file == file_name:
+            relationship_type = 'DECLARED_IN_FILE'
+        else:
+            relationship_type = 'INCLUDED_IN_FILE'
+
         file_info = {
             'file_id': file_id,
             'file_path': file_name,
@@ -566,7 +577,8 @@ class CppProcessor:
             'start_line': start_line,
             'end_line': end_line,
             'raw_code': raw_code,
-            'raw_comment': node.raw_comment if node.raw_comment else ''
+            'raw_comment': node.raw_comment if node.raw_comment else '',
+            'relationship_type': relationship_type
         }
 
         details = {
@@ -590,7 +602,7 @@ class CppProcessor:
         type_name = "Method"
         class_name = full_scope
         method_name = node.spelling
-        fully_qualified_method_name = f"{class_name}::{method_name}" if class_name else method_name
+        fully_qualified_method_name = f"{full_scope}::{method_name}" if full_scope else method_name
 
 #        logger.info(f"Processing {type_name}: {fully_qualified_method_name} in file {file_name}")
 
@@ -610,37 +622,45 @@ class CppProcessor:
 
         description += "."
 
-        async with self.lock_methods:
-            is_new_method = True if fully_qualified_method_name not in self.methods else False
+        decl_id = self.get_declaration_id(node)
+        true_decl_file = self.true_declarations.get(decl_id)
 
-        # Cache method information, prioritize CPP file
-        if is_cpp_file or is_new_method:
-            raw_code, start_line, end_line = await self.get_raw_code(node)
-            # Cache method information
-            file_info = {
-                'file_id': file_id,
-                'file_path': file_name,
-                'file_type': FileType.CppCode if is_cpp_file else FileType.CppHeader,
-                'start_line': node.extent.start.line,
-                'end_line': node.extent.end.line,
-                'raw_code': raw_code,
-                'raw_comment': raw_comment
-            }
+        if node.is_definition():
+            relationship_type = 'IMPLEMENTED_IN_FILE'
+        elif node.location.file and node.location.file.name == file_name:
+            relationship_type = 'DECLARED_IN_FILE'
+        else:
+            relationship_type = 'INCLUDED_IN_FILE'
+            
+        raw_code, start_line, end_line = await self.get_raw_code(node)
+        file_info = {
+            'file_id': file_id,
+            'file_path': file_name,
+            'file_type': FileType.CppCode if is_cpp_file else FileType.CppHeader,
+            'start_line': node.extent.start.line,
+            'end_line': node.extent.end.line,
+            'raw_code': raw_code,
+            'raw_comment': raw_comment,
+            'relationship_type': relationship_type
+        }
 
-            details = {
-                'type': type_name,
-                'name': fully_qualified_method_name,
-                'scope': full_scope,
-                'short_name': method_name,
-                'return_type': return_type,
-                'description': description,
-                'namespace': namespace,
-                'files': [file_info]
-            }
-            await self.update_method(fully_qualified_method_name, details)
+        details = {
+            'type': type_name,
+            'name': fully_qualified_method_name,
+            'scope': full_scope,
+            'short_name': method_name,
+            'return_type': return_type,
+            'description': description,
+            'namespace': namespace,
+            'files': [file_info]
+        }
+        await self.update_method(fully_qualified_method_name, details)
     
 #        logger.info(f"Finished processing method: {node.spelling} in file {file_name} full_name: {fully_qualified_method_name}")
 
+    def get_declaration_id(self, node):
+        return f"{node.kind}:{node.spelling}:{self.get_full_scope(node, include_self=True)}"
+    
     async def process_function_node(self, file_id: str, node, file_name, full_scope, namespace, is_cpp_file):
         type_name = "Function"
         function_name = node.spelling
@@ -667,31 +687,42 @@ class CppProcessor:
         async with self.lock_functions:
             is_new_function = True if fully_qualified_function_name not in self.functions else False
 
-        # Store function information, prioritize CPP file
-        if is_cpp_file or is_new_function:
-            raw_code, start_line, end_line = await self.get_raw_code(node)
-            file_info = {
-                'file_id': file_id,
-                'file_path': file_name,
-                'file_type': FileType.CppCode if is_cpp_file else FileType.CppHeader,
-                'start_line': node.extent.start.line,
-                'end_line': node.extent.end.line,
-                'raw_code': raw_code,
-                'raw_comment': raw_comment
-            }
+        raw_code, start_line, end_line = await self.get_raw_code(node)
 
-            details = {
-                'type': type_name,
-                'name': fully_qualified_function_name,
-                'scope': full_scope,
-                'short_name': function_name,
-                'description': description,
-                'return_type': return_type,
-                'namespace': namespace,
-                'files': [file_info]
-            }
-            # Cache function information
-            await self.update_function(fully_qualified_function_name, details)
+        decl_id = self.get_declaration_id(node)
+        true_decl_file = self.true_declarations.get(decl_id)
+
+        if node.is_definition():
+            relationship_type = 'IMPLEMENTED_IN_FILE'
+        elif node.location.file and node.location.file.name == file_name:
+            relationship_type = 'DECLARED_IN_FILE'
+        else:
+            relationship_type = 'INCLUDED_IN_FILE'
+    
+        file_info = {
+            'file_id': file_id,
+            'file_path': file_name,
+            'file_type': FileType.CppCode if is_cpp_file else FileType.CppHeader,
+            'start_line': node.extent.start.line,
+            'end_line': node.extent.end.line,
+            'raw_code': raw_code,
+            'raw_comment': raw_comment,
+            'relationship_type': relationship_type
+        }
+    
+        details = {
+            'type': type_name,
+            'name': fully_qualified_function_name,
+            'scope': full_scope,
+            'short_name': function_name,
+            'description': description,
+            'return_type': return_type,
+            'namespace': namespace,
+            'files': [file_info]
+        }
+        # Cache function information
+        await self.update_function(fully_qualified_function_name, details)
+
 #        logger.info(f"Finished processing function: {node.spelling} in file {file_name} full_name: {fully_qualified_function_name}")
 
 
