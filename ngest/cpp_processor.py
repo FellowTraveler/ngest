@@ -4,11 +4,10 @@
 import logging
 import traceback
 import asyncio
-from collections import deque
+from collections import deque, defaultdict
 from typing import Dict, Any
 import copy
 import pprint
-from collections import defaultdict
 import aiofiles
 
 import ngest
@@ -49,8 +48,28 @@ class CppProcessor:
         self.lock_functions = asyncio.Lock()
 #        self.lock_header_files = asyncio.Lock()
 
-        self.true_declarations = {}
+        self.original_declarations = defaultdict(list)
+        self.all_declarations = defaultdict(list)
+        self.declaration_types = defaultdict(dict)
+        self.declarations_lock = asyncio.Lock()
         
+    def get_usr(self, node):
+        """
+        Get the USR for a node and return it in normalized form.
+        Always use this method to get USRs, as it handles normalization internally.
+        """
+        if node:
+            usr = clang.cindex.conf.lib.clang_getCursorUSR(node)
+            normalized_usr = self.normalize_usr(usr.decode('utf-8') if isinstance(usr, bytes) else usr)
+            logger.info(f"Generated USR for node {node.spelling}: {normalized_usr}")
+            return normalized_usr
+        return None
+        
+    def normalize_usr(self, usr):
+        if usr is None:
+            return ''
+        return usr.replace('@', '_').replace('#', '_').replace(':', '_').replace('>', '_').replace('<', '_').replace('&', '_').replace('$', '_')
+    
     async def update_namespace(self, full_name, details):
         async with self.lock_namespaces:
             existing_info = self.namespaces.get(full_name, {})
@@ -141,7 +160,7 @@ class CppProcessor:
                     merged_details[key] = value
             self.functions[full_name] = merged_details
         
-    async def parse_cpp_file(self, file_id: str, inputPath: str, inputLocation: str, project_id: str):
+    async def parse_cpp_file(self, file_id: str, inputPath: str, inputLocation: str, localPath: str, project_id: str):
         try:
 #            logger.info(f"Creating Clang Index for parsing C++ file: {inputPath}")
             index = clang.cindex.Index.create()
@@ -168,7 +187,7 @@ class CppProcessor:
 #                logger.info(f"Saved contents of header file: {inputPath}")
 
 #            logger.info(f"Starting to process nodes for {inputPath}")
-            await self.process_nodes(file_id, translation_unit.cursor, inputLocation, project_id, inputPath.endswith('.cpp'))
+            await self.process_nodes(file_id=file_id, node=translation_unit.cursor, inputLocation=inputLocation, project_path=localPath, project_id=project_id, is_cpp_file=inputPath.endswith('.cpp'))
 #            logger.info(f"Finished parsing nodes for {inputPath}")
 
         except clang.cindex.TranslationUnitLoadError as tu_error:
@@ -285,57 +304,84 @@ class CppProcessor:
     async def prepare_storage_tasks(self):
         tasks = []
         
-        async with self.lock_namespaces:
-            for full_name, namespace_info in self.namespaces.items():
-                tasks.append(('Namespace', full_name, copy.deepcopy(namespace_info)))
-
         async with self.lock_classes:
             for full_name, class_info in self.classes.items():
                 if 'interface_summary' in class_info or 'implementation_summary' in class_info:
-                    files = class_info.get('files', [])
-                    converted_files = [{**f, 'file_type': f['file_type'].name} for f in files]
-                    tasks.append(('Class', full_name, {
-                        'full_name': full_name,
-                        'namespace': class_info.get('namespace', ''),
-                        'short_name': class_info.get('short_name', ''),
-                        'scope': class_info.get('scope', ''),
-                        'interface_summary': class_info.get('interface_summary', ''),
-                        'implementation_summary': class_info.get('implementation_summary', ''),
-                        'interface_embedding': class_info.get('interface_embedding', []),
-                        'implementation_embedding': class_info.get('implementation_embedding', []),
-                        'base_classes': class_info.get('base_classes', []),
-                        'files': converted_files
-                    }))
+                    usr = class_info.get('usr', '')
+                    task_type = class_info.get('type', 'Class')
+                    if usr:
+                        logger.info(f"Preparing storage task for {task_type}: {full_name}, USR: {usr}")
+                        files = class_info.get('files', [])
+                        converted_files = [{**f, 'file_type': f['file_type'].name} for f in files]
+#                        for file in files:
+#                            file['file_type'] = file['file_type'].name if isinstance(file['file_type'], FileType) else str(file['file_type'])
+                        tasks.append(('Class', full_name, {
+                            'usr': usr,
+                            'type': task_type,
+                            'full_name': full_name,
+                            'namespace': class_info.get('namespace', ''),
+                            'short_name': class_info.get('short_name', ''),
+                            'scope': class_info.get('scope', ''),
+                            'interface_summary': class_info.get('interface_summary', ''),
+                            'implementation_summary': class_info.get('implementation_summary', ''),
+                            'interface_embedding': class_info.get('interface_embedding', []),
+                            'implementation_embedding': class_info.get('implementation_embedding', []),
+                            'base_classes': [{'usr': base.get('usr', ''), 'name': base.get('name', ''), 'access_specifier': base.get('access_specifier')} for base in class_info.get('base_classes', [])],
+                            'files': converted_files
+                        }))
+                    else:
+                        logger.warning(f"Skipping class {full_name} due to missing USR")
 
         async with self.lock_methods:
             for full_name, method_info in self.methods.items():
                 if 'summary' in method_info:
-                    files = method_info.get('files', [])
-                    converted_files = [{**f, 'file_type': f['file_type'].name} for f in files]
-                    tasks.append(('Method', full_name, {
-                        'full_name': full_name,
-                        'namespace': method_info.get('namespace', ''),
-                        'short_name': method_info.get('short_name', ''),
-                        'scope': method_info.get('scope', ''),
-                        'summary': method_info.get('summary', ''),
-                        'embedding': method_info.get('embedding', []),
-                        'files': converted_files
-                    }))
-                
+                    usr = method_info.get('usr', '')
+                    task_type = method_info.get('type', 'Method')
+                    if usr:
+                        logger.info(f"Preparing storage task for {task_type}: {full_name}, USR: {usr}")
+                        files = method_info.get('files', [])
+                        converted_files = [{**f, 'file_type': f['file_type'].name} for f in files]
+#                        for file in files:
+#                            file['file_type'] = file['file_type'].name if isinstance(file['file_type'], FileType) else str(file['file_type'])
+                        tasks.append(('Method', full_name, {
+                            'usr': usr,
+                            'type': task_type,
+                            'full_name': full_name,
+                            'namespace': method_info.get('namespace', ''),
+                            'short_name': method_info.get('short_name', ''),
+                            'scope': method_info.get('scope', ''),
+                            'summary': method_info.get('summary', ''),
+                            'embedding': method_info.get('embedding', []),
+                            'class_usr': method_info.get('class_usr', ''),
+                            'files': converted_files
+                        }))
+                    else:
+                        logger.warning(f"Skipping method {full_name} due to missing USR")
+
         async with self.lock_functions:
             for full_name, function_info in self.functions.items():
                 if 'summary' in function_info:
-                    files = function_info.get('files', [])
-                    converted_files = [{**f, 'file_type': f['file_type'].name} for f in files]
-                    tasks.append(('Function', full_name, {
-                        'full_name': full_name,
-                        'namespace': function_info.get('namespace', ''),
-                        'short_name': function_info.get('short_name', ''),
-                        'scope': function_info.get('scope', ''),
-                        'summary': function_info.get('summary', ''),
-                        'embedding': function_info.get('embedding', []),
-                        'files': converted_files
-                    }))
+                    usr = function_info.get('usr', '')
+                    task_type = function_info.get('type', 'Function')
+                    if usr:
+                        logger.info(f"Preparing storage task for {task_type}: {full_name}, USR: {usr}")
+                        files = function_info.get('files', [])
+                        converted_files = [{**f, 'file_type': f['file_type'].name} for f in files]
+#                        for file in files:
+#                            file['file_type'] = file['file_type'].name if isinstance(file['file_type'], FileType) else str(file['file_type'])
+                        tasks.append(('Function', full_name, {
+                            'usr': usr,
+                            'type': task_type,
+                            'full_name': full_name,
+                            'namespace': function_info.get('namespace', ''),
+                            'short_name': function_info.get('short_name', ''),
+                            'scope': function_info.get('scope', ''),
+                            'summary': function_info.get('summary', ''),
+                            'embedding': function_info.get('embedding', []),
+                            'files': converted_files
+                        }))
+                    else:
+                        logger.warning(f"Skipping function {full_name} due to missing USR")
 
         return tasks
     
@@ -354,38 +400,41 @@ class CppProcessor:
 #            logger.warning(f"{len(self.failed_nodes)} nodes still failed after retries")
 
 
-    async def retry_single_node(self, node, project_path, project_id, is_cpp_file, retry_count):
+    async def retry_single_node(self, node, inputLocation, project_path, project_id, is_cpp_file, retry_count):
         async with self.retry_semaphore:
             try:
                 logger.info(f"Retrying node {node.spelling} (attempt {retry_count + 1})")
-                await self.process_single_node(node, project_path, project_id, is_cpp_file)
+                await self.process_single_node(node, inputLocation, project_path, project_id, is_cpp_file)
             except Exception as e:
                 logger.error(f"Error retrying node {node.spelling}: {e}")
                 self.failed_nodes.append((node, project_path, project_id, is_cpp_file, retry_count + 1))
                 
                 
-    async def process_nodes(self, file_id: str, node, project_path, project_id, is_cpp_file):
+    async def process_nodes(self, file_id: str, node, inputLocation, project_path, project_id, is_cpp_file):
+    
+#        logger.info(f"process_nodes: project_path: {project_path}")
+        
         try:
             if node.kind == clang.cindex.CursorKind.TRANSLATION_UNIT:
                 # For the translation unit, process all children without checking the file path
                 for child in node.get_children():
-                    await self.process_nodes(file_id, child, project_path, project_id, is_cpp_file)
+                    await self.process_nodes(file_id, child, inputLocation, project_path, project_id, is_cpp_file)
             else:
                 # Process the current node
-                await self.process_single_node(file_id=file_id, node=node, project_path=project_path, project_id=project_id, is_cpp_file=is_cpp_file)
+                await self.process_single_node(file_id=file_id, node=node, inputLocation=inputLocation, project_path=project_path, project_id=project_id, is_cpp_file=is_cpp_file)
 
                 # Process child nodes
                 if node.kind not in (clang.cindex.CursorKind.NAMESPACE, clang.cindex.CursorKind.CLASS_DECL, clang.cindex.CursorKind.STRUCT_DECL, clang.cindex.CursorKind.CLASS_TEMPLATE, clang.cindex.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION):
-                    await self.process_child_nodes(file_id=file_id, node=node, project_path=project_path, project_id=project_id, is_cpp_file=is_cpp_file)
+                    await self.process_child_nodes(file_id=file_id, node=node, inputLocation=inputLocation, project_path=project_path, project_id=project_id, is_cpp_file=is_cpp_file)
         except Exception as e:
             logger.error(f"Error processing node {node.spelling}: {e}")
             self.failed_nodes.append((node, project_path, project_id, is_cpp_file, 0))
 
-    async def process_child_nodes(self, file_id: str, node, project_path, project_id, is_cpp_file):
+    async def process_child_nodes(self, file_id: str, node, inputLocation, project_path, project_id, is_cpp_file):
         for child in node.get_children():
             if child.location.file and project_path in child.location.file.name:
 #                logger.info(f"Processing child node {child.spelling}, kind: {child.kind}")
-                await self.process_nodes(file_id=file_id, node=child, project_path=project_path, project_id=project_id, is_cpp_file=is_cpp_file)
+                await self.process_nodes(file_id=file_id, node=child, inputLocation=inputLocation, project_path=project_path, project_id=project_id, is_cpp_file=is_cpp_file)
 
     async def is_exported(self, node):
         for token in node.get_tokens():
@@ -393,35 +442,164 @@ class CppProcessor:
                 return True
         return False
 
-    async def process_single_node(self, file_id: str, node, project_path, project_id, is_cpp_file):
-#        logger.info(f"Processing node: {node.spelling}, kind: {node.kind}")
+#    def get_node_type(self, usr):
+#        if usr.startswith('c__F_') or usr.endswith('_F_') or '_F_' in usr:  # Functions
+#            return 'Function'
+#        elif usr.startswith('c__M_') or usr.startswith('c__CM_'):  # Methods
+#            return 'Method'
+#        elif usr.startswith('c__S_') or usr.startswith('c__C_'):  # Structs or Classes
+#            return 'Class'
+#        elif usr.startswith('c__N_'):  # Namespaces
+#            return 'Namespace'
+#        elif '_F_' in usr:  # Functions in header files
+#            return 'Function'
+#        elif usr.startswith('c_') and '.h_F_' in usr:  # Functions in specific header files
+#            return 'Function'
+#        else:
+#            # Log unknown USR types for further investigation
+#            logger.warning(f"Unknown USR type: {usr}")
+#            return 'Unknown'
+
+
+    def get_node_type_from_kind(self, kind):
+        if kind in (clang.cindex.CursorKind.NAMESPACE,):
+            return 'Namespace'
+        elif kind in (clang.cindex.CursorKind.CLASS_DECL, clang.cindex.CursorKind.STRUCT_DECL,
+                      clang.cindex.CursorKind.CLASS_TEMPLATE, clang.cindex.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION):
+            return 'Class'
+        elif kind in (clang.cindex.CursorKind.CXX_METHOD, clang.cindex.CursorKind.CONSTRUCTOR, clang.cindex.CursorKind.DESTRUCTOR):
+            return 'Method'
+        elif kind in (clang.cindex.CursorKind.FUNCTION_DECL,):
+            return 'Function'
+        else:
+            return 'Unknown'
+            
+    async def finalize_relationships(self, project_id, session):
+        async with self.declarations_lock:
+            for usr, occurrences in self.all_declarations.items():
+                try:
+                    # Extract the node type (from clang's CursorKind) from the first occurrence
+                    _, node_kind, _, _ = occurrences[0]
+                    node_type = self.get_node_type_from_kind(node_kind)
+
+                    logger.info(f"Attempting to create relationships for USR: {usr}, node_type: {node_type}")
+
+                    # Check if the node exists in the database
+                    check_query = f"""
+                    MATCH (n:{node_type} {{usr: $usr, project_id: $project_id}})
+                    RETURN n
+                    """
+                    result = await session.run(check_query, usr=usr, project_id=project_id)
+                    node_exists = await result.single()
+
+                    if not node_exists:
+                        logger.warning(f"{node_type} node with USR {usr} does not exist. Skipping relationship creation.")
+                        continue
+
+                    # Determine the canonical file (where it's declared)
+                    canonical_file = next(
+                        (file for file, _, _, _ in occurrences if self.declaration_types[usr][file] == 'DECLARED_IN_FILE'),
+                        None
+                    )
+
+                    if not canonical_file:
+                        # If no canonical file is found, fall back to the first occurrence
+                        canonical_file = occurrences[0][0]
+                        self.declaration_types[usr][canonical_file] = 'DECLARED_IN_FILE'
+
+                    for file, _, line, column in occurrences:
+                        # Ensure that only the canonical file is marked as 'DECLARED_IN_FILE'
+                        if file != canonical_file and self.declaration_types[usr][file] == 'DECLARED_IN_FILE':
+                            self.declaration_types[usr][file] = 'INCLUDED_IN_FILE'
+
+                        relationship_type = self.declaration_types[usr][file]
+                        logger.info(f"Creating {relationship_type} relationship for {node_type} {usr} to file {file}")
+
+                        # Create the relationship
+                        await self.create_relationship(session, usr, file, relationship_type, line, column, project_id, node_type)
+
+                except Exception as e:
+                    logger.error(f"Error processing declaration {usr}: {e}")
+
+
+    async def create_relationship(self, session, usr, local_path, relationship_type, line, column, project_id, node_type):
+        query = f"""
+        MATCH (n:{node_type} {{usr: $usr, project_id: $project_id}})
+        MATCH (f:File {{full_path: $file_path, project_id: $project_id}})
+        MERGE (n)-[r:{relationship_type}]->(f)
+        SET r.line = $line, r.column = $column
+        RETURN n, f, r
+        """
+        result = await session.run(query, usr=usr, file_path=local_path, line=line, column=column, project_id=project_id)
+        summary = await result.consume()
+        
+        if summary.counters.relationships_created > 0:
+            logger.info(f"Created {relationship_type} relationship for {node_type} {usr} to File {local_path}")
+        else:
+            logger.warning(f"Failed to create {relationship_type} relationship for {node_type} {usr} to File {local_path}")
+            # Add debug information
+            debug_query = f"""
+            MATCH (n:{node_type} {{usr: $usr, project_id: $project_id}})
+            RETURN n
+            """
+            debug_result = await session.run(debug_query, usr=usr, project_id=project_id)
+            debug_record = await debug_result.single()
+            if debug_record and 'n' in debug_record:
+                debug_node = debug_record['n']
+                if hasattr(debug_node, 'properties'):
+                    logger.info(f"Debug: Found node {node_type} with properties: {debug_node.properties}")
+                else:
+                    logger.info(f"Debug: Found node {node_type}, but it doesn't have properties attribute")
+            else:
+                logger.warning(f"Debug: Node {node_type} with USR {usr} not found")
+
+    
+            
+    async def process_single_node(self, file_id: str, node, inputLocation, project_path, project_id, is_cpp_file):
         try:
-            file_name = node.location.file.name if node.location.file else ''
             if node.location.file and project_path in node.location.file.name:
+                file_name = node.location.file.name if node.location.file else ''
                 full_scope = self.get_full_scope(node)
                 full_name = self.get_full_scope(node, include_self=True)
                 namespace = self.get_namespace(node)
 
+                if node.kind in (clang.cindex.CursorKind.NAMESPACE, clang.cindex.CursorKind.CLASS_DECL,
+                                 clang.cindex.CursorKind.STRUCT_DECL, clang.cindex.CursorKind.CLASS_TEMPLATE,
+                                 clang.cindex.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
+                                 clang.cindex.CursorKind.CXX_METHOD, clang.cindex.CursorKind.CONSTRUCTOR,
+                                 clang.cindex.CursorKind.DESTRUCTOR, clang.cindex.CursorKind.FUNCTION_DECL):
+
+                    usr = self.get_usr(node)
+                    async with self.declarations_lock:
+                        self.all_declarations[usr].append((project_path, node.kind, node.location.line, node.location.column))
+                        
+                        if usr not in self.original_declarations:
+                            self.original_declarations[usr] = project_path
+
+                        if node.is_definition():
+                            self.declaration_types[usr][project_path] = 'IMPLEMENTED_IN_FILE'
+                        elif project_path == self.original_declarations[usr]:
+                            self.declaration_types[usr][project_path] = 'DECLARED_IN_FILE'
+                        else:
+                            self.declaration_types[usr][project_path] = 'INCLUDED_IN_FILE'
+                            
+                # Process specific node types
                 if node.kind == clang.cindex.CursorKind.NAMESPACE:
-#                    logger.info(f"Processing namespace: {node.spelling}")
-                    await self.process_namespace_node(file_id=file_id, node=node, project_path=project_path, project_id=project_id, is_cpp_file=is_cpp_file)
-#                    logger.info(f"Finished processing namespace: {node.spelling}")
+                    await self.process_namespace_node(file_id=file_id, node=node, inputLocation=inputLocation, project_path=project_path, project_id=project_id, is_cpp_file=is_cpp_file)
                 elif node.kind in (clang.cindex.CursorKind.CLASS_DECL, clang.cindex.CursorKind.STRUCT_DECL,
                                   clang.cindex.CursorKind.CLASS_TEMPLATE, clang.cindex.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION):
-                    await self.process_class_node(file_id=file_id, node=node, project_path=project_path, project_id=project_id, file_name=file_name, full_scope=full_scope, full_name=full_name, namespace=namespace, is_cpp_file=is_cpp_file)
+                    await self.process_class_node(file_id=file_id, node=node, inputLocation=inputLocation, project_path=project_path, project_id=project_id, file_name=file_name, full_scope=full_scope, full_name=full_name, namespace=namespace, is_cpp_file=is_cpp_file)
                 elif node.kind in (clang.cindex.CursorKind.CXX_METHOD, clang.cindex.CursorKind.CONSTRUCTOR, clang.cindex.CursorKind.DESTRUCTOR):
-                    await self.process_method_node(file_id, node, file_name, full_scope, namespace, is_cpp_file)
+                    await self.process_method_node(file_id, node, inputLocation, project_path, full_scope, namespace, is_cpp_file)
                 elif node.kind == clang.cindex.CursorKind.FUNCTION_DECL:
-                    await self.process_function_node(file_id, node, file_name, full_scope, namespace, is_cpp_file)
-#                else:
-#                    logger.info(f"Unhandled node type: {node.kind} for node: {node.spelling}")
-#                    await self.process_child_nodes(node, project_path, project_id, is_cpp_file)
+                    await self.process_function_node(file_id, node, inputLocation, project_path, full_scope, namespace, is_cpp_file)
+
         except Exception as e:
             logger.error(f"Error processing node {node.spelling} of kind {node.kind}: {e}")
             logger.error(f"Node details: kind={node.kind}, location={node.location}, type={node.type.spelling if node.type else 'None'}")
-            self.failed_nodes.append((node, project_path, project_id, is_cpp_file, 0))
-
-    async def process_namespace_node(self, file_id: str, node, project_path, project_id, is_cpp_file):
+        
+    
+    async def process_namespace_node(self, file_id: str, node, inputLocation, project_path, project_id, is_cpp_file):
         file_name = node.location.file.name if node.location.file else ''
         if project_path not in file_name:
             logger.info(f"project_path not in file_name for namespace node: {node.spelling}, kind: {node.kind}, project_path: {project_path}, file_name: {file_name}")
@@ -430,7 +608,7 @@ class CppProcessor:
             full_name = self.get_full_scope(node, include_self=True)
             namespace = self.get_namespace(node)
 
-            description = f"Namespace {node.spelling} in scope {full_scope} defined in {file_name}"
+            description = f"Namespace {node.spelling} in scope {full_scope} defined in {project_path}"
             raw_comment = node.raw_comment if node.raw_comment else ''
             if raw_comment:
                 description += f" with documentation: {raw_comment.strip()}"
@@ -439,7 +617,7 @@ class CppProcessor:
 
             file_info = {
                 'file_id': file_id,
-                'file_path': file_name,
+                'file_path': project_path,
                 'file_type': FileType.CppCode if is_cpp_file else FileType.CppHeader,
                 'start_line': start_line,
                 'end_line': end_line,
@@ -458,7 +636,7 @@ class CppProcessor:
             }
             await self.update_namespace(full_name, details)
 
-        await self.process_child_nodes(file_id=file_id, node=node, project_path=project_path, project_id=project_id, is_cpp_file=is_cpp_file)
+        await self.process_child_nodes(file_id=file_id, node=node, inputLocation=inputLocation, project_path=project_path, project_id=project_id, is_cpp_file=is_cpp_file)
     
 
     def get_parent_namespace(self, node):
@@ -468,16 +646,16 @@ class CppProcessor:
         return parent.spelling if parent else None
 
 
-    async def process_class_node(self, file_id: str, node, project_path, project_id, file_name, full_scope, full_name, namespace, is_cpp_file):
+    async def process_class_node(self, file_id: str, node, inputLocation, project_path, project_id, file_name, full_scope, full_name, namespace, is_cpp_file):
         type_name = "Class" if node.kind == clang.cindex.CursorKind.CLASS_DECL else "Struct" if node.kind == clang.cindex.CursorKind.STRUCT_DECL else "ClassTemplate"
         class_name = node.spelling
 
-#        logger.info(f"Processing {type_name}: {full_name} in file {file_name}")
+#        logger.info(f"Processing {type_name}: {full_name} in file {project_path}")
 
         interface_description = ""
         implementation_description = ""
 
-        description = f"{type_name} {class_name} in scope {full_scope} defined in {file_name}"
+        description = f"{type_name} {class_name} in scope {full_scope} defined in {project_path}"
         raw_comment = node.raw_comment if node.raw_comment else ''
         if raw_comment:
             description += f" with documentation: {raw_comment.strip()}"
@@ -556,23 +734,30 @@ class CppProcessor:
         for base in bases:
             base_type = base.get_definition()
             if base_type:
+                base_usr = self.get_usr(base)
                 base_classes.append({
+                    'usr': base_usr,
                     'name': self.get_full_scope(base_type, include_self=True),
                     'access_specifier': base.access_specifier.name  # Convert to string
                 })
 
-        original_file = node.location.file.name if node.location.file else file_name
-        
+        usr = self.get_usr(node)
+        if not usr:
+            logger.warning(f"Skipping class {class_name} due to missing USR")
+            return
+
+        original_file = self.original_declarations.get(usr)
+
         if node.is_definition():
-            relationship_type = 'DEFINED_IN_FILE'
-        elif original_file == file_name:
+            relationship_type = 'IMPLEMENTED_IN_FILE'
+        elif project_path == original_file:
             relationship_type = 'DECLARED_IN_FILE'
         else:
             relationship_type = 'INCLUDED_IN_FILE'
 
         file_info = {
             'file_id': file_id,
-            'file_path': file_name,
+            'file_path': project_path,
             'file_type': FileType.CppCode if is_cpp_file else FileType.CppHeader,
             'start_line': start_line,
             'end_line': end_line,
@@ -591,22 +776,25 @@ class CppProcessor:
             'implementation_description': implementation_description,
             'namespace': namespace,
             'base_classes': base_classes,
-            'files': [file_info]
+            'files': [file_info],
+            'usr': usr
         }
         await self.update_class(full_name, details)
     
-        await self.process_child_nodes(file_id, node, project_path, project_id, is_cpp_file)
-#        logger.info(f"Finished processing {type_name}: {full_name} in file {file_name}")
+        await self.process_child_nodes(file_id, node, inputLocation, project_path, project_id, is_cpp_file)
+#        logger.info(f"Finished processing {type_name}: {full_name} in file {project_path}")
 
-    async def process_method_node(self, file_id: str, node, file_name, full_scope, namespace, is_cpp_file):
+
+
+    async def process_method_node(self, file_id: str, node, inputLocation, project_path, full_scope, namespace, is_cpp_file):
         type_name = "Method"
         class_name = full_scope
         method_name = node.spelling
         fully_qualified_method_name = f"{full_scope}::{method_name}" if full_scope else method_name
 
-#        logger.info(f"Processing {type_name}: {fully_qualified_method_name} in file {file_name}")
+#        logger.info(f"Processing {type_name}: {fully_qualified_method_name} in file {project_path}")
 
-        description = f"Method {method_name} in class {full_scope} defined in {file_name}"
+        description = f"Method {method_name} in class {full_scope} defined in {project_path}"
         raw_comment = node.raw_comment if node.raw_comment else ''
         if raw_comment:
             description += f" with documentation: {raw_comment.strip()}"
@@ -622,20 +810,24 @@ class CppProcessor:
 
         description += "."
 
-        decl_id = self.get_declaration_id(node)
-        true_decl_file = self.true_declarations.get(decl_id)
+        usr = self.get_usr(node)
+        if not usr:
+            logger.warning(f"Skipping method {method_name} due to missing USR")
+            return
+
+        original_file = self.original_declarations.get(usr)
 
         if node.is_definition():
             relationship_type = 'IMPLEMENTED_IN_FILE'
-        elif node.location.file and node.location.file.name == file_name:
+        elif project_path == original_file:
             relationship_type = 'DECLARED_IN_FILE'
         else:
             relationship_type = 'INCLUDED_IN_FILE'
-            
+                
         raw_code, start_line, end_line = await self.get_raw_code(node)
         file_info = {
             'file_id': file_id,
-            'file_path': file_name,
+            'file_path': project_path,
             'file_type': FileType.CppCode if is_cpp_file else FileType.CppHeader,
             'start_line': node.extent.start.line,
             'end_line': node.extent.end.line,
@@ -643,6 +835,10 @@ class CppProcessor:
             'raw_comment': raw_comment,
             'relationship_type': relationship_type
         }
+
+        # Get the class USR
+        class_node = node.semantic_parent
+        class_usr = self.get_usr(class_node) if class_node.kind in [clang.cindex.CursorKind.CLASS_DECL, clang.cindex.CursorKind.STRUCT_DECL] else None
 
         details = {
             'type': type_name,
@@ -652,23 +848,22 @@ class CppProcessor:
             'return_type': return_type,
             'description': description,
             'namespace': namespace,
-            'files': [file_info]
+            'files': [file_info],
+            'usr': usr,
+            'class_usr': class_usr if class_usr is not None else ''
         }
         await self.update_method(fully_qualified_method_name, details)
     
-#        logger.info(f"Finished processing method: {node.spelling} in file {file_name} full_name: {fully_qualified_method_name}")
+#        logger.info(f"Finished processing method: {node.spelling} in file {project_path} full_name: {fully_qualified_method_name}")
 
-    def get_declaration_id(self, node):
-        return f"{node.kind}:{node.spelling}:{self.get_full_scope(node, include_self=True)}"
-    
-    async def process_function_node(self, file_id: str, node, file_name, full_scope, namespace, is_cpp_file):
+    async def process_function_node(self, file_id: str, node, inputLocation, project_path, full_scope, namespace, is_cpp_file):
         type_name = "Function"
         function_name = node.spelling
         fully_qualified_function_name = f"{full_scope}::{function_name}" if full_scope else function_name
 
-#        logger.info(f"Processing {type_name}: {fully_qualified_function_name} in file {file_name}")
+#        logger.info(f"Processing {type_name}: {fully_qualified_function_name} in file {project_path}")
 
-        description = f"Function {function_name} in scope {full_scope} defined in {file_name}"
+        description = f"Function {function_name} in scope {full_scope} defined in {project_path}"
         raw_comment = node.raw_comment if node.raw_comment else ''
         if raw_comment:
             description += f" with documentation: {raw_comment.strip()}"
@@ -689,19 +884,23 @@ class CppProcessor:
 
         raw_code, start_line, end_line = await self.get_raw_code(node)
 
-        decl_id = self.get_declaration_id(node)
-        true_decl_file = self.true_declarations.get(decl_id)
+        usr = self.get_usr(node)
+        if not usr:
+            logger.warning(f"Skipping function {function_name} due to missing USR")
+            return
+
+        original_file = self.original_declarations.get(usr)
 
         if node.is_definition():
             relationship_type = 'IMPLEMENTED_IN_FILE'
-        elif node.location.file and node.location.file.name == file_name:
+        elif project_path == original_file:
             relationship_type = 'DECLARED_IN_FILE'
         else:
             relationship_type = 'INCLUDED_IN_FILE'
-    
+
         file_info = {
             'file_id': file_id,
-            'file_path': file_name,
+            'file_path': project_path,
             'file_type': FileType.CppCode if is_cpp_file else FileType.CppHeader,
             'start_line': node.extent.start.line,
             'end_line': node.extent.end.line,
@@ -718,12 +917,13 @@ class CppProcessor:
             'description': description,
             'return_type': return_type,
             'namespace': namespace,
-            'files': [file_info]
+            'files': [file_info],
+            'usr': usr
         }
         # Cache function information
         await self.update_function(fully_qualified_function_name, details)
 
-#        logger.info(f"Finished processing function: {node.spelling} in file {file_name} full_name: {fully_qualified_function_name}")
+#        logger.info(f"Finished processing function: {node.spelling} in file {project_path} full_name: {fully_qualified_function_name}")
 
 
     def get_full_scope(self, node, include_self=False):

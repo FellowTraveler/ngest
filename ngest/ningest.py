@@ -38,6 +38,7 @@ class NIngest:
         self.started_ingestion = False
         self.start_ingest_semaphore = asyncio.Semaphore(1)
 
+        self.finalize_semaphore = asyncio.Semaphore(1)
         self.summarize_semaphore = asyncio.Semaphore(1)
         self.store_semaphore = asyncio.Semaphore(1)
 
@@ -214,6 +215,10 @@ class NIngest:
                         await self.start_progress_store(self.total_files)
                         await self.importer_.store_all_cpp(self.project_id)
                 
+                    async with self.finalize_semaphore:
+                        async with self.importer_.get_session() as session:
+                            await self.importer_.finalize_relationships(self.project_id, session)
+
             except Exception as e:
                 result = -1
                 logger.error(f"Error during ingestion in start_ingestion: {e}")

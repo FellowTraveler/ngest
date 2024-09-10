@@ -222,7 +222,7 @@ class NNeo4JImporter(NBaseImporter):
                 # These exceptions are handled by the retry decorator
                 raise
             except Exception as e:
-                logger.error(f"Unhandled error in get_session: {e}")
+                logger.error(f"Unhandled error in get_session: {type(e).__name__}: {str(e)}")
                 raise
             finally:
                 await session.close()
@@ -306,6 +306,7 @@ class NNeo4JImporter(NBaseImporter):
             file_id = None
             document_id = None
             localPath = strip_top_level(inputPath, topLevelInputPath)
+            
             file_type = self.ascertain_file_type(inputPath)
 
             async with self.rate_limiter_db:
@@ -324,6 +325,8 @@ class NNeo4JImporter(NBaseImporter):
                         logger.error("Failed to create file in database")
                         return -1
                     file_id = file.id
+
+            logger.info(f"Created File node: filename={inputName}, full_path={localPath}, project_id={project_id}")
 
             parse_method = getattr(self, f"Parse{file_type['type'].capitalize()}", None)
             
@@ -746,7 +749,7 @@ class NNeo4JImporter(NBaseImporter):
 
     async def ParseCpp(self, file_id: str, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str):
         try:
-            await self.cpp_processor.parse_cpp_file(file_id, inputPath, inputLocation, project_id)
+            await self.cpp_processor.parse_cpp_file(file_id, inputPath, inputLocation, localPath, project_id)
         except FileProcessingError as e:
             logger.error(f"Error parsing C++ file {inputPath}: {e}")
             raise
@@ -799,6 +802,12 @@ class NNeo4JImporter(NBaseImporter):
 #            logger.error(f"Error while gathering summarization tasks: {e}")
 #            raise FileProcessingError(f"Error while gathering summarization tasks: {e}")
 
+    async def finalize_relationships(self, project_id, session):
+        logger.info("Starting to finalize relationships")
+        await self.cpp_processor.finalize_relationships(project_id, session)
+        logger.info("Finished finalizing relationships")
+        
+        
     async def summarize_all_cpp(self, project_id):
         try:
 #            await self.cpp_processor.retry_failed_nodes(project_id)
@@ -974,7 +983,6 @@ class NNeo4JImporter(NBaseImporter):
 #            raise FileProcessingError(f"Error in summarize_cpp_function_prep calling update_functions: {e}")
             return False
 
-
     async def store_cpp_namespaces_batch(self, namespaces, project_id, session):
         query = """
         UNWIND $namespaces AS ns
@@ -1001,140 +1009,162 @@ class NNeo4JImporter(NBaseImporter):
         }
         """
         
-        await session.run(query, {'namespaces': namespaces, 'project_id': project_id})
+        result = await session.run(query, {'namespaces': namespaces, 'project_id': project_id})
+        summary = await result.consume()
+        
+        logger.info(f"Processed {len(namespaces)} namespaces. "
+                    f"Created {summary.counters.nodes_created} nodes and "
+                    f"{summary.counters.relationships_created} relationships.")
+                
 
     async def store_cpp_classes_batch(self, classes, project_id, session):
+        logger.info(f"Processing {len(classes)} classes for batch storage")
+        
         query = """
         UNWIND $classes AS class
-        MERGE (n:Class {name: class.full_name, project_id: $project_id})
-        ON CREATE SET n.namespace = class.namespace,
+        MERGE (n:Class {usr: class.usr, project_id: $project_id})
+        ON CREATE SET n.name = class.full_name,
+                      n.namespace = class.namespace,
                       n.short_name = class.short_name,
                       n.scope = class.scope,
                       n.interface_summary = class.interface_summary,
                       n.implementation_summary = class.implementation_summary,
-                      n.embedding = class.embedding
-        ON MATCH SET
-            n.interface_summary = class.interface_summary,
-            n.implementation_summary = class.implementation_summary,
-            n.embedding = class.embedding
+                      n.interface_embedding = class.interface_embedding,
+                      n.implementation_embedding = class.implementation_embedding,
+                      n.is_new = true
+        ON MATCH SET n.name = class.full_name,
+                     n.namespace = class.namespace,
+                     n.short_name = class.short_name,
+                     n.scope = class.scope,
+                     n.interface_summary = class.interface_summary,
+                     n.implementation_summary = class.implementation_summary,
+                     n.interface_embedding = class.interface_embedding,
+                     n.implementation_embedding = class.implementation_embedding,
+                     n.is_new = false
         WITH n, class
         UNWIND class.base_classes AS base
-        MATCH (b:Class {name: base.name, project_id: $project_id})
+        MATCH (b:Class {usr: base.usr, project_id: $project_id})
         MERGE (n)-[r:INHERITS_FROM]->(b)
         SET r.access_specifier = base.access_specifier
-        WITH n, class
-        UNWIND [file IN class.files WHERE file.relationship_type = 'DEFINED_IN_FILE'] AS file
-        MATCH (f:File {id: file.file_id, project_id: $project_id})
-        MERGE (n)-[r1:DEFINED_IN_FILE]->(f)
-        ON CREATE SET r1.start_line = file.start_line,
-                      r1.end_line = file.end_line,
-                      r1.raw_code = file.raw_code,
-                      r1.raw_comment = file.raw_comment
-        WITH n, class
-        UNWIND [file IN class.files WHERE file.relationship_type = 'DECLARED_IN_FILE'] AS file
-        MATCH (f:File {id: file.file_id, project_id: $project_id})
-        MERGE (n)-[r2:DECLARED_IN_FILE]->(f)
-        ON CREATE SET r2.start_line = file.start_line,
-                      r2.end_line = file.end_line,
-                      r2.raw_code = file.raw_code,
-                      r2.raw_comment = file.raw_comment
-        WITH n, class
-        UNWIND [file IN class.files WHERE file.relationship_type = 'INCLUDED_IN_FILE'] AS file
-        MATCH (f:File {id: file.file_id, project_id: $project_id})
-        MERGE (n)-[r3:INCLUDED_IN_FILE]->(f)
-        ON CREATE SET r3.start_line = file.start_line,
-                      r3.end_line = file.end_line,
-                      r3.raw_code = file.raw_code,
-                      r3.raw_comment = file.raw_comment
+        RETURN n.usr AS usr, n.is_new AS is_new
         """
-        await session.run(query, {'classes': classes, 'project_id': project_id})
+        
+        result = await session.run(query, {'classes': classes, 'project_id': project_id})
+        records = await result.fetch(len(classes))
+        
+        new_count = sum(1 for record in records if record['is_new'])
+        existing_count = len(records) - new_count
+        
+        logger.info(f"Processed {len(records)} classes. New: {new_count}, Existing: {existing_count}")
+        
+        summary = await result.consume()
+        relationships_created = summary.counters.relationships_created
+        expected_relationships = sum(len(cls['base_classes']) for cls in classes)
+        
+        if relationships_created != expected_relationships:
+            logger.warning(f"Not all INHERITS_FROM relationships were created. "
+                           f"Created: {relationships_created}, Expected: {expected_relationships}")
+            
+            for cls in classes:
+                for base in cls['base_classes']:
+                    check_query = """
+                    MATCH (n:Class {usr: $class_usr, project_id: $project_id})
+                    MATCH (b:Class {usr: $base_usr, project_id: $project_id})
+                    RETURN n, b
+                    """
+                    check_result = await session.run(check_query, class_usr=cls['usr'], base_usr=base['usr'], project_id=project_id)
+                    check_record = await check_result.single()
+                    if not check_record or not check_record.get('b'):
+                        logger.error(f"Base class with USR {base['usr']} for class {cls['full_name']} does not exist in the database.")
+
+        if len(records) != len(classes):
+            logger.error(f"Not all class nodes were processed. Processed: {len(records)}, Total: {len(classes)}")
+            for cls in classes:
+                if cls['usr'] not in [record['usr'] for record in records]:
+                    logger.error(f"Class node not processed: USR: {cls['usr']}, Name: {cls['full_name']}")
+
 
     async def store_cpp_methods_batch(self, methods, project_id, session):
         query = """
         UNWIND $methods AS method
-        MERGE (n:Method {name: method.full_name, project_id: $project_id})
-        ON CREATE SET n.namespace = method.namespace,
+        MERGE (n:Method {usr: method.usr, project_id: $project_id})
+        ON CREATE SET n.name = method.full_name,
+                      n.namespace = method.namespace,
                       n.short_name = method.short_name,
                       n.scope = method.scope,
                       n.summary = method.summary,
-                      n.embedding = method.embedding
-        ON MATCH SET
-            n.summary = method.summary,
-            n.embedding = method.embedding
+                      n.embedding = method.embedding,
+                      n.is_new = true
+        ON MATCH SET n.summary = method.summary,
+                     n.embedding = method.embedding,
+                     n.is_new = false
         WITH n, method
-        MATCH (c:Class {name: method.scope, project_id: $project_id})
+        MATCH (c:Class {usr: method.class_usr, project_id: $project_id})
         MERGE (c)-[:HAS_METHOD]->(n)
         MERGE (n)-[:DEFINED_IN_CLASS]->(c)
-        WITH n, method
-        UNWIND [file IN method.files WHERE file.relationship_type = 'DECLARED_IN_FILE'] AS file
-        MATCH (f:File {id: file.file_id, project_id: $project_id})
-        MERGE (n)-[r1:DECLARED_IN_FILE]->(f)
-        ON CREATE SET r1.start_line = file.start_line,
-                      r1.end_line = file.end_line,
-                      r1.raw_code = file.raw_code,
-                      r1.raw_comment = file.raw_comment
-        WITH n, method
-        UNWIND [file IN method.files WHERE file.relationship_type = 'IMPLEMENTED_IN_FILE'] AS file
-        MATCH (f:File {id: file.file_id, project_id: $project_id})
-        MERGE (n)-[r2:IMPLEMENTED_IN_FILE]->(f)
-        ON CREATE SET r2.start_line = file.start_line,
-                      r2.end_line = file.end_line,
-                      r2.raw_code = file.raw_code,
-                      r2.raw_comment = file.raw_comment
-        WITH n, method
-        UNWIND [file IN method.files WHERE file.relationship_type = 'INCLUDED_IN_FILE'] AS file
-        MATCH (f:File {id: file.file_id, project_id: $project_id})
-        MERGE (n)-[r3:INCLUDED_IN_FILE]->(f)
-        ON CREATE SET r3.start_line = file.start_line,
-                      r3.end_line = file.end_line,
-                      r3.raw_code = file.raw_code,
-                      r3.raw_comment = file.raw_comment
+        RETURN n.usr AS usr, n.is_new AS is_new
         """
-        await session.run(query, {'methods': methods, 'project_id': project_id})
+        
+        result = await session.run(query, {'methods': methods, 'project_id': project_id})
+        records = await result.fetch(len(methods))
+        
+        new_count = sum(1 for record in records if record['is_new'])
+        existing_count = len(records) - new_count
+        
+        logger.info(f"Processed {len(records)} methods. New: {new_count}, Existing: {existing_count}")
+        
+        summary = await result.consume()
+        relationships_created = summary.counters.relationships_created
+        expected_relationships = len(methods) * 2  # HAS_METHOD and DEFINED_IN_CLASS
+        
+        if relationships_created != expected_relationships:
+            logger.warning(f"Not all method relationships were created. "
+                           f"Created: {relationships_created}, Expected: {expected_relationships}")
+        
+        if len(records) != len(methods):
+            logger.error(f"Not all method nodes were processed. Processed: {len(records)}, Total: {len(methods)}")
+            for method in methods:
+                if method['usr'] not in [record['usr'] for record in records]:
+                    logger.error(f"Method node not processed: USR: {method['usr']}, Name: {method['full_name']}")
+
 
     async def store_cpp_functions_batch(self, functions, project_id, session):
         query = """
         UNWIND $functions AS func
-        MERGE (n:Function {name: func.full_name, project_id: $project_id})
-        ON CREATE SET n.namespace = func.namespace,
+        MERGE (n:Function {usr: func.usr, project_id: $project_id})
+        ON CREATE SET n.name = func.full_name,
+                      n.namespace = func.namespace,
                       n.short_name = func.short_name,
                       n.scope = func.scope,
                       n.summary = func.summary,
-                      n.embedding = func.embedding
-        ON MATCH SET
-            n.summary = func.summary,
-            n.embedding = func.embedding
-        WITH n, func
-        UNWIND [file IN func.files WHERE file.relationship_type = 'IMPLEMENTED_IN_FILE'] AS file
-        MATCH (f:File {id: file.file_id, project_id: $project_id})
-        MERGE (n)-[r1:IMPLEMENTED_IN_FILE]->(f)
-        ON CREATE SET r1.start_line = file.start_line,
-                      r1.end_line = file.end_line,
-                      r1.raw_code = file.raw_code,
-                      r1.raw_comment = file.raw_comment
-        WITH n, func
-        UNWIND [file IN func.files WHERE file.relationship_type = 'DECLARED_IN_FILE'] AS file
-        MATCH (f:File {id: file.file_id, project_id: $project_id})
-        MERGE (n)-[r2:DECLARED_IN_FILE]->(f)
-        ON CREATE SET r2.start_line = file.start_line,
-                      r2.end_line = file.end_line,
-                      r2.raw_code = file.raw_code,
-                      r2.raw_comment = file.raw_comment
-        WITH n, func
-        UNWIND [file IN func.files WHERE file.relationship_type = 'INCLUDED_IN_FILE'] AS file
-        MATCH (f:File {id: file.file_id, project_id: $project_id})
-        MERGE (n)-[r3:INCLUDED_IN_FILE]->(f)
-        ON CREATE SET r3.start_line = file.start_line,
-                      r3.end_line = file.end_line,
-                      r3.raw_code = file.raw_code,
-                      r3.raw_comment = file.raw_comment
+                      n.embedding = func.embedding,
+                      n.is_new = true
+        ON MATCH SET n.summary = func.summary,
+                     n.embedding = func.embedding,
+                     n.is_new = false
+        RETURN n.usr AS usr, n.is_new AS is_new
         """
-        await session.run(query, {'functions': functions, 'project_id': project_id})
-                      
-                      
+        
+        result = await session.run(query, {'functions': functions, 'project_id': project_id})
+        records = await result.fetch(len(functions))
+        
+        new_count = sum(1 for record in records if record['is_new'])
+        existing_count = len(records) - new_count
+        
+        logger.info(f"Processed {len(records)} functions. New: {new_count}, Existing: {existing_count}")
+        
+        if len(records) != len(functions):
+            logger.error(f"Not all function nodes were processed. Processed: {len(records)}, Total: {len(functions)}")
+            for func in functions:
+                if func['usr'] not in [record['usr'] for record in records]:
+                    logger.error(f"Function node not processed: USR: {func['usr']}, Name: {func['full_name']}")
+
+
+    
     async def store_all_cpp(self, project_id):
         try:
             tasks = await self.cpp_processor.prepare_storage_tasks()
+            logger.info(f"Prepared {len(tasks)} storage tasks")
 
             batch_size = 50
             max_concurrent_batches = 3
@@ -1143,11 +1173,14 @@ class NNeo4JImporter(NBaseImporter):
 
             async def process_batch(batch):
                 nonlocal completed_tasks
+                namespaces = []
                 classes = []
                 methods = []
                 functions = []
                 for task_type, name, info in batch:
-                    if task_type == 'Class':
+                    if task_type == 'Namespace':
+                        namespaces.append({'full_name': name, **info})
+                    elif task_type == 'Class':
                         classes.append({'full_name': name, **info})
                     elif task_type == 'Method':
                         methods.append({'full_name': name, **info})
@@ -1156,32 +1189,38 @@ class NNeo4JImporter(NBaseImporter):
                 
                 try:
                     async with self.get_session() as session:
+                        if namespaces:
+                            await self.store_cpp_namespaces_batch(namespaces, project_id, session)
+                            logger.info(f"Stored {len(namespaces)} namespaces")
                         if classes:
                             await self.store_cpp_classes_batch(classes, project_id, session)
+                            logger.info(f"Stored {len(classes)} classes")
                         if methods:
                             await self.store_cpp_methods_batch(methods, project_id, session)
+                            logger.info(f"Stored {len(methods)} methods")
                         if functions:
                             await self.store_cpp_functions_batch(functions, project_id, session)
+                            logger.info(f"Stored {len(functions)} functions")
+                    completed_tasks += len(batch)
+                    await self.update_progress_store(len(batch))
+                    logger.info(f"Completed {completed_tasks}/{total_tasks} storage tasks")
+                    return True
                 except Exception as e:
-                    logger.error(f"Error processing batch: {str(e)}")
-                    raise
-                
-                completed_tasks += len(batch)
-                await self.update_progress_store(len(batch))
-                logger.info(f"Completed {completed_tasks}/{total_tasks} storage tasks")
-
-            # Create more balanced batches
-            batches = [tasks[i:i+batch_size] for i in range(0, len(tasks), batch_size)]
-            
+                    logger.error(f"Error processing batch: {type(e).__name__}: {str(e)}")
+                    logger.error(f"Traceback: {traceback.format_exc()}")
+                    return e
+        
             # Process batches concurrently with a limit
             semaphore = asyncio.Semaphore(max_concurrent_batches)
             async def process_batch_with_semaphore(batch):
                 async with semaphore:
-                    await process_batch(batch)
+                    return await process_batch(batch)
 
-            await asyncio.gather(*[process_batch_with_semaphore(batch) for batch in batches])
-
-            logger.info(f"Completed all storage tasks successfully")
+            batches = [tasks[i:i+batch_size] for i in range(0, len(tasks), batch_size)]
+            results = await asyncio.gather(*[process_batch_with_semaphore(batch) for batch in batches], return_exceptions=True)
+            
+            successful_batches = sum(1 for result in results if result is True)
+            logger.info(f"Completed {successful_batches}/{len(batches)} storage batches successfully")
 
         except Exception as e:
             logger.error(f"Error in store_all_cpp: {e}")
