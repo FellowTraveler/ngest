@@ -48,10 +48,24 @@ class CppProcessor:
         self.lock_functions = asyncio.Lock()
 #        self.lock_header_files = asyncio.Lock()
 
-        self.original_declarations = defaultdict(list)
         self.all_declarations = defaultdict(list)
-        self.declaration_types = defaultdict(dict)
+        self.declaration_types = defaultdict(lambda: defaultdict(str))
         self.declarations_lock = asyncio.Lock()
+        
+        self.class_declarations = {}
+        self.class_implementations = {}
+        self.method_declarations = {}
+        self.method_implementations = {}
+        self.function_declarations = {}
+        self.function_implementations = {}
+
+    def get_relationship_type(self, node, file_path):
+        if node.is_definition():
+            return 'IMPLEMENTED_IN_FILE'
+        elif file_path.endswith(('.hpp', '.h', '.hxx')):
+            return 'DECLARED_IN_FILE'
+        else:
+            return 'INCLUDED_IN_FILE'
         
     def get_usr(self, node):
         """
@@ -115,7 +129,6 @@ class CppProcessor:
                     merged_details[key] = value
             self.classes[full_name] = merged_details
         
-
     async def update_method(self, full_name, details):
         async with self.lock_methods:
             existing_info = self.methods.get(full_name, {})
@@ -128,7 +141,7 @@ class CppProcessor:
                     for existing_file in existing_files:
                         if existing_file['file_id'] == new_file['file_id']:
                             file_exists = True
-                            if new_file['relationship_type'] in ['IMPLEMENTED_IN_FILE'] or len(new_file['raw_code']) > len(existing_file['raw_code']):
+                            if new_file['relationship_type'] == 'IMPLEMENTED_IN_FILE' or len(new_file['raw_code']) > len(existing_file['raw_code']):
                                 existing_file.update(new_file)
                             break
                     if not file_exists:
@@ -137,6 +150,7 @@ class CppProcessor:
                 elif value or isinstance(value, (int, float)):
                     merged_details[key] = value
             self.methods[full_name] = merged_details
+
         
     async def update_function(self, full_name, details):
         async with self.lock_functions:
@@ -331,6 +345,8 @@ class CppProcessor:
                         }))
                     else:
                         logger.warning(f"Skipping class {full_name} due to missing USR")
+                else:
+                    logger.warning(f"Skipping class {full_name} due to missing summary(ies)")
 
         async with self.lock_methods:
             for full_name, method_info in self.methods.items():
@@ -357,6 +373,8 @@ class CppProcessor:
                         }))
                     else:
                         logger.warning(f"Skipping method {full_name} due to missing USR")
+                else:
+                    logger.warning(f"Skipping method {full_name} due to missing summary")
 
         async with self.lock_functions:
             for full_name, function_info in self.functions.items():
@@ -382,6 +400,8 @@ class CppProcessor:
                         }))
                     else:
                         logger.warning(f"Skipping function {full_name} due to missing USR")
+                else:
+                    logger.warning(f"Skipping function {full_name} due to missing summary")
 
         return tasks
     
@@ -473,54 +493,54 @@ class CppProcessor:
             return 'Function'
         else:
             return 'Unknown'
-            
+
     async def finalize_relationships(self, project_id, session):
         async with self.declarations_lock:
-            for usr, occurrences in self.all_declarations.items():
-                try:
-                    # Extract the node type (from clang's CursorKind) from the first occurrence
-                    _, node_kind, _, _ = occurrences[0]
-                    node_type = self.get_node_type_from_kind(node_kind)
+            # Handle classes
+            for usr, declaration_file in self.class_declarations.items():
+                implementation_file = self.class_implementations.get(usr)
+                if implementation_file:
+                    await self.create_relationship(session, usr, declaration_file, 'DECLARED_IN_FILE', self.all_declarations[usr][0][2], self.all_declarations[usr][0][3], project_id, 'Class')
+                    await self.create_relationship(session, usr, implementation_file, 'IMPLEMENTED_IN_FILE', self.all_declarations[usr][0][2], self.all_declarations[usr][0][3], project_id, 'Class')
+                else:
+                    await self.create_relationship(session, usr, declaration_file, 'IMPLEMENTED_IN_FILE', self.all_declarations[usr][0][2], self.all_declarations[usr][0][3], project_id, 'Class')
 
-                    logger.info(f"Attempting to create relationships for USR: {usr}, node_type: {node_type}")
+            # Handle methods
+            for usr, declaration_file in self.method_declarations.items():
+                implementation_file = self.method_implementations.get(usr)
+                if implementation_file:
+                    await self.create_relationship(session, usr, declaration_file, 'DECLARED_IN_FILE', self.all_declarations[usr][0][2], self.all_declarations[usr][0][3], project_id, 'Method')
+                    await self.create_relationship(session, usr, implementation_file, 'IMPLEMENTED_IN_FILE', self.all_declarations[usr][0][2], self.all_declarations[usr][0][3], project_id, 'Method')
+                else:
+                    await self.create_relationship(session, usr, declaration_file, 'IMPLEMENTED_IN_FILE', self.all_declarations[usr][0][2], self.all_declarations[usr][0][3], project_id, 'Method')
 
-                    # Check if the node exists in the database
-                    check_query = f"""
-                    MATCH (n:{node_type} {{usr: $usr, project_id: $project_id}})
-                    RETURN n
-                    """
-                    result = await session.run(check_query, usr=usr, project_id=project_id)
-                    node_exists = await result.single()
+            # Handle functions
+            for usr, declaration_file in self.function_declarations.items():
+                implementation_file = self.function_implementations.get(usr)
+                if implementation_file:
+                    await self.create_relationship(session, usr, declaration_file, 'DECLARED_IN_FILE', self.all_declarations[usr][0][2], self.all_declarations[usr][0][3], project_id, 'Function')
+                    await self.create_relationship(session, usr, implementation_file, 'IMPLEMENTED_IN_FILE', self.all_declarations[usr][0][2], self.all_declarations[usr][0][3], project_id, 'Function')
+                else:
+                    await self.create_relationship(session, usr, declaration_file, 'IMPLEMENTED_IN_FILE', self.all_declarations[usr][0][2], self.all_declarations[usr][0][3], project_id, 'Function')
 
-                    if not node_exists:
-                        logger.warning(f"{node_type} node with USR {usr} does not exist. Skipping relationship creation.")
-                        continue
-
-                    # Determine the canonical file (where it's declared)
-                    canonical_file = next(
-                        (file for file, _, _, _ in occurrences if self.declaration_types[usr][file] == 'DECLARED_IN_FILE'),
-                        None
-                    )
-
-                    if not canonical_file:
-                        # If no canonical file is found, fall back to the first occurrence
-                        canonical_file = occurrences[0][0]
-                        self.declaration_types[usr][canonical_file] = 'DECLARED_IN_FILE'
-
-                    for file, _, line, column in occurrences:
-                        # Ensure that only the canonical file is marked as 'DECLARED_IN_FILE'
-                        if file != canonical_file and self.declaration_types[usr][file] == 'DECLARED_IN_FILE':
-                            self.declaration_types[usr][file] = 'INCLUDED_IN_FILE'
-
-                        relationship_type = self.declaration_types[usr][file]
-                        logger.info(f"Creating {relationship_type} relationship for {node_type} {usr} to file {file}")
-
-                        # Create the relationship
-                        await self.create_relationship(session, usr, file, relationship_type, line, column, project_id, node_type)
-
-                except Exception as e:
-                    logger.error(f"Error processing declaration {usr}: {e}")
-
+            # Handle entities without explicit declarations (fallback)
+            for usr, declarations in self.all_declarations.items():
+                if usr not in self.class_declarations and usr not in self.method_declarations and usr not in self.function_declarations:
+                    node_type = self.get_node_type_from_kind(declarations[0][1])
+                    implementation_file = self.function_implementations.get(usr)
+                    if implementation_file:
+                        for file_path, _, line, column in declarations:
+                            if file_path != implementation_file:
+                                await self.create_relationship(session, usr, file_path, 'DECLARED_IN_FILE', line, column, project_id, node_type)
+                        await self.create_relationship(session, usr, implementation_file, 'IMPLEMENTED_IN_FILE', declarations[0][2], declarations[0][3], project_id, node_type)
+                    else:
+                        # If there's no separate implementation, the first declaration is treated as the implementation
+                        first_declaration = declarations[0]
+                        await self.create_relationship(session, usr, first_declaration[0], 'IMPLEMENTED_IN_FILE', first_declaration[2], first_declaration[3], project_id, node_type)
+                        for file_path, _, line, column in declarations[1:]:
+                            await self.create_relationship(session, usr, file_path, 'DECLARED_IN_FILE', line, column, project_id, node_type)
+                            
+                        
 
     async def create_relationship(self, session, usr, local_path, relationship_type, line, column, project_id, node_type):
         query = f"""
@@ -551,10 +571,10 @@ class CppProcessor:
                 else:
                     logger.info(f"Debug: Found node {node_type}, but it doesn't have properties attribute")
             else:
-                logger.warning(f"Debug: Node {node_type} with USR {usr} not found")
+                logger.warning(f"Debug: {node_type} node  with USR {usr} not found")
 
     
-            
+                
     async def process_single_node(self, file_id: str, node, inputLocation, project_path, project_id, is_cpp_file):
         try:
             if node.location.file and project_path in node.location.file.name:
@@ -572,17 +592,12 @@ class CppProcessor:
                     usr = self.get_usr(node)
                     async with self.declarations_lock:
                         self.all_declarations[usr].append((project_path, node.kind, node.location.line, node.location.column))
+                        relationship_type = self.get_relationship_type(node, project_path)
+                        current_type = self.declaration_types[usr][project_path]
                         
-                        if usr not in self.original_declarations:
-                            self.original_declarations[usr] = project_path
+                        if relationship_type == 'IMPLEMENTED_IN_FILE' or (relationship_type == 'DECLARED_IN_FILE' and current_type != 'IMPLEMENTED_IN_FILE'):
+                            self.declaration_types[usr][project_path] = relationship_type
 
-                        if node.is_definition():
-                            self.declaration_types[usr][project_path] = 'IMPLEMENTED_IN_FILE'
-                        elif project_path == self.original_declarations[usr]:
-                            self.declaration_types[usr][project_path] = 'DECLARED_IN_FILE'
-                        else:
-                            self.declaration_types[usr][project_path] = 'INCLUDED_IN_FILE'
-                            
                 # Process specific node types
                 if node.kind == clang.cindex.CursorKind.NAMESPACE:
                     await self.process_namespace_node(file_id=file_id, node=node, inputLocation=inputLocation, project_path=project_path, project_id=project_id, is_cpp_file=is_cpp_file)
@@ -649,8 +664,6 @@ class CppProcessor:
     async def process_class_node(self, file_id: str, node, inputLocation, project_path, project_id, file_name, full_scope, full_name, namespace, is_cpp_file):
         type_name = "Class" if node.kind == clang.cindex.CursorKind.CLASS_DECL else "Struct" if node.kind == clang.cindex.CursorKind.STRUCT_DECL else "ClassTemplate"
         class_name = node.spelling
-
-#        logger.info(f"Processing {type_name}: {full_name} in file {project_path}")
 
         interface_description = ""
         implementation_description = ""
@@ -725,8 +738,6 @@ class CppProcessor:
         if members:
             implementation_description = "Implementation details: " + ", ".join(members)
 
-#        async with self.lock_header_files:
-#            header_code = self.header_files.get(file_name, '')
         raw_code, start_line, end_line = await self.get_raw_code(node)
                 
         # Update base classes information
@@ -746,14 +757,23 @@ class CppProcessor:
             logger.warning(f"Skipping class {class_name} due to missing USR")
             return
 
-        original_file = self.original_declarations.get(usr)
-
-        if node.is_definition():
-            relationship_type = 'IMPLEMENTED_IN_FILE'
-        elif project_path == original_file:
-            relationship_type = 'DECLARED_IN_FILE'
-        else:
-            relationship_type = 'INCLUDED_IN_FILE'
+        relationship_type = None
+            
+        async with self.declarations_lock:
+            self.all_declarations[usr].append((project_path, node.kind, node.location.line, node.location.column))
+            
+            relationship_type = self.get_relationship_type(node, project_path)
+            current_type = self.declaration_types[usr][project_path]
+            
+            if relationship_type == 'IMPLEMENTED_IN_FILE' or (relationship_type == 'DECLARED_IN_FILE' and current_type != 'IMPLEMENTED_IN_FILE'):
+                self.declaration_types[usr][project_path] = relationship_type
+            
+            if node.is_definition():
+                self.class_implementations[usr] = project_path
+            elif project_path.endswith(('.hpp', '.h', '.hxx')):
+                self.class_declarations[usr] = project_path
+            
+            relationship_type = self.declaration_types[usr][project_path]
 
         file_info = {
             'file_id': file_id,
@@ -780,10 +800,8 @@ class CppProcessor:
             'usr': usr
         }
         await self.update_class(full_name, details)
-    
+        
         await self.process_child_nodes(file_id, node, inputLocation, project_path, project_id, is_cpp_file)
-#        logger.info(f"Finished processing {type_name}: {full_name} in file {project_path}")
-
 
 
     async def process_method_node(self, file_id: str, node, inputLocation, project_path, full_scope, namespace, is_cpp_file):
@@ -791,8 +809,6 @@ class CppProcessor:
         class_name = full_scope
         method_name = node.spelling
         fully_qualified_method_name = f"{full_scope}::{method_name}" if full_scope else method_name
-
-#        logger.info(f"Processing {type_name}: {fully_qualified_method_name} in file {project_path}")
 
         description = f"Method {method_name} in class {full_scope} defined in {project_path}"
         raw_comment = node.raw_comment if node.raw_comment else ''
@@ -815,15 +831,24 @@ class CppProcessor:
             logger.warning(f"Skipping method {method_name} due to missing USR")
             return
 
-        original_file = self.original_declarations.get(usr)
-
-        if node.is_definition():
-            relationship_type = 'IMPLEMENTED_IN_FILE'
-        elif project_path == original_file:
-            relationship_type = 'DECLARED_IN_FILE'
-        else:
-            relationship_type = 'INCLUDED_IN_FILE'
+        relationship_type = None
+        
+        async with self.declarations_lock:
+            self.all_declarations[usr].append((project_path, node.kind, node.location.line, node.location.column))
+            
+            relationship_type = self.get_relationship_type(node, project_path)
+            current_type = self.declaration_types[usr][project_path]
+            
+            if relationship_type == 'IMPLEMENTED_IN_FILE' or (relationship_type == 'DECLARED_IN_FILE' and current_type != 'IMPLEMENTED_IN_FILE'):
+                self.declaration_types[usr][project_path] = relationship_type
+            
+            if node.is_definition():
+                self.method_implementations[usr] = project_path
+            elif project_path.endswith(('.hpp', '.h', '.hxx')):
+                self.method_declarations[usr] = project_path
                 
+            relationship_type = self.declaration_types[usr][project_path]
+
         raw_code, start_line, end_line = await self.get_raw_code(node)
         file_info = {
             'file_id': file_id,
@@ -854,14 +879,12 @@ class CppProcessor:
         }
         await self.update_method(fully_qualified_method_name, details)
     
-#        logger.info(f"Finished processing method: {node.spelling} in file {project_path} full_name: {fully_qualified_method_name}")
-
+    
+        
     async def process_function_node(self, file_id: str, node, inputLocation, project_path, full_scope, namespace, is_cpp_file):
         type_name = "Function"
         function_name = node.spelling
         fully_qualified_function_name = f"{full_scope}::{function_name}" if full_scope else function_name
-
-#        logger.info(f"Processing {type_name}: {fully_qualified_function_name} in file {project_path}")
 
         description = f"Function {function_name} in scope {full_scope} defined in {project_path}"
         raw_comment = node.raw_comment if node.raw_comment else ''
@@ -889,14 +912,23 @@ class CppProcessor:
             logger.warning(f"Skipping function {function_name} due to missing USR")
             return
 
-        original_file = self.original_declarations.get(usr)
-
-        if node.is_definition():
-            relationship_type = 'IMPLEMENTED_IN_FILE'
-        elif project_path == original_file:
-            relationship_type = 'DECLARED_IN_FILE'
-        else:
-            relationship_type = 'INCLUDED_IN_FILE'
+        relationship_type = None
+        
+        async with self.declarations_lock:
+            self.all_declarations[usr].append((project_path, node.kind, node.location.line, node.location.column))
+            
+            relationship_type = self.get_relationship_type(node, project_path)
+            current_type = self.declaration_types[usr][project_path]
+            
+            if relationship_type == 'IMPLEMENTED_IN_FILE' or (relationship_type == 'DECLARED_IN_FILE' and current_type != 'IMPLEMENTED_IN_FILE'):
+                self.declaration_types[usr][project_path] = relationship_type
+            
+            if node.is_definition():
+                self.function_implementations[usr] = project_path
+            elif project_path.endswith(('.hpp', '.h', '.hxx')):
+                self.function_declarations[usr] = project_path
+                
+            relationship_type = self.declaration_types[usr][project_path]
 
         file_info = {
             'file_id': file_id,
@@ -908,7 +940,7 @@ class CppProcessor:
             'raw_comment': raw_comment,
             'relationship_type': relationship_type
         }
-    
+
         details = {
             'type': type_name,
             'name': fully_qualified_function_name,
@@ -922,9 +954,9 @@ class CppProcessor:
         }
         # Cache function information
         await self.update_function(fully_qualified_function_name, details)
-
-#        logger.info(f"Finished processing function: {node.spelling} in file {project_path} full_name: {fully_qualified_function_name}")
-
+        
+        
+    
 
     def get_full_scope(self, node, include_self=False):
         scopes = []
