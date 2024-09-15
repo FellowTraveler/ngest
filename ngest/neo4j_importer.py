@@ -1,6 +1,7 @@
 # Copyright 2024 Chris Odom
 # MIT License
 
+from neo4j import AsyncSession
 import aiohttp
 import traceback
 import os
@@ -757,15 +758,8 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Unexpected error parsing C++ file {inputPath}: {e}")
             raise FileProcessingError(f"Unexpected error parsing C++ file {inputPath}: {e}")
             
-    def get_raw_code(self, node):
-        # Extract raw code from the source node
-        if node.extent.start.file and node.extent.end.file:
-            with open(node.extent.start.file.name, 'r') as file:
-                file.seek(node.extent.start.offset)
-                raw_code = file.read(node.extent.end.offset - node.extent.start.offset)
-            return raw_code
-        return ''
-
+            
+            
     async def update_progress_scan(self, increment=1):
         if self.progress_callback_scan:
             await self.progress_callback_scan(increment)
@@ -778,29 +772,6 @@ class NNeo4JImporter(NBaseImporter):
         if self.progress_callback_store:
             await self.progress_callback_store(increment)
         
-#    async def summarize_all_cpp(self, project_id):
-#        try:
-#            tasks = await self.cpp_processor.prepare_summarization_tasks()
-#            logger.info(f"Prepared {len(tasks)} summarization tasks")
-#
-#            for task_type, name, info in tasks:
-#                logger.info(f"Starting summarization for {task_type} {name}")
-#                try:
-#                    if task_type == 'Class':
-#                        await self.summarize_cpp_class_prep(name, info)
-#                    elif task_type == 'Method':
-#                        await self.summarize_cpp_method_prep(name, info)
-#                    elif task_type == 'Function':
-#                        await self.summarize_cpp_function_prep(name, info)
-#                    logger.info(f"Completed summarization for {task_type} {name}")
-#                except Exception as e:
-#                    logger.error(f"Error in summarization task for {task_type} {name}: {e}")
-#
-#            logger.info("Completed all summarization tasks")
-#
-#        except Exception as e:
-#            logger.error(f"Error while gathering summarization tasks: {e}")
-#            raise FileProcessingError(f"Error while gathering summarization tasks: {e}")
 
     async def finalize_relationships(self, project_id, session):
         logger.info("Starting to finalize relationships")
@@ -826,7 +797,7 @@ class NNeo4JImporter(NBaseImporter):
                     result = False
                     try:
 #                        logger.info(f"Starting summarization for {task_type} {name}")
-                        if task_type == 'Class':
+                        if task_type in ['Class', 'Struct']:
                             result = await self.summarize_cpp_class_prep(name, details)
                         elif task_type == 'Method':
                             result = await self.summarize_cpp_method_prep(name, details)
@@ -847,7 +818,7 @@ class NNeo4JImporter(NBaseImporter):
 
             await asyncio.gather(*[process_task(task) for task in tasks])
 
-            if completed_tasks != total_tasks:
+            if completed_tasks < total_tasks:
                 logger.warning(f"Only {completed_tasks} out of {total_tasks} summarization tasks completed successfully")
             else:
                 logger.info("Completed all summarization tasks successfully")
@@ -856,41 +827,6 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Error while gathering summarization tasks: {e}")
             logger.error(f"Error details: {traceback.format_exc()}")
             raise FileProcessingError(f"Error while gathering summarization tasks: {e}")
-
-#    async def summarize_all_cpp(self, project_id):
-#        try:
-#            tasks = await self.cpp_processor.prepare_summarization_tasks()
-#
-#            summarization_tasks = []
-#            for task_type, name, info in tasks:
-#                if task_type == 'Class':
-#                    summarization_tasks.append(self.summarize_cpp_class_prep(name, info))
-#                elif task_type == 'Method':
-#                    summarization_tasks.append(self.summarize_cpp_method_prep(name, info))
-#                elif task_type == 'Function':
-#                    summarization_tasks.append(self.summarize_cpp_function_prep(name, info))
-#
-#            total_tasks = len(summarization_tasks)
-#            completed_tasks = 0
-#
-#            # Use asyncio.as_completed to process tasks as they finish
-#            for future in asyncio.as_completed(summarization_tasks):
-#                try:
-#                    await future
-#                    completed_tasks += 1
-#                    logger.info(f"Completed {completed_tasks}/{total_tasks} summarization tasks")
-#                except Exception as e:
-#                    logger.error(f"Error in summarization task: {e}")
-#
-#            if completed_tasks != total_tasks:
-#                logger.warning(f"Only {completed_tasks} out of {total_tasks} summarization tasks completed")
-#
-#            # Ensure all tasks are completed
-##            await asyncio.gather(*summarization_tasks)
-#
-#        except Exception as e:
-#            logger.error(f"Error while gathering summarization and embedding tasks: {e}")
-#            raise FileProcessingError(f"Error while gathering summarization and embedding tasks: {e}")
 
 
     async def summarize_cpp_class_prep(self, name, class_info):
@@ -916,7 +852,7 @@ class NNeo4JImporter(NBaseImporter):
             return True
 
         except Exception as e:
-            logger.error(f"Error in summarize_cpp_class_prep for class {name}: {e}")
+            logger.error(f"Error in summarize_cpp_class_prep for type {name}: {e}")
             # Try to salvage partial information
 #            partial_details = {k: v for k, v in class_info.items() if k in ['interface_description', 'implementation_description']}
 #            await self.cpp_processor.update_class(name, partial_details)
@@ -983,11 +919,14 @@ class NNeo4JImporter(NBaseImporter):
 #            raise FileProcessingError(f"Error in summarize_cpp_function_prep calling update_functions: {e}")
             return False
 
+
+
     async def store_cpp_namespaces_batch(self, namespaces, project_id, session):
         query = """
         UNWIND $namespaces AS ns
-        MERGE (n:Namespace {name: ns.name, project_id: $project_id})
-        ON CREATE SET n.scope = ns.scope,
+        MERGE (n:Namespace {usr: ns.usr, project_id: $project_id})
+        ON CREATE SET n.name = ns.name,
+                      n.scope = ns.scope,
                       n.short_name = ns.short_name,
                       n.description = ns.description
         WITH n, ns
@@ -1016,72 +955,89 @@ class NNeo4JImporter(NBaseImporter):
                     f"Created {summary.counters.nodes_created} nodes and "
                     f"{summary.counters.relationships_created} relationships.")
                 
+                    
 
     async def store_cpp_classes_batch(self, classes, project_id, session):
         logger.info(f"Processing {len(classes)} classes for batch storage")
         
-        query = """
-        UNWIND $classes AS class
-        MERGE (n:Class {usr: class.usr, project_id: $project_id})
-        ON CREATE SET n.name = class.full_name,
-                      n.namespace = class.namespace,
-                      n.short_name = class.short_name,
-                      n.scope = class.scope,
-                      n.interface_summary = class.interface_summary,
-                      n.implementation_summary = class.implementation_summary,
-                      n.interface_embedding = class.interface_embedding,
-                      n.implementation_embedding = class.implementation_embedding,
-                      n.is_new = true
-        ON MATCH SET n.name = class.full_name,
-                     n.namespace = class.namespace,
-                     n.short_name = class.short_name,
-                     n.scope = class.scope,
-                     n.interface_summary = class.interface_summary,
-                     n.implementation_summary = class.implementation_summary,
-                     n.interface_embedding = class.interface_embedding,
-                     n.implementation_embedding = class.implementation_embedding,
-                     n.is_new = false
-        WITH n, class
-        UNWIND class.base_classes AS base
-        MATCH (b:Class {usr: base.usr, project_id: $project_id})
-        MERGE (n)-[r:INHERITS_FROM]->(b)
-        SET r.access_specifier = base.access_specifier
-        RETURN n.usr AS usr, n.is_new AS is_new
-        """
+        # Group classes by type
+        classes_by_type = defaultdict(list)
+        for cls in classes:
+            classes_by_type[cls['type']].append(cls)
         
-        result = await session.run(query, {'classes': classes, 'project_id': project_id})
-        records = await result.fetch(len(classes))
-        
-        new_count = sum(1 for record in records if record['is_new'])
-        existing_count = len(records) - new_count
-        
-        logger.info(f"Processed {len(records)} classes. New: {new_count}, Existing: {existing_count}")
-        
-        summary = await result.consume()
-        relationships_created = summary.counters.relationships_created
-        expected_relationships = sum(len(cls['base_classes']) for cls in classes)
-        
-        if relationships_created != expected_relationships:
-            logger.warning(f"Not all INHERITS_FROM relationships were created. "
-                           f"Created: {relationships_created}, Expected: {expected_relationships}")
+        for class_type, type_classes in classes_by_type.items():
+            # Create or match nodes
+            node_creation_query = """
+            UNWIND $classes AS cls
+            CALL apoc.create.node([cls.type], {
+                usr: cls.usr,
+                project_id: $project_id,
+                name: cls.full_name,
+                namespace: cls.namespace,
+                short_name: cls.short_name,
+                scope: cls.scope,
+                interface_summary: cls.interface_summary,
+                implementation_summary: cls.implementation_summary,
+                interface_embedding: cls.interface_embedding,
+                implementation_embedding: cls.implementation_embedding,
+                is_new: true
+            }) YIELD node AS n
+            RETURN n.usr AS usr, n.is_new AS is_new
+            """
             
-            for cls in classes:
-                for base in cls['base_classes']:
-                    check_query = """
-                    MATCH (n:Class {usr: $class_usr, project_id: $project_id})
-                    MATCH (b:Class {usr: $base_usr, project_id: $project_id})
-                    RETURN n, b
-                    """
-                    check_result = await session.run(check_query, class_usr=cls['usr'], base_usr=base['usr'], project_id=project_id)
-                    check_record = await check_result.single()
-                    if not check_record or not check_record.get('b'):
-                        logger.error(f"Base class with USR {base['usr']} for class {cls['full_name']} does not exist in the database.")
+            result = await session.run(node_creation_query,
+                                       {'classes': type_classes, 'project_id': project_id})
+            nodes = await result.fetch(len(type_classes))
+            
+            # Now handle relationships
+            relationship_query = """
+            UNWIND $relationships AS rel
+            MATCH (n {usr: rel.class_usr, project_id: $project_id})
+            MATCH (b {usr: rel.base_usr, project_id: $project_id})
+            MERGE (n)-[r:INHERITS_FROM]->(b)
+            SET r.access_specifier = rel.access_specifier
+            RETURN count(r) as relationships_created
+            """
+            
+            relationships = [
+                {'class_usr': cls['usr'], 'base_usr': base['usr'], 'access_specifier': base.get('access_specifier')}
+                for cls in type_classes for base in cls.get('base_classes', [])
+            ]
+            
+            if relationships:
+                rel_result = await session.run(relationship_query, {'relationships': relationships, 'project_id': project_id})
+                rel_count = await rel_result.single()
+                relationships_created = rel_count['relationships_created']
 
-        if len(records) != len(classes):
-            logger.error(f"Not all class nodes were processed. Processed: {len(records)}, Total: {len(classes)}")
-            for cls in classes:
-                if cls['usr'] not in [record['usr'] for record in records]:
-                    logger.error(f"Class node not processed: USR: {cls['usr']}, Name: {cls['full_name']}")
+            # Process results for this batch
+            new_count = sum(1 for record in nodes if record['is_new'])
+            existing_count = len(nodes) - new_count
+            
+            logger.info(f"Processed {len(nodes)} {class_type} classes. New: {new_count}, Existing: {existing_count}")
+                    
+            if relationships:
+                expected_relationships = len(relationships)
+                if relationships_created != expected_relationships:
+                    logger.warning(f"Not all INHERITS_FROM relationships were created for {class_type}. "
+                                   f"Created: {relationships_created}, Expected: {expected_relationships}")
+                    
+                    for cls in type_classes:
+                        for base in cls.get('base_classes', []):
+                            check_query = """
+                            MATCH (n {usr: $class_usr, project_id: $project_id})
+                            MATCH (b {usr: $base_usr, project_id: $project_id})
+                            RETURN n, b
+                            """
+                            check_result = await session.run(check_query, class_usr=cls['usr'], base_usr=base['usr'], project_id=project_id)
+                            check_record = await check_result.single()
+                            if not check_record or not check_record.get('b'):
+                                logger.error(f"Base class with USR {base['usr']} for class {cls['full_name']} does not exist in the database.")
+
+            if len(nodes) != len(type_classes):
+                logger.error(f"Not all {class_type} nodes were processed. Processed: {len(nodes)}, Total: {len(type_classes)}")
+                for cls in type_classes:
+                    if cls['usr'] not in [record['usr'] for record in nodes]:
+                        logger.error(f"{class_type} node not processed: USR: {cls['usr']}, Name: {cls['full_name']}")
 
 
     async def store_cpp_methods_batch(self, methods, project_id, session):
@@ -1099,7 +1055,7 @@ class NNeo4JImporter(NBaseImporter):
                      n.embedding = method.embedding,
                      n.is_new = false
         WITH n, method
-        MATCH (c:Class {usr: method.class_usr, project_id: $project_id})
+        MATCH (c:Class|Struct {usr: method.class_usr, project_id: $project_id})
         MERGE (c)-[:HAS_METHOD]->(n)
         MERGE (n)-[:DEFINED_IN_CLASS]->(c)
         RETURN n.usr AS usr, n.is_new AS is_new
@@ -1160,81 +1116,94 @@ class NNeo4JImporter(NBaseImporter):
                     logger.error(f"Function node not processed: USR: {func['usr']}, Name: {func['full_name']}")
 
 
-    
+
+
     async def store_all_cpp(self, project_id):
         try:
             tasks = await self.cpp_processor.prepare_storage_tasks()
             logger.info(f"Prepared {len(tasks)} storage tasks")
 
-            batch_size = 50
-            max_concurrent_batches = 3
-            total_tasks = len(tasks)
-            completed_tasks = 0
+            # Define the order of processing
+            process_order = ['Namespace', 'Function', 'Class', 'Struct', 'Method']
 
-            async def process_batch(batch):
-                nonlocal completed_tasks
-                namespaces = []
-                classes = []
-                methods = []
-                functions = []
-                for task_type, name, info in batch:
-                    if task_type == 'Namespace':
-                        namespaces.append({'full_name': name, **info})
-                    elif task_type == 'Class':
-                        classes.append({'full_name': name, **info})
-                    elif task_type == 'Method':
-                        methods.append({'full_name': name, **info})
-                    elif task_type == 'Function':
-                        functions.append({'full_name': name, **info})
-                
-                try:
-                    async with self.get_session() as session:
-                        if namespaces:
-                            await self.store_cpp_namespaces_batch(namespaces, project_id, session)
-                            logger.info(f"Stored {len(namespaces)} namespaces")
-                        if classes:
-                            await self.store_cpp_classes_batch(classes, project_id, session)
-                            logger.info(f"Stored {len(classes)} classes")
-                        if methods:
-                            await self.store_cpp_methods_batch(methods, project_id, session)
-                            logger.info(f"Stored {len(methods)} methods")
-                        if functions:
-                            await self.store_cpp_functions_batch(functions, project_id, session)
-                            logger.info(f"Stored {len(functions)} functions")
-                    completed_tasks += len(batch)
-                    await self.update_progress_store(len(batch))
-                    logger.info(f"Completed {completed_tasks}/{total_tasks} storage tasks")
-                    return True
-                except Exception as e:
-                    logger.error(f"Error processing batch: {type(e).__name__}: {str(e)}")
-                    logger.error(f"Traceback: {traceback.format_exc()}")
-                    return e
-        
-            # Process batches concurrently with a limit
-            semaphore = asyncio.Semaphore(max_concurrent_batches)
-            async def process_batch_with_semaphore(batch):
-                async with semaphore:
-                    return await process_batch(batch)
+            for task_type in process_order:
+                type_tasks = [(task_type, name, info) for t, name, info in tasks if t == task_type or (t in ['Class', 'Struct'] and task_type in ['Class', 'Struct'])]
+                if not type_tasks:
+                    continue  # Skip if no tasks for this type
 
-            batches = [tasks[i:i+batch_size] for i in range(0, len(tasks), batch_size)]
-            results = await asyncio.gather(*[process_batch_with_semaphore(batch) for batch in batches], return_exceptions=True)
-            
-            successful_batches = sum(1 for result in results if result is True)
-            logger.info(f"Completed {successful_batches}/{len(batches)} storage batches successfully")
+                await self.process_specific_type(type_tasks, project_id, [task_type])
+
+            logger.info(f"All storage tasks completed successfully")
 
         except Exception as e:
             logger.error(f"Error in store_all_cpp: {e}")
             logger.error(f"Error details: {traceback.format_exc()}")
             raise FileProcessingError(f"Error in store_all_cpp: {e}")
+
+    async def process_specific_type(self, tasks, project_id, types):
+        batch_size = 50
+        max_concurrent_batches = 3
+        total_tasks = len(tasks)
+        completed_tasks = 0
+
+        async def process_batch(batch):
+            nonlocal completed_tasks
+            # Filter batch to only include specified types
+            batch = [(t, n, i) for t, n, i in batch if t in types]
+            
+            if not batch:
+                return True  # Skip if batch is empty for this type
+            
+            try:
+                async with self.get_session() as session:
+                    if 'Namespace' in types:
+                        namespaces = [{'full_name': n, **i} for t, n, i in batch if t == 'Namespace']
+                        if namespaces:
+                            await self.store_cpp_namespaces_batch(namespaces, project_id, session)
+                    if 'Function' in types:
+                        functions = [{'full_name': n, **i} for t, n, i in batch if t == 'Function']
+                        if functions:
+                            await self.store_cpp_functions_batch(functions, project_id, session)
+                    if 'Class' in types or 'Struct' in types:
+                        classes = [{'full_name': n, **i} for t, n, i in batch if t in ['Class', 'Struct']]
+                        if classes:
+                            await self.store_cpp_classes_batch(classes, project_id, session)
+                    if 'Method' in types:
+                        methods = [{'full_name': n, **i} for t, n, i in batch if t == 'Method']
+                        if methods:
+                            await self.store_cpp_methods_batch(methods, project_id, session)
+                    
+                completed_tasks += len(batch)
+                await self.update_progress_store(len(batch))
+                logger.info(f"Completed {completed_tasks}/{total_tasks} storage tasks for {types}")
+                return True
+            except Exception as e:
+                logger.error(f"Error processing batch for {types}: {e}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                return e
+
+        # Process batches for this type
+        batches = [tasks[i:i+batch_size] for i in range(0, len(tasks), batch_size)]
+        semaphore = asyncio.Semaphore(max_concurrent_batches)
+        async def process_batch_with_semaphore(batch):
+            async with semaphore:
+                return await process_batch(batch)
+
+        results = await asyncio.gather(*[process_batch_with_semaphore(batch) for batch in batches], return_exceptions=True)
         
-        
+        successful_batches = sum(1 for result in results if result is True)
+        logger.info(f"Completed {successful_batches}/{len(batches)} storage batches successfully for {types}")
+
+
+
+
     async def store_cpp_class(self, full_name, info, project_id):
 #        logger.info(f"Storing summary for class: {full_name}")
         try:
             type_name = info.get('type', 'Class')
             
             query = """
-                MERGE (n:{type} {{name: $full_name, project_id: $project_id}})
+                MERGE (n:{type_name} {{name: $full_name, project_id: $project_id}})
                 ON CREATE SET n.namespace = $namespace,
                               n.short_name = $short_name,
                               n.scope = $scope,
@@ -1263,7 +1232,7 @@ class NNeo4JImporter(NBaseImporter):
                 'interface_embedding': info.get('interface_embedding', []),
                 'implementation_embedding': info.get('implementation_embedding', []),
                 'file_path': info.get('file_path', ''),
-                'raw_code': info.get('raw_code', '')
+                'raw_code': info.get('raw_code', 'Code unavailable')
             }
             
             async with self.rate_limiter_db:
@@ -1305,7 +1274,7 @@ class NNeo4JImporter(NBaseImporter):
                 'summary': info.get('summary', ''),
                 'embedding': info.get('embedding', []),
                 'file_path': info.get('file_path', ''),
-                'raw_code': info.get('raw_code', '')
+                'raw_code': info.get('raw_code', 'Code unavailable')
             }
             
             async with self.rate_limiter_db:
@@ -1361,7 +1330,7 @@ class NNeo4JImporter(NBaseImporter):
                 'summary': info.get('summary', ''),
                 'embedding': info.get('embedding', []),
                 'file_path': info.get('file_path', ''),
-                'raw_code': info.get('raw_code', '')
+                'raw_code': info.get('raw_code', 'Code unavailable')
             }
             
             async with self.rate_limiter_db:
@@ -1381,6 +1350,8 @@ class NNeo4JImporter(NBaseImporter):
             scopes.append(current.spelling)
             current = current.semantic_parent
         return "::".join(reversed(scopes))
+
+
 
     async def ParsePython(self, file_id: str, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
         """
@@ -1444,6 +1415,8 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Error ingesting Python file {inputPath}: {e}")
             raise FileProcessingError(f"Error ingesting Python file {inputPath}: {e}")
 
+
+
     async def summarize_python_class(self, cls) -> str:
         """
         Summarize a Python class.
@@ -1459,6 +1432,8 @@ class NNeo4JImporter(NBaseImporter):
         description += ", ".join(methods)
         return await self.do_summarize_text(description)
 
+
+
     async def summarize_python_function(self, func) -> str:
         """
         Summarize a Python function.
@@ -1471,6 +1446,8 @@ class NNeo4JImporter(NBaseImporter):
         """
         description = f"Function {func.name} with arguments: {', '.join(arg.arg for arg in func.args.args)}. It performs the following tasks: "
         return await self.do_summarize_text(description)
+
+
 
     async def ParseRust(self, file_id: str, inputPath: str, inputLocation: str, inputName: str, localPath: str, currentOutputPath: str, project_id: str) -> None:
         """

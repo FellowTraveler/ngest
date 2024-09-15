@@ -61,12 +61,18 @@ class CppProcessor:
 
     def get_relationship_type(self, node, file_path):
         if node.is_definition():
-            return 'IMPLEMENTED_IN_FILE'
+            if node.kind in (clang.cindex.CursorKind.CLASS_DECL,
+                             clang.cindex.CursorKind.STRUCT_DECL,
+                             clang.cindex.CursorKind.CLASS_TEMPLATE,
+                             clang.cindex.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION):
+                return 'DEFINED_IN_FILE'
+            else:
+                return 'IMPLEMENTED_IN_FILE'
         elif file_path.endswith(('.hpp', '.h', '.hxx')):
             return 'DECLARED_IN_FILE'
         else:
             return 'INCLUDED_IN_FILE'
-        
+            
     def get_usr(self, node):
         """
         Get the USR for a node and return it in normalized form.
@@ -109,71 +115,80 @@ class CppProcessor:
         
     async def update_class(self, full_name, details):
         async with self.lock_classes:
-            existing_info = self.classes.get(full_name, {})
-            merged_details = existing_info.copy()
-            for key, value in details.items():
-                if key == 'files':
-                    existing_files = merged_details.get('files', [])
-                    new_file = value[0]
-                    file_exists = False
-                    for existing_file in existing_files:
-                        if existing_file['file_id'] == new_file['file_id']:
-                            file_exists = True
-                            if new_file['relationship_type'] in ['DEFINED_IN_FILE', 'IMPLEMENTED_IN_FILE'] or len(new_file['raw_code']) > len(existing_file['raw_code']):
-                                existing_file.update(new_file)
-                            break
-                    if not file_exists:
-                        existing_files.append(new_file)
-                    merged_details['files'] = existing_files
-                elif value or isinstance(value, (int, float)):
-                    merged_details[key] = value
-            self.classes[full_name] = merged_details
-        
+            try:
+                existing_info = self.classes.get(full_name, {})
+                merged_details = existing_info.copy()
+                for key, value in details.items():
+                    if key == 'files':
+                        existing_files = merged_details.get('files', [])
+                        new_file = value[0]
+                        file_exists = False
+                        for existing_file in existing_files:
+                            if existing_file['file_id'] == new_file['file_id']:
+                                file_exists = True
+                                if new_file['relationship_type'] == 'DEFINED_IN_FILE' or len(new_file['raw_code']) > len(existing_file['raw_code']):
+                                    existing_file.update(new_file)
+                                break
+                        if not file_exists:
+                            existing_files.append(new_file)
+                        merged_details['files'] = existing_files
+                    elif value or isinstance(value, (int, float)):
+                        merged_details[key] = value
+                self.classes[full_name] = merged_details
+            except Exception as e:
+                logger.error(f"Exception thrown in update_class: {e}")
+                
     async def update_method(self, full_name, details):
         async with self.lock_methods:
-            existing_info = self.methods.get(full_name, {})
-            merged_details = existing_info.copy()
-            for key, value in details.items():
-                if key == 'files':
-                    existing_files = merged_details.get('files', [])
-                    new_file = value[0]
-                    file_exists = False
-                    for existing_file in existing_files:
-                        if existing_file['file_id'] == new_file['file_id']:
-                            file_exists = True
-                            if new_file['relationship_type'] == 'IMPLEMENTED_IN_FILE' or len(new_file['raw_code']) > len(existing_file['raw_code']):
-                                existing_file.update(new_file)
-                            break
-                    if not file_exists:
-                        existing_files.append(new_file)
-                    merged_details['files'] = existing_files
-                elif value or isinstance(value, (int, float)):
-                    merged_details[key] = value
-            self.methods[full_name] = merged_details
+            try:
+                existing_info = self.methods.get(full_name, {})
+                merged_details = existing_info.copy()
+                for key, value in details.items():
+                    if key == 'files':
+                        existing_files = merged_details.get('files', [])
+                        new_file = value[0]
+                        file_exists = False
+                        for existing_file in existing_files:
+                            if existing_file['file_id'] == new_file['file_id']:
+                                file_exists = True
+                                if new_file['relationship_type'] == 'IMPLEMENTED_IN_FILE' or len(new_file['raw_code']) > len(existing_file['raw_code']):
+                                    existing_file.update(new_file)
+                                break
+                        if not file_exists:
+                            existing_files.append(new_file)
+                        merged_details['files'] = existing_files
+                    elif value or isinstance(value, (int, float)):
+                        merged_details[key] = value
+                self.methods[full_name] = merged_details
+            except Exception as e:
+                logger.error(f"Exception thrown in update_method: {e}")
 
         
     async def update_function(self, full_name, details):
         async with self.lock_functions:
-            existing_info = self.functions.get(full_name, {})
-            merged_details = existing_info.copy()
-            for key, value in details.items():
-                if key == 'files':
-                    existing_files = merged_details.get('files', [])
-                    new_file = value[0]
-                    file_exists = False
-                    for existing_file in existing_files:
-                        if existing_file['file_id'] == new_file['file_id']:
-                            file_exists = True
-                            if new_file['relationship_type'] in ['IMPLEMENTED_IN_FILE'] or len(new_file['raw_code']) > len(existing_file['raw_code']):
-                                existing_file.update(new_file)
-                            break
-                    if not file_exists:
-                        existing_files.append(new_file)
-                    merged_details['files'] = existing_files
-                elif value or isinstance(value, (int, float)):
-                    merged_details[key] = value
-            self.functions[full_name] = merged_details
-        
+            try:
+                existing_info = self.functions.get(full_name, {})
+                merged_details = existing_info.copy()
+                for key, value in details.items():
+                    if key == 'files':
+                        existing_files = merged_details.get('files', [])
+                        new_file = value[0]
+                        file_exists = False
+                        for existing_file in existing_files:
+                            if existing_file['file_id'] == new_file['file_id']:
+                                file_exists = True
+                                if new_file['relationship_type'] in ['IMPLEMENTED_IN_FILE'] or len(new_file['raw_code']) > len(existing_file['raw_code']):
+                                    existing_file.update(new_file)
+                                break
+                        if not file_exists:
+                            existing_files.append(new_file)
+                        merged_details['files'] = existing_files
+                    elif value or isinstance(value, (int, float)):
+                        merged_details[key] = value
+                self.functions[full_name] = merged_details
+            except Exception as e:
+                logger.error(f"Exception thrown in update_function: {e}")
+
     async def parse_cpp_file(self, file_id: str, inputPath: str, inputLocation: str, localPath: str, project_id: str):
         try:
 #            logger.info(f"Creating Clang Index for parsing C++ file: {inputPath}")
@@ -233,6 +248,8 @@ class CppProcessor:
                 namespace = class_info.get('namespace', '')
 #                logger.info(f"Checking class: {full_name}, namespace: {namespace}")
                 
+                type = class_info.get('type', 'Class')
+                
                 # Create a simplified version of class_info for logging
 #                simplified_info = {
 #                    'type': class_info.get('type'),
@@ -253,7 +270,7 @@ class CppProcessor:
 #                logger.info(f"Simplified class info: {simplified_info}")
                 
                 if 'interface_description' in class_info or 'implementation_description' in class_info:
-                    tasks.append(('Class', full_name, copy.deepcopy(class_info)))
+                    tasks.append((type, full_name, copy.deepcopy(class_info)))
 #                    logger.info(f"Added summarization task for class: {full_name}")
                 else:
                     logger.warning(f"Skipping summarization for class {full_name} in namespace {namespace}. "
@@ -329,7 +346,7 @@ class CppProcessor:
                         converted_files = [{**f, 'file_type': f['file_type'].name} for f in files]
 #                        for file in files:
 #                            file['file_type'] = file['file_type'].name if isinstance(file['file_type'], FileType) else str(file['file_type'])
-                        tasks.append(('Class', full_name, {
+                        tasks.append((task_type, full_name, {
                             'usr': usr,
                             'type': task_type,
                             'full_name': full_name,
@@ -484,7 +501,9 @@ class CppProcessor:
     def get_node_type_from_kind(self, kind):
         if kind in (clang.cindex.CursorKind.NAMESPACE,):
             return 'Namespace'
-        elif kind in (clang.cindex.CursorKind.CLASS_DECL, clang.cindex.CursorKind.STRUCT_DECL,
+        elif kind == clang.cindex.CursorKind.STRUCT_DECL:
+            return 'Struct'
+        elif kind in (clang.cindex.CursorKind.CLASS_DECL,
                       clang.cindex.CursorKind.CLASS_TEMPLATE, clang.cindex.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION):
             return 'Class'
         elif kind in (clang.cindex.CursorKind.CXX_METHOD, clang.cindex.CursorKind.CONSTRUCTOR, clang.cindex.CursorKind.DESTRUCTOR):
@@ -496,52 +515,40 @@ class CppProcessor:
 
     async def finalize_relationships(self, project_id, session):
         async with self.declarations_lock:
-            # Handle classes
-            for usr, declaration_file in self.class_declarations.items():
-                implementation_file = self.class_implementations.get(usr)
-                if implementation_file:
-                    await self.create_relationship(session, usr, declaration_file, 'DECLARED_IN_FILE', self.all_declarations[usr][0][2], self.all_declarations[usr][0][3], project_id, 'Class')
-                    await self.create_relationship(session, usr, implementation_file, 'IMPLEMENTED_IN_FILE', self.all_declarations[usr][0][2], self.all_declarations[usr][0][3], project_id, 'Class')
-                else:
-                    await self.create_relationship(session, usr, declaration_file, 'IMPLEMENTED_IN_FILE', self.all_declarations[usr][0][2], self.all_declarations[usr][0][3], project_id, 'Class')
-
-            # Handle methods
-            for usr, declaration_file in self.method_declarations.items():
-                implementation_file = self.method_implementations.get(usr)
-                if implementation_file:
-                    await self.create_relationship(session, usr, declaration_file, 'DECLARED_IN_FILE', self.all_declarations[usr][0][2], self.all_declarations[usr][0][3], project_id, 'Method')
-                    await self.create_relationship(session, usr, implementation_file, 'IMPLEMENTED_IN_FILE', self.all_declarations[usr][0][2], self.all_declarations[usr][0][3], project_id, 'Method')
-                else:
-                    await self.create_relationship(session, usr, declaration_file, 'IMPLEMENTED_IN_FILE', self.all_declarations[usr][0][2], self.all_declarations[usr][0][3], project_id, 'Method')
-
-            # Handle functions
-            for usr, declaration_file in self.function_declarations.items():
-                implementation_file = self.function_implementations.get(usr)
-                if implementation_file:
-                    await self.create_relationship(session, usr, declaration_file, 'DECLARED_IN_FILE', self.all_declarations[usr][0][2], self.all_declarations[usr][0][3], project_id, 'Function')
-                    await self.create_relationship(session, usr, implementation_file, 'IMPLEMENTED_IN_FILE', self.all_declarations[usr][0][2], self.all_declarations[usr][0][3], project_id, 'Function')
-                else:
-                    await self.create_relationship(session, usr, declaration_file, 'IMPLEMENTED_IN_FILE', self.all_declarations[usr][0][2], self.all_declarations[usr][0][3], project_id, 'Function')
-
-            # Handle entities without explicit declarations (fallback)
             for usr, declarations in self.all_declarations.items():
-                if usr not in self.class_declarations and usr not in self.method_declarations and usr not in self.function_declarations:
-                    node_type = self.get_node_type_from_kind(declarations[0][1])
-                    implementation_file = self.function_implementations.get(usr)
-                    if implementation_file:
-                        for file_path, _, line, column in declarations:
-                            if file_path != implementation_file:
-                                await self.create_relationship(session, usr, file_path, 'DECLARED_IN_FILE', line, column, project_id, node_type)
-                        await self.create_relationship(session, usr, implementation_file, 'IMPLEMENTED_IN_FILE', declarations[0][2], declarations[0][3], project_id, node_type)
-                    else:
-                        # If there's no separate implementation, the first declaration is treated as the implementation
-                        first_declaration = declarations[0]
-                        await self.create_relationship(session, usr, first_declaration[0], 'IMPLEMENTED_IN_FILE', first_declaration[2], first_declaration[3], project_id, node_type)
-                        for file_path, _, line, column in declarations[1:]:
-                            await self.create_relationship(session, usr, file_path, 'DECLARED_IN_FILE', line, column, project_id, node_type)
-                            
+                node_type = self.get_node_type_from_kind(declarations[0][1])
+                
+                if node_type in ['Class', 'Struct']:
+                    # Find the declaration that is a definition (if any)
+                    definition = next((decl for decl in declarations if self.declaration_types[usr][decl[0]] == 'DEFINED_IN_FILE'), None)
+                    
+                    if definition:
+                        file_full_path = definition[0]
                         
+                        # If we found a definition, create a DEFINED_IN_FILE relationship
+                        await self.create_relationship(session, usr, file_full_path, 'DEFINED_IN_FILE', definition[2], definition[3], project_id, node_type)
+                        await self.create_reverse_relationship(session, file_full_path, usr, 'DEFINES_TYPE', definition[2], definition[3], project_id, 'File', node_type)
+            
+                elif node_type in ['Method', 'Function']:
+                    declaration_file = next((decl[0] for decl in declarations if self.declaration_types[usr][decl[0]] == 'DECLARED_IN_FILE'), None)
+                    implementation_file = next((decl[0] for decl in declarations if self.declaration_types[usr][decl[0]] == 'IMPLEMENTED_IN_FILE'), None)
+                    
+                    if declaration_file and implementation_file:
+                        await self.create_relationship(session, usr, declaration_file, 'DECLARED_IN_FILE', declarations[0][2], declarations[0][3], project_id, node_type)
+                        await self.create_relationship(session, usr, implementation_file, 'IMPLEMENTED_IN_FILE', declarations[0][2], declarations[0][3], project_id, node_type)
+                    elif implementation_file:
+                        await self.create_relationship(session, usr, implementation_file, 'IMPLEMENTED_IN_FILE', declarations[0][2], declarations[0][3], project_id, node_type)
+                    elif declaration_file:
+                        await self.create_relationship(session, usr, declaration_file, 'DECLARED_IN_FILE', declarations[0][2], declarations[0][3], project_id, node_type)
+                
+                else:
+                    logger.warning(f"Unknown node type {node_type} for USR {usr}")
 
+            for usr in self.all_declarations:
+                if usr not in self.class_declarations and usr not in self.method_declarations and usr not in self.function_declarations:
+                    logger.warning(f"USR {usr} not found in class, method, or function declarations")
+                    
+                
     async def create_relationship(self, session, usr, local_path, relationship_type, line, column, project_id, node_type):
         query = f"""
         MATCH (n:{node_type} {{usr: $usr, project_id: $project_id}})
@@ -573,8 +580,40 @@ class CppProcessor:
             else:
                 logger.warning(f"Debug: {node_type} node  with USR {usr} not found")
 
-    
+
+    async def create_reverse_relationship(self, session, file_path, usr, relationship_type, line, column, project_id, from_node_type, to_node_type):
+        query = f"""
+        MATCH (f:{from_node_type} {{full_path: $file_path, project_id: $project_id}})
+        MATCH (n:{to_node_type} {{usr: $usr, project_id: $project_id}})
+        MERGE (f)-[r:{relationship_type}]->(n)
+        SET r.line = $line, r.column = $column
+        RETURN f, n, r
+        """
+        result = await session.run(query, file_path=file_path, usr=usr, line=line, column=column, project_id=project_id)
+        summary = await result.consume()
+        
+        if summary.counters.relationships_created > 0:
+            logger.info(f"Created {relationship_type} relationship from File {file_path} to {to_node_type} {usr}")
+        else:
+            logger.warning(f"Failed to create {relationship_type} relationship from File {file_path} to {to_node_type} {usr}")
+            # Add debug information
+            debug_query = f"""
+            MATCH (f:{from_node_type} {{full_path: $file_path, project_id: $project_id}})
+            RETURN f
+            """
+            debug_result = await session.run(debug_query, file_path=file_path, project_id=project_id)
+            debug_record = await debug_result.single()
+            if debug_record and 'f' in debug_record:
+                debug_node = debug_record['f']
+                if hasattr(debug_node, 'properties'):
+                    logger.info(f"Debug: Found node {from_node_type} with properties: {debug_node.properties}")
+                else:
+                    logger.info(f"Debug: Found node {from_node_type}, but it doesn't have properties attribute")
+            else:
+                logger.warning(f"Debug: {from_node_type} node with full_path {file_path} not found")
                 
+                
+                        
     async def process_single_node(self, file_id: str, node, inputLocation, project_path, project_id, is_cpp_file):
         try:
             if node.location.file and project_path in node.location.file.name:
@@ -593,26 +632,24 @@ class CppProcessor:
                     async with self.declarations_lock:
                         self.all_declarations[usr].append((project_path, node.kind, node.location.line, node.location.column))
                         relationship_type = self.get_relationship_type(node, project_path)
-                        current_type = self.declaration_types[usr][project_path]
-                        
-                        if relationship_type == 'IMPLEMENTED_IN_FILE' or (relationship_type == 'DECLARED_IN_FILE' and current_type != 'IMPLEMENTED_IN_FILE'):
-                            self.declaration_types[usr][project_path] = relationship_type
+                        self.declaration_types[usr][project_path] = relationship_type
 
-                # Process specific node types
-                if node.kind == clang.cindex.CursorKind.NAMESPACE:
-                    await self.process_namespace_node(file_id=file_id, node=node, inputLocation=inputLocation, project_path=project_path, project_id=project_id, is_cpp_file=is_cpp_file)
-                elif node.kind in (clang.cindex.CursorKind.CLASS_DECL, clang.cindex.CursorKind.STRUCT_DECL,
-                                  clang.cindex.CursorKind.CLASS_TEMPLATE, clang.cindex.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION):
-                    await self.process_class_node(file_id=file_id, node=node, inputLocation=inputLocation, project_path=project_path, project_id=project_id, file_name=file_name, full_scope=full_scope, full_name=full_name, namespace=namespace, is_cpp_file=is_cpp_file)
-                elif node.kind in (clang.cindex.CursorKind.CXX_METHOD, clang.cindex.CursorKind.CONSTRUCTOR, clang.cindex.CursorKind.DESTRUCTOR):
-                    await self.process_method_node(file_id, node, inputLocation, project_path, full_scope, namespace, is_cpp_file)
-                elif node.kind == clang.cindex.CursorKind.FUNCTION_DECL:
-                    await self.process_function_node(file_id, node, inputLocation, project_path, full_scope, namespace, is_cpp_file)
+                    # Process specific node types
+                    if node.kind == clang.cindex.CursorKind.NAMESPACE:
+                        await self.process_namespace_node(file_id=file_id, node=node, inputLocation=inputLocation, project_path=project_path, project_id=project_id, is_cpp_file=is_cpp_file)
+                    elif node.kind in (clang.cindex.CursorKind.CLASS_DECL, clang.cindex.CursorKind.STRUCT_DECL,
+                                      clang.cindex.CursorKind.CLASS_TEMPLATE, clang.cindex.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION):
+                        if node.is_definition():
+                            await self.process_class_node(file_id=file_id, node=node, inputLocation=inputLocation, project_path=project_path, project_id=project_id, file_name=file_name, full_scope=full_scope, full_name=full_name, namespace=namespace, is_cpp_file=is_cpp_file)
+                    elif node.kind in (clang.cindex.CursorKind.CXX_METHOD, clang.cindex.CursorKind.CONSTRUCTOR, clang.cindex.CursorKind.DESTRUCTOR):
+                        await self.process_method_node(file_id, node, inputLocation, project_path, full_scope, namespace, is_cpp_file)
+                    elif node.kind == clang.cindex.CursorKind.FUNCTION_DECL:
+                        await self.process_function_node(file_id, node, inputLocation, project_path, full_scope, namespace, is_cpp_file)
 
         except Exception as e:
             logger.error(f"Error processing node {node.spelling} of kind {node.kind}: {e}")
             logger.error(f"Node details: kind={node.kind}, location={node.location}, type={node.type.spelling if node.type else 'None'}")
-        
+            
     
     async def process_namespace_node(self, file_id: str, node, inputLocation, project_path, project_id, is_cpp_file):
         file_name = node.location.file.name if node.location.file else ''
@@ -765,7 +802,7 @@ class CppProcessor:
             relationship_type = self.get_relationship_type(node, project_path)
             current_type = self.declaration_types[usr][project_path]
             
-            if relationship_type == 'IMPLEMENTED_IN_FILE' or (relationship_type == 'DECLARED_IN_FILE' and current_type != 'IMPLEMENTED_IN_FILE'):
+            if relationship_type == 'IMPLEMENTED_IN_FILE' or (relationship_type == 'DEFINED_IN_FILE' and current_type != 'IMPLEMENTED_IN_FILE'):
                 self.declaration_types[usr][project_path] = relationship_type
             
             if node.is_definition():
@@ -1006,12 +1043,12 @@ class CppProcessor:
             impl_file_info = next((f for f in class_info.get('files', []) if f['file_type'] == FileType.CppCode), None)
 
             interface_info = class_info.copy()
-            interface_info['raw_code'] = header_file_info['raw_code'] if header_file_info else ''
-            interface_info['raw_comment'] = header_file_info['raw_comment'] if header_file_info else ''
+            interface_info['raw_code'] = header_file_info['raw_code'] if header_file_info else 'Interface raw code unavailable. Summary should warn of this.'
+            interface_info['raw_comment'] = header_file_info['raw_comment'] if header_file_info else 'Interface raw comment unavailable'
 
             implementation_info = class_info.copy()
-            implementation_info['raw_code'] = impl_file_info['raw_code'] if impl_file_info else ''
-            implementation_info['raw_comment'] = impl_file_info['raw_comment'] if impl_file_info else ''
+            implementation_info['raw_code'] = impl_file_info['raw_code'] if impl_file_info else 'Implementation raw code unavailable. Summary should mention this.'
+            implementation_info['raw_comment'] = impl_file_info['raw_comment'] if impl_file_info else 'Implementation raw comment unavailable'
 
             class_name, full_scope, interface_summary, interface_description = await self.summarize_cpp_class_public_interface(interface_info)
             implementation_summary, implementation_description = await self.summarize_cpp_class_implementation(implementation_info)
@@ -1045,9 +1082,9 @@ class CppProcessor:
             full_name = class_info.get('name', 'anonymous')
             full_scope = class_info.get('scope', '')
             short_name = class_info.get('short_name', '')
-            raw_code = class_info.get('raw_code', '')
+            raw_code = class_info.get('raw_code', 'Interface raw code unavailable. Summary should warn of this.')
             file_path = class_info.get('file_path', '')
-            raw_comment = class_info.get('raw_comment', '')
+            raw_comment = class_info.get('raw_comment', 'Interface raw comment unavailable.')
             description = class_info.get('description', '')
             interface_description = class_info.get('interface_description', raw_code)
 
@@ -1090,9 +1127,9 @@ class CppProcessor:
             full_name = class_info.get('name', 'anonymous')
             full_scope = class_info.get('scope', '')
             short_name = class_info.get('short_name', '')
-            raw_code = class_info.get('raw_code', '')
+            raw_code = class_info.get('raw_code', 'Implementation raw code unavailable.')
             file_path = class_info.get('file_path', '')
-            raw_comment = class_info.get('raw_comment', '')
+            raw_comment = class_info.get('raw_comment', 'Implementation raw comment unavailable.')
             description = class_info.get('description', '')
             implementation_description = class_info.get('implementation_description', raw_code)
 
@@ -1146,9 +1183,9 @@ class CppProcessor:
         full_name = node_info.get('name', 'anonymous')
         full_scope = node_info.get('scope', '')
         short_name = node_info.get('short_name', '')
-        raw_code = longest_file_info['raw_code']
+        raw_code = longest_file_info.get('raw_code', 'Function code unavailable.')
         file_path = longest_file_info['file_path']
-        raw_comment = longest_file_info['raw_comment']
+        raw_comment = longest_file_info.get('raw_comment', 'Function code comment unavailable.')
         description = node_info.get('description', '')
 
         if type_name is None:
