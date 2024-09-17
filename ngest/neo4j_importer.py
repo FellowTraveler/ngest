@@ -920,58 +920,69 @@ class NNeo4JImporter(NBaseImporter):
             return False
 
 
+    async def store_cpp_namespaces_batch(self, namespaces, project_id, session, phase):
+        if phase == 'create_nodes':
+            logger.info(f"Creating namespace nodes for batch")
+            query = """
+            UNWIND $namespaces AS ns
+            MERGE (n:Namespace {usr: ns.usr, project_id: $project_id})
+            ON CREATE SET n.name = ns.full_name,
+                          n.scope = ns.scope,
+                          n.short_name = ns.short_name,
+                          n.description = ns.description,
+                          n.is_new = true
+            ON MATCH SET n.description = ns.description,
+                         n.is_new = false
+            RETURN n.usr AS usr, n.is_new AS is_new
+            """
+            result = await session.run(query, {'namespaces': namespaces, 'project_id': project_id})
+            records = await result.fetch(len(namespaces))
 
-    async def store_cpp_namespaces_batch(self, namespaces, project_id, session):
-        query = """
-        UNWIND $namespaces AS ns
-        MERGE (n:Namespace {usr: ns.usr, project_id: $project_id})
-        ON CREATE SET n.name = ns.name,
-                      n.scope = ns.scope,
-                      n.short_name = ns.short_name,
-                      n.description = ns.description
-        WITH n, ns
-        CALL {
-            WITH n, ns
+            new_count = sum(1 for record in records if record['is_new'])
+            existing_count = len(records) - new_count
+
+            logger.info(f"Processed {len(records)} namespaces. New: {new_count}, Existing: {existing_count}")
+            
+        elif phase == 'create_relationships':
+            logger.info(f"Creating namespace relationships for batch")
+            
+            # Create relationships to parent namespaces
+            parent_ns_query = """
+            UNWIND $namespaces AS ns
+            MATCH (n:Namespace {usr: ns.usr, project_id: $project_id})
             MATCH (p:Namespace {name: ns.parent_namespace, project_id: $project_id})
             WHERE ns.parent_namespace IS NOT NULL
             MERGE (p)-[:CONTAINS_NAMESPACE]->(n)
-        }
-        WITH n, ns
-        UNWIND ns.files AS file
-        MATCH (f:File {id: file.file_id, project_id: $project_id})
-        MERGE (n)-[r:DECLARED_IN_FILE]->(f)
-        ON CREATE SET r = {
-            start_line: file.start_line,
-            end_line: file.end_line,
-            raw_code: file.raw_code,
-            raw_comment: file.raw_comment
-        }
-        """
-        
-        result = await session.run(query, {'namespaces': namespaces, 'project_id': project_id})
-        summary = await result.consume()
-        
-        logger.info(f"Processed {len(namespaces)} namespaces. "
-                    f"Created {summary.counters.nodes_created} nodes and "
-                    f"{summary.counters.relationships_created} relationships.")
-                
-                    
+            """
 
-    async def store_cpp_classes_batch(self, classes, project_id, session):
-        logger.info(f"Processing {len(classes)} classes for batch storage")
-        
-        # Group classes by type
-        classes_by_type = defaultdict(list)
-        for cls in classes:
-            classes_by_type[cls['type']].append(cls)
-        
-        for class_type, type_classes in classes_by_type.items():
-            # Create or match nodes
+            await session.run(parent_ns_query, {'namespaces': namespaces, 'project_id': project_id})
+
+            # Create relationships to files
+            file_rel_query = """
+            UNWIND $namespaces AS ns
+            UNWIND ns.files AS file
+            MATCH (n:Namespace {usr: ns.usr, project_id: $project_id})
+            MATCH (f:File {full_path: file.file_path, project_id: $project_id})
+            MERGE (n)-[r:DECLARED_IN_FILE]->(f)
+            ON CREATE SET r.start_line = file.start_line,
+                          r.end_line = file.end_line,
+                          r.raw_code = file.raw_code,
+                          r.raw_comment = file.raw_comment
+            """
+
+            await session.run(file_rel_query, {'namespaces': namespaces, 'project_id': project_id})
+            logger.info(f"Created namespace relationships for batch")
+
+                            
+
+    async def store_cpp_classes_batch(self, classes, project_id, session, phase):
+        if phase == 'create_nodes':
+            logger.info(f"Creating class nodes for batch")
+
+            # Create or match nodes using apoc.merge.node to handle dynamic labels
             node_creation_query = """
             UNWIND $classes AS cls
-            CALL apoc.create.node([cls.type], {
-                usr: cls.usr,
-                project_id: $project_id,
+            CALL apoc.merge.node([cls.type], {usr: cls.usr, project_id: $project_id}, {
                 name: cls.full_name,
                 namespace: cls.namespace,
                 short_name: cls.short_name,
@@ -979,16 +990,20 @@ class NNeo4JImporter(NBaseImporter):
                 interface_summary: cls.interface_summary,
                 implementation_summary: cls.implementation_summary,
                 interface_embedding: cls.interface_embedding,
-                implementation_embedding: cls.implementation_embedding,
-                is_new: true
+                implementation_embedding: cls.implementation_embedding
             }) YIELD node AS n
-            RETURN n.usr AS usr, n.is_new AS is_new
+            RETURN n.usr AS usr
             """
-            
-            result = await session.run(node_creation_query,
-                                       {'classes': type_classes, 'project_id': project_id})
-            nodes = await result.fetch(len(type_classes))
-            
+
+            result = await session.run(node_creation_query, {'classes': classes, 'project_id': project_id})
+            nodes = await result.fetch(len(classes))
+
+            new_count = len(nodes)
+            logger.info(f"Processed {new_count} class nodes.")
+
+        elif phase == 'create_relationships':
+            logger.info(f"Creating class relationships for batch")
+
             # Now handle relationships
             relationship_query = """
             UNWIND $relationships AS rel
@@ -998,123 +1013,110 @@ class NNeo4JImporter(NBaseImporter):
             SET r.access_specifier = rel.access_specifier
             RETURN count(r) as relationships_created
             """
-            
+
             relationships = [
-                {'class_usr': cls['usr'], 'base_usr': base['usr'], 'access_specifier': base.get('access_specifier')}
-                for cls in type_classes for base in cls.get('base_classes', [])
+                {
+                    'class_usr': cls['usr'],
+                    'base_usr': base['usr'],
+                    'access_specifier': base.get('access_specifier')
+                }
+                for cls in classes for base in cls.get('base_classes', [])
+                if base.get('usr')
             ]
-            
+
             if relationships:
                 rel_result = await session.run(relationship_query, {'relationships': relationships, 'project_id': project_id})
                 rel_count = await rel_result.single()
                 relationships_created = rel_count['relationships_created']
+                logger.info(f"Created {relationships_created} INHERITS_FROM relationships.")
+            else:
+                logger.info(f"No INHERITS_FROM relationships to create for this batch.")
 
-            # Process results for this batch
-            new_count = sum(1 for record in nodes if record['is_new'])
-            existing_count = len(nodes) - new_count
+
+    async def store_cpp_methods_batch(self, methods, project_id, session, phase):
+        if phase == 'create_nodes':
+            logger.info(f"Creating method nodes for batch")
+            query = """
+            UNWIND $methods AS method
+            MERGE (n:Method {usr: method.usr, project_id: $project_id})
+            ON CREATE SET n.name = method.full_name,
+                          n.namespace = method.namespace,
+                          n.short_name = method.short_name,
+                          n.scope = method.scope,
+                          n.summary = method.summary,
+                          n.embedding = method.embedding,
+                          n.is_new = true
+            ON MATCH SET n.summary = method.summary,
+                         n.embedding = method.embedding,
+                         n.is_new = false
+            RETURN n.usr AS usr, n.is_new AS is_new
+            """
+            result = await session.run(query, {'methods': methods, 'project_id': project_id})
+            records = await result.fetch(len(methods))
+
+            new_count = sum(1 for record in records if record['is_new'])
+            existing_count = len(records) - new_count
+
+            logger.info(f"Processed {len(records)} methods. New: {new_count}, Existing: {existing_count}")
             
-            logger.info(f"Processed {len(nodes)} {class_type} classes. New: {new_count}, Existing: {existing_count}")
-                    
-            if relationships:
-                expected_relationships = len(relationships)
-                if relationships_created != expected_relationships:
-                    logger.warning(f"Not all INHERITS_FROM relationships were created for {class_type}. "
-                                   f"Created: {relationships_created}, Expected: {expected_relationships}")
-                    
-                    for cls in type_classes:
-                        for base in cls.get('base_classes', []):
-                            check_query = """
-                            MATCH (n {usr: $class_usr, project_id: $project_id})
-                            MATCH (b {usr: $base_usr, project_id: $project_id})
-                            RETURN n, b
-                            """
-                            check_result = await session.run(check_query, class_usr=cls['usr'], base_usr=base['usr'], project_id=project_id)
-                            check_record = await check_result.single()
-                            if not check_record or not check_record.get('b'):
-                                logger.error(f"Base class with USR {base['usr']} for class {cls['full_name']} does not exist in the database.")
+            
+        elif phase == 'create_relationships':
+            logger.info(f"Creating method relationships for batch")
+            relationship_query = """
+            UNWIND $methods AS method
+            WITH method
+            WHERE method.class_usr IS NOT NULL AND method.class_usr <> ''
+            MATCH (n:Method {usr: method.usr, project_id: $project_id})
+            MATCH (c) WHERE (c:Class OR c:Struct) AND c.usr = method.class_usr AND c.project_id = $project_id
+            MERGE (c)-[:HAS_METHOD]->(n)
+            MERGE (n)-[:DEFINED_IN_CLASS]->(c)
+            RETURN count(*) as relationships_created
+            """
+            result = await session.run(relationship_query, {'methods': methods, 'project_id': project_id})
+            rel_count = await result.single()
+            relationships_created = rel_count['relationships_created']
+            logger.info(f"Created {relationships_created} method relationships.")
 
-            if len(nodes) != len(type_classes):
-                logger.error(f"Not all {class_type} nodes were processed. Processed: {len(nodes)}, Total: {len(type_classes)}")
-                for cls in type_classes:
-                    if cls['usr'] not in [record['usr'] for record in nodes]:
-                        logger.error(f"{class_type} node not processed: USR: {cls['usr']}, Name: {cls['full_name']}")
+    async def store_cpp_functions_batch(self, functions, project_id, session, phase):
+        if phase == 'create_nodes':
+            logger.info(f"Creating function nodes for batch")
+            query = """
+            UNWIND $functions AS func
+            MERGE (n:Function {usr: func.usr, project_id: $project_id})
+            ON CREATE SET n.name = func.full_name,
+                          n.namespace = func.namespace,
+                          n.short_name = func.short_name,
+                          n.scope = func.scope,
+                          n.summary = func.summary,
+                          n.embedding = func.embedding,
+                          n.is_new = true
+            ON MATCH SET n.summary = func.summary,
+                         n.embedding = func.embedding,
+                         n.is_new = false
+            RETURN n.usr AS usr, n.is_new AS is_new
+            """
+            result = await session.run(query, {'functions': functions, 'project_id': project_id})
+            records = await result.fetch(len(functions))
 
+            new_count = sum(1 for record in records if record['is_new'])
+            existing_count = len(records) - new_count
 
-    async def store_cpp_methods_batch(self, methods, project_id, session):
-        query = """
-        UNWIND $methods AS method
-        MERGE (n:Method {usr: method.usr, project_id: $project_id})
-        ON CREATE SET n.name = method.full_name,
-                      n.namespace = method.namespace,
-                      n.short_name = method.short_name,
-                      n.scope = method.scope,
-                      n.summary = method.summary,
-                      n.embedding = method.embedding,
-                      n.is_new = true
-        ON MATCH SET n.summary = method.summary,
-                     n.embedding = method.embedding,
-                     n.is_new = false
-        WITH n, method
-        MATCH (c:Class|Struct {usr: method.class_usr, project_id: $project_id})
-        MERGE (c)-[:HAS_METHOD]->(n)
-        MERGE (n)-[:DEFINED_IN_CLASS]->(c)
-        RETURN n.usr AS usr, n.is_new AS is_new
-        """
-        
-        result = await session.run(query, {'methods': methods, 'project_id': project_id})
-        records = await result.fetch(len(methods))
-        
-        new_count = sum(1 for record in records if record['is_new'])
-        existing_count = len(records) - new_count
-        
-        logger.info(f"Processed {len(records)} methods. New: {new_count}, Existing: {existing_count}")
-        
-        summary = await result.consume()
-        relationships_created = summary.counters.relationships_created
-        expected_relationships = len(methods) * 2  # HAS_METHOD and DEFINED_IN_CLASS
-        
-        if relationships_created != expected_relationships:
-            logger.warning(f"Not all method relationships were created. "
-                           f"Created: {relationships_created}, Expected: {expected_relationships}")
-        
-        if len(records) != len(methods):
-            logger.error(f"Not all method nodes were processed. Processed: {len(records)}, Total: {len(methods)}")
-            for method in methods:
-                if method['usr'] not in [record['usr'] for record in records]:
-                    logger.error(f"Method node not processed: USR: {method['usr']}, Name: {method['full_name']}")
-
-
-    async def store_cpp_functions_batch(self, functions, project_id, session):
-        query = """
-        UNWIND $functions AS func
-        MERGE (n:Function {usr: func.usr, project_id: $project_id})
-        ON CREATE SET n.name = func.full_name,
-                      n.namespace = func.namespace,
-                      n.short_name = func.short_name,
-                      n.scope = func.scope,
-                      n.summary = func.summary,
-                      n.embedding = func.embedding,
-                      n.is_new = true
-        ON MATCH SET n.summary = func.summary,
-                     n.embedding = func.embedding,
-                     n.is_new = false
-        RETURN n.usr AS usr, n.is_new AS is_new
-        """
-        
-        result = await session.run(query, {'functions': functions, 'project_id': project_id})
-        records = await result.fetch(len(functions))
-        
-        new_count = sum(1 for record in records if record['is_new'])
-        existing_count = len(records) - new_count
-        
-        logger.info(f"Processed {len(records)} functions. New: {new_count}, Existing: {existing_count}")
-        
-        if len(records) != len(functions):
-            logger.error(f"Not all function nodes were processed. Processed: {len(records)}, Total: {len(functions)}")
-            for func in functions:
-                if func['usr'] not in [record['usr'] for record in records]:
-                    logger.error(f"Function node not processed: USR: {func['usr']}, Name: {func['full_name']}")
-
+            logger.info(f"Processed {len(records)} functions. New: {new_count}, Existing: {existing_count}")
+            
+        elif phase == 'create_relationships':
+            logger.info(f"Creating function relationships for batch")
+            # Adjusted code to handle missing namespaces
+            relationship_query = """
+            UNWIND $functions AS func
+            MATCH (n:Function {usr: func.usr, project_id: $project_id})
+            OPTIONAL MATCH (ns:Namespace {usr: func.namespace_usr, project_id: $project_id})
+            // Only create the relationship if the namespace exists
+            WITH n, ns
+            WHERE ns IS NOT NULL
+            MERGE (ns)-[:CONTAINS_FUNCTION]->(n)
+            """
+            await session.run(relationship_query, {'functions': functions, 'project_id': project_id})
+            logger.info(f"Created function relationships.")
 
 
 
@@ -1126,12 +1128,23 @@ class NNeo4JImporter(NBaseImporter):
             # Define the order of processing
             process_order = ['Namespace', 'Function', 'Class', 'Struct', 'Method']
 
+            # First phase: Create all nodes
             for task_type in process_order:
-                type_tasks = [(task_type, name, info) for t, name, info in tasks if t == task_type or (t in ['Class', 'Struct'] and task_type in ['Class', 'Struct'])]
+                type_tasks = [(task_type, name, info) for t, name, info in tasks
+                              if t == task_type or (t in ['Class', 'Struct'] and task_type in ['Class', 'Struct'])]
                 if not type_tasks:
                     continue  # Skip if no tasks for this type
 
-                await self.process_specific_type(type_tasks, project_id, [task_type])
+                await self.process_specific_type(type_tasks, project_id, [task_type], phase='create_nodes')
+
+            # Second phase: Create all relationships
+            for task_type in process_order:
+                type_tasks = [(task_type, name, info) for t, name, info in tasks
+                              if t == task_type or (t in ['Class', 'Struct'] and task_type in ['Class', 'Struct'])]
+                if not type_tasks:
+                    continue  # Skip if no tasks for this type
+
+                await self.process_specific_type(type_tasks, project_id, [task_type], phase='create_relationships')
 
             logger.info(f"All storage tasks completed successfully")
 
@@ -1140,7 +1153,9 @@ class NNeo4JImporter(NBaseImporter):
             logger.error(f"Error details: {traceback.format_exc()}")
             raise FileProcessingError(f"Error in store_all_cpp: {e}")
 
-    async def process_specific_type(self, tasks, project_id, types):
+
+
+    async def process_specific_type(self, tasks, project_id, types, phase):
         batch_size = 50
         max_concurrent_batches = 3
         total_tasks = len(tasks)
@@ -1150,49 +1165,50 @@ class NNeo4JImporter(NBaseImporter):
             nonlocal completed_tasks
             # Filter batch to only include specified types
             batch = [(t, n, i) for t, n, i in batch if t in types]
-            
+
             if not batch:
                 return True  # Skip if batch is empty for this type
-            
+
             try:
                 async with self.get_session() as session:
                     if 'Namespace' in types:
                         namespaces = [{'full_name': n, **i} for t, n, i in batch if t == 'Namespace']
                         if namespaces:
-                            await self.store_cpp_namespaces_batch(namespaces, project_id, session)
+                            await self.store_cpp_namespaces_batch(namespaces, project_id, session, phase)
                     if 'Function' in types:
                         functions = [{'full_name': n, **i} for t, n, i in batch if t == 'Function']
                         if functions:
-                            await self.store_cpp_functions_batch(functions, project_id, session)
+                            await self.store_cpp_functions_batch(functions, project_id, session, phase)
                     if 'Class' in types or 'Struct' in types:
                         classes = [{'full_name': n, **i} for t, n, i in batch if t in ['Class', 'Struct']]
                         if classes:
-                            await self.store_cpp_classes_batch(classes, project_id, session)
+                            await self.store_cpp_classes_batch(classes, project_id, session, phase)
                     if 'Method' in types:
                         methods = [{'full_name': n, **i} for t, n, i in batch if t == 'Method']
                         if methods:
-                            await self.store_cpp_methods_batch(methods, project_id, session)
-                    
+                            await self.store_cpp_methods_batch(methods, project_id, session, phase)
+
                 completed_tasks += len(batch)
                 await self.update_progress_store(len(batch))
-                logger.info(f"Completed {completed_tasks}/{total_tasks} storage tasks for {types}")
+                logger.info(f"Completed {completed_tasks}/{total_tasks} storage tasks for {types} in phase {phase}")
                 return True
             except Exception as e:
-                logger.error(f"Error processing batch for {types}: {e}")
+                logger.error(f"Error processing batch for {types} in phase {phase}: {e}")
                 logger.error(f"Traceback: {traceback.format_exc()}")
                 return e
 
         # Process batches for this type
-        batches = [tasks[i:i+batch_size] for i in range(0, len(tasks), batch_size)]
+        batches = [tasks[i:i + batch_size] for i in range(0, len(tasks), batch_size)]
         semaphore = asyncio.Semaphore(max_concurrent_batches)
+
         async def process_batch_with_semaphore(batch):
             async with semaphore:
                 return await process_batch(batch)
 
         results = await asyncio.gather(*[process_batch_with_semaphore(batch) for batch in batches], return_exceptions=True)
-        
+
         successful_batches = sum(1 for result in results if result is True)
-        logger.info(f"Completed {successful_batches}/{len(batches)} storage batches successfully for {types}")
+        logger.info(f"Completed {successful_batches}/{len(batches)} storage batches successfully for {types} in phase {phase}")
 
 
 

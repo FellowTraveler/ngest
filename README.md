@@ -1,12 +1,46 @@
-# ngest
-Python script for ingesting various files into a semantic graph. For text, images, cpp, python, rust, javascript, and PDFs.
+![CPP Project Ingestion](./images/broad_overview.jpg)
 
-### Note / Status
+# ngest
+Python script for ingesting various files into a semantic graph. For text, images, cpp, python, rust, javascript, and PDFs. Main goal is for meaningful retrieval across large code bases for autocoding with agents. 
+
+### Work in Progress
 
 This project isn't done yet so don't bother using it.
 When it's ready there will also be a retrieval script.
 
 Status: we have minimal CPP ingestion now working, as well as 2-layer ingestion for PDFs.
+
+## Details on the Constructed Graph in Neo4J
+
+### A Project contains Files and a Directory Tree
+
+Traverse the Project directory and recursively ingest all the files and folders inside it. 
+
+![Project has files](./images/project_has_files.jpg)
+
+![Directory Tree](./images/dir_tree.jpg)
+
+### Files have ```DEFINES_TYPE``` relationships to Classes
+
+![CPP classes defined in their headers](./images/cpp_project.jpg)
+
+### CPP Classes are correspondingly ```DEFINED_IN_FILE```
+
+![Files contain definitions of various Classes](./images/cpp_classes.jpg)
+
+### CPP Methods defined in their Class
+
+![Methods defined in their class](./images/class_methods.jpg)
+
+### CPP Methods are ```DECLARED_IN_FILE``` and ```IMPLEMENTED_IN_FILE```
+
+![Methods defined in their class](./images/method_relationships.jpg)
+
+### PDFs are chunked in 2 levels for Parent Document Retrieval
+
+![PDFs chunked in 2 levels](./images/pdf_chunks.jpg)
+
+Rudimentary so far.
 
 ## Requirements
 
@@ -112,3 +146,90 @@ Remember that the Clang setup is automatically performed when you import ngest, 
 
 P.S. in case you're curious, this can be used to wipe a Neo4J DB.
 Use with caution: ```CALL apoc.schema.assert({},{},true); MATCH (n) DETACH DELETE n;```
+
+## Testing
+
+I put these Cypher queries here mainly for myself.
+
+```
+MATCH (p:Project)
+OPTIONAL MATCH (p)<-[:BELONGS_TO_PROJECT]-(f:File)
+OPTIONAL MATCH (p)-[:HAS_FILE]->(f:File)
+OPTIONAL MATCH (c)<-[:DEFINES_TYPE]-(f:File)
+OPTIONAL MATCH (c)-[:DEFINED_IN_FILE]->(f)
+RETURN *
+
+
+MATCH (f:File)-[r]-()
+WHERE f.full_path ENDS WITH 'ec/BigInt.hpp' OR f.full_path ENDS WITH 'ec/BigInt.cpp'
+RETURN f.full_path, TYPE(r) as relationship_type, 
+       CASE WHEN STARTNODE(r) = f 
+            THEN 'outgoing' 
+            ELSE 'incoming' 
+       END as direction,
+       CASE WHEN STARTNODE(r) = f 
+            THEN labels(ENDNODE(r))[0] 
+            ELSE labels(STARTNODE(r))[0] 
+       END as related_node_type
+       
+       
+       
+MATCH (c:Class {short_name: 'BigInt'})-[r]-()
+RETURN c.short_name, TYPE(r) as relationship_type, 
+       CASE WHEN STARTNODE(r) = c 
+            THEN 'outgoing' 
+            ELSE 'incoming' 
+       END as direction,
+       CASE WHEN STARTNODE(r) = c 
+            THEN labels(ENDNODE(r))[0] 
+            ELSE labels(STARTNODE(r))[0] 
+       END as related_node_type
+              
+
+MATCH (m:Method)-[r]-()
+WHERE m.scope CONTAINS 'BigInt'
+RETURN m.short_name, TYPE(r) as relationship_type, 
+       CASE WHEN STARTNODE(r) = m 
+            THEN 'outgoing' 
+            ELSE 'incoming' 
+       END as direction,
+       CASE WHEN STARTNODE(r) = m 
+            THEN labels(ENDNODE(r))[0] 
+            ELSE labels(STARTNODE(r))[0] 
+       END as related_node_type
+
+
+Check for Namespace nodes:
+
+MATCH (n:Namespace)
+RETURN n.name, n.usr
+
+Verify Class-Method relationships:
+
+MATCH (c:Class)-[:HAS_METHOD]->(m:Method)
+RETURN c.name AS ClassName, m.name AS MethodName, m.usr AS MethodUSR
+
+Check for orphaned Methods (Methods not connected to any Class):
+
+MATCH (m:Method)
+WHERE NOT (m)<-[:HAS_METHOD]-()
+RETURN m.name, m.usr
+
+Verify File relationships:
+
+MATCH (n)-[r]->(f:File)
+WHERE type(r) IN ['IMPLEMENTED_IN_FILE', 'DECLARED_IN_FILE']
+RETURN labels(n)[0] AS NodeType, n.name AS NodeName, type(r) AS RelationType, f.full_path AS FilePath
+
+Check for nodes without File relationships:
+
+MATCH (n)
+WHERE NOT (n)-[:IMPLEMENTED_IN_FILE|DECLARED_IN_FILE]->(:File)
+AND n:Class OR n:Method OR n:Function
+RETURN labels(n)[0] AS NodeType, n.name AS NodeName, n.usr AS NodeUSR
+
+Verify Namespace-Class relationships:
+
+MATCH (ns:Namespace)-[:CONTAINS]->(c:Class)
+RETURN ns.name AS Namespace, c.name AS ClassName
+```

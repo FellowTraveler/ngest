@@ -214,7 +214,7 @@ class NIngest:
                     async with self.store_semaphore:
                         await self.start_progress_store(self.total_files)
                         await self.importer_.store_all_cpp(self.project_id)
-                
+
                     async with self.finalize_semaphore:
                         async with self.importer_.get_session() as session:
                             await self.importer_.finalize_relationships(self.project_id, session)

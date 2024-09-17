@@ -339,6 +339,7 @@ class CppProcessor:
             for full_name, class_info in self.classes.items():
                 if 'interface_summary' in class_info or 'implementation_summary' in class_info:
                     usr = class_info.get('usr', '')
+                    namespace_usr = class_info.get('namespace_usr', '')
                     task_type = class_info.get('type', 'Class')
                     if usr:
                         logger.info(f"Preparing storage task for {task_type}: {full_name}, USR: {usr}")
@@ -351,6 +352,7 @@ class CppProcessor:
                             'type': task_type,
                             'full_name': full_name,
                             'namespace': class_info.get('namespace', ''),
+                            'namespace_usr': namespace_usr,
                             'short_name': class_info.get('short_name', ''),
                             'scope': class_info.get('scope', ''),
                             'interface_summary': class_info.get('interface_summary', ''),
@@ -369,6 +371,7 @@ class CppProcessor:
             for full_name, method_info in self.methods.items():
                 if 'summary' in method_info:
                     usr = method_info.get('usr', '')
+                    namespace_usr = method_info.get('namespace_usr', '')
                     task_type = method_info.get('type', 'Method')
                     if usr:
                         logger.info(f"Preparing storage task for {task_type}: {full_name}, USR: {usr}")
@@ -381,6 +384,7 @@ class CppProcessor:
                             'type': task_type,
                             'full_name': full_name,
                             'namespace': method_info.get('namespace', ''),
+                            'namespace_usr': namespace_usr,
                             'short_name': method_info.get('short_name', ''),
                             'scope': method_info.get('scope', ''),
                             'summary': method_info.get('summary', ''),
@@ -397,6 +401,7 @@ class CppProcessor:
             for full_name, function_info in self.functions.items():
                 if 'summary' in function_info:
                     usr = function_info.get('usr', '')
+                    namespace_usr = function_info.get('namespace_usr', '')
                     task_type = function_info.get('type', 'Function')
                     if usr:
                         logger.info(f"Preparing storage task for {task_type}: {full_name}, USR: {usr}")
@@ -409,6 +414,7 @@ class CppProcessor:
                             'type': task_type,
                             'full_name': full_name,
                             'namespace': function_info.get('namespace', ''),
+                            'namespace_usr': namespace_usr,
                             'short_name': function_info.get('short_name', ''),
                             'scope': function_info.get('scope', ''),
                             'summary': function_info.get('summary', ''),
@@ -651,6 +657,14 @@ class CppProcessor:
             logger.error(f"Node details: kind={node.kind}, location={node.location}, type={node.type.spelling if node.type else 'None'}")
             
     
+    def get_namespace_node(self, node):
+        current = node.semantic_parent
+        while current and current.kind != clang.cindex.CursorKind.TRANSLATION_UNIT:
+            if current.kind == clang.cindex.CursorKind.NAMESPACE:
+                return current
+            current = current.semantic_parent
+        return None
+
     async def process_namespace_node(self, file_id: str, node, inputLocation, project_path, project_id, is_cpp_file):
         file_name = node.location.file.name if node.location.file else ''
         if project_path not in file_name:
@@ -666,6 +680,11 @@ class CppProcessor:
                 description += f" with documentation: {raw_comment.strip()}"
 
             raw_code, start_line, end_line = await self.get_raw_code(node)
+
+            usr = self.get_usr(node)
+            if not usr:
+                logger.warning(f"Skipping namespace {node.spelling} due to missing USR")
+                return
 
             file_info = {
                 'file_id': file_id,
@@ -684,6 +703,7 @@ class CppProcessor:
                 'short_name': node.spelling,
                 'description': description,
                 'parent_namespace': self.get_parent_namespace(node),
+                'usr': usr,
                 'files': [file_info]
             }
             await self.update_namespace(full_name, details)
